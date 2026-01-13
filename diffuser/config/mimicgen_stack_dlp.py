@@ -22,7 +22,7 @@ mode_to_args = {
     'max_path_length': 115,
     'env_config_dir': 'env_config/n_cubes',
     'eval_freq': 0,
-    'n_steps_per_epoch': 1e5,
+    'n_steps_per_epoch': 2000,
   },
 }
 

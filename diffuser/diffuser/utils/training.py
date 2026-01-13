@@ -321,3 +321,97 @@ class Trainer(object):
         self.model.train()
         self.ema_model.train()
         return out
+
+    @torch.no_grad()
+    def eval_mimicgen_rollouts(
+        self,
+        make_env_fn,
+        dlp_model,
+        calib_h5_path,
+        n_episodes=5,
+        max_steps=50,
+        bounds_xyz=((-2,2), (-2,2), (-0.2,2.5)),
+        grid_dhw=(64,64,64),
+        cams=("agentview","sideview","robot0_eye_in_hand"),
+        pixel_stride=2,
+        goal_from_env_fn=None,
+    ):
+        """
+        True success eval by stepping MimicGen.
+        - make_env_fn: () -> env
+        - dlp_model: your 3D DLP (already loaded)
+        - calib_h5_path: hdf5 with meta/cameras/*
+        - goal_from_env_fn: (env, raw_obs) -> raw_goal_obs (optional)
+        """
+        from diffuser.envs.mimicgen_dlp_wrapper import MimicGenDLPWrapper
+
+        device = next(self.ema_model.parameters()).device
+        dlp_model = dlp_model.to(device).eval()
+
+        successes = []
+        returns = []
+        lengths = []
+
+        for ep in range(n_episodes):
+            env = make_env_fn()
+            envw = MimicGenDLPWrapper(
+                env=env,
+                dlp_model=dlp_model,
+                device=device,
+                cams=cams,
+                grid_dhw=grid_dhw,
+                bounds_xyz=bounds_xyz,
+                pixel_stride=pixel_stride,
+                calib_h5_path=calib_h5_path,
+                get_goal_raw_obs_fn=goal_from_env_fn,
+            )
+
+            obs_vec = envw.reset()
+            ep_ret = 0.0
+
+            for t in range(max_steps):
+                # build condition dict in *raw token space*
+                cond_np = envw.make_cond(obs_vec, horizon=self.dataset.horizon)
+
+                # normalize exactly like dataset training
+                def norm_obs(v):
+                    # v is flat (obs_dim,)
+                    # your normalizer expects (N, dim)
+                    v_norm = self.dataset.normalizer.normalize(v[None], "observations")[0]
+                    return torch.from_numpy(v_norm).float().to(device)
+
+                cond = {k: norm_obs(v)[None, :] for k, v in cond_np.items()}  # add batch dim
+
+                # sample plan from EMA diffusion
+                sample = self.ema_model(cond, verbose=False)
+                traj = sample.trajectories[0]  # (H, action_dim + obs_dim)
+
+                a_dim = self.dataset.action_dim
+                a0_norm = traj[0, :a_dim].detach().cpu().numpy().astype(np.float32)
+
+                # unnormalize action back to env action space
+                a0 = self.dataset.normalizer.unnormalize(a0_norm[None], "actions")[0]
+
+                obs_vec, r, done, info = envw.step(a0)
+                ep_ret += float(r)
+
+                if done:
+                    break
+
+            # success flag (wrapper tries common info keys; may be None)
+            success = bool(info.get("success", False)) if isinstance(info, dict) else False
+            successes.append(success)
+            returns.append(ep_ret)
+            lengths.append(t + 1)
+
+            try:
+                env.close()
+            except Exception:
+                pass
+
+        out = {
+            "sim/success_rate": float(np.mean(successes)) if len(successes) else 0.0,
+            "sim/avg_return": float(np.mean(returns)) if len(returns) else 0.0,
+            "sim/avg_len": float(np.mean(lengths)) if len(lengths) else 0.0,
+        }
+        return out
