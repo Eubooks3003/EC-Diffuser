@@ -27,7 +27,7 @@ mode_to_args = {
     'env_config_dir': 'env_config/n_cubes',
     'eval_freq': 1,
     'eval_backend': 'mimicgen',
-    'n_steps_per_epoch': 2000,
+    'n_steps_per_epoch': 200,
   },
 }
 

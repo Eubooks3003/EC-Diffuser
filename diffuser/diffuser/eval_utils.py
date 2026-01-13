@@ -320,6 +320,81 @@ def evaluate_policy(policy, env, plan_args, logger,
 
     return stats
 
+def setup_mimicgen_env(args):
+    """
+    Create a MimicGen / RoboSuite env using robomimic metadata from a dataset HDF5.
+
+    We use args.calib_h5_path as the dataset file by default (since you already have it),
+    but you can also set args.mimicgen_dataset_h5.
+
+    This function keeps imports local so importing eval_utils doesn't require MimicGen deps
+    unless you actually call mimicgen eval.
+    """
+    # 1) Try to register MimicGen envs (different installs use different module names)
+    for mod in ("mimicgen_envs", "mimicgen"):
+        try:
+            __import__(mod)
+            break
+        except Exception:
+            pass
+
+    # 2) Pull env metadata from a robomimic-style dataset .hdf5
+    dataset_h5 = getattr(args, "mimicgen_dataset_h5", None) or getattr(args, "calib_h5_path", None)
+    if dataset_h5 is None:
+        raise RuntimeError(
+            "setup_mimicgen_env needs args.calib_h5_path or args.mimicgen_dataset_h5 "
+            "pointing to a robomimic-format dataset .hdf5 that contains env metadata."
+        )
+
+    from robomimic.utils import file_utils as FileUtils
+    from robomimic.utils import env_utils as EnvUtils
+
+    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_h5)
+
+    # 3) Optional overrides for cameras / offscreen rendering
+    env_kwargs = dict(env_meta.get("env_kwargs", {}) or {})
+    env_kwargs.setdefault("has_renderer", False)
+    env_kwargs.setdefault("has_offscreen_renderer", True)
+    env_kwargs.setdefault("use_camera_obs", True)
+
+    cams = getattr(args, "mimicgen_cams", None)
+    if cams is not None:
+        env_kwargs["camera_names"] = list(cams)
+
+    # If you want to force sizes, set these args in config and they’ll override metadata
+    cam_w = getattr(args, "mimicgen_camera_width", None)
+    cam_h = getattr(args, "mimicgen_camera_height", None)
+    if cam_w is not None:
+        env_kwargs["camera_widths"] = cam_w
+    if cam_h is not None:
+        env_kwargs["camera_heights"] = cam_h
+
+    # 4) Create env (robomimic APIs vary slightly across versions, so be defensive)
+    env_name = env_meta.get("env_name", None)
+    if env_name is None:
+        # some versions store it under a different key
+        env_name = env_meta.get("env", None)
+
+    try:
+        env = EnvUtils.create_env_from_metadata(
+            env_meta=env_meta,
+            env_name=env_name,
+            render=False,
+            render_offscreen=True,
+            use_image_obs=True,
+            env_kwargs=env_kwargs,
+        )
+    except TypeError:
+        # older signatures
+        env = EnvUtils.create_env_from_metadata(
+            env_meta,
+            env_name=env_name,
+            render=False,
+            render_offscreen=True,
+            use_image_obs=True,
+        )
+
+    return env
 
 def wandb_log_eval_stats(env, eval_stat_dict, plan_args):
     # minimal logging; keep it generic
