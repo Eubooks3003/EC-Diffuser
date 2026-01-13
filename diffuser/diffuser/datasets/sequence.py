@@ -5,7 +5,15 @@ import torch
 import pdb
 
 from .preprocessing import get_preprocess_fn
-from .d4rl import load_environment, sequence_dataset
+# from .d4rl import load_environment, sequence_dataset
+
+# try:
+#     from .d4rl import load_environment, sequence_dataset
+# except Exception as e:
+#     load_environment = None
+#     sequence_dataset = None
+#     _D4RL_IMPORT_ERROR = e
+
 from .normalization import DatasetNormalizer
 from .buffer import ReplayBuffer
 

@@ -114,37 +114,42 @@ diffusion = diffusion_config(model)
 
 trainer = trainer_config(diffusion, dataset, renderer)
 
-plan_args = ArgsParser().parse_args('plan', savepath=args.savepath)
+eval_freq = getattr(args, "eval_freq", 0)
+do_eval = (eval_freq is not None) and (eval_freq > 0)
 
-logger_config = utils.Config(
-    utils.Logger,
-    renderer=renderer,
-    logpath=plan_args.savepath,
-    vis_freq=plan_args.vis_freq,
-    max_render=plan_args.max_render,
-)
+if do_eval:
+    plan_args = ArgsParser().parse_args('plan', savepath=args.savepath)
 
-## policies are wrappers around an unconditional diffusion model
-policy_config = utils.Config(
-    plan_args.policy,
-    diffusion_model=diffusion,
-    normalizer=dataset.normalizer,
-    preprocess_fns=plan_args.preprocess_fns,
-    verbose=False,
-    horizon=plan_args.horizon,
-)
+    logger_config = utils.Config(
+        utils.Logger,
+        renderer=renderer,
+        logpath=plan_args.savepath,
+        vis_freq=plan_args.vis_freq,
+        max_render=plan_args.max_render,
+    )
 
-logger = logger_config()
-policy = policy_config()
+    ## policies are wrappers around an unconditional diffusion model
+    policy_config = utils.Config(
+        plan_args.policy,
+        diffusion_model=diffusion,
+        normalizer=dataset.normalizer,
+        preprocess_fns=plan_args.preprocess_fns,
+        verbose=False,
+        horizon=plan_args.horizon,
+    )
 
+    logger = logger_config()
+    policy = policy_config()
 
+    env = setup_isaac_env(args)
+    if args.input_type == 'dlp':
+        renderer.env = env
+else:
+    plan_args = None
+    logger = None
+    policy = None
+    env = None
 
-#-----------------------------------------------------------------------------#
-#---------------------------- create environments ----------------------------#
-#-----------------------------------------------------------------------------#
-env = setup_isaac_env(args)
-if args.input_type == 'dlp':
-    renderer.env = env
 
 #-----------------------------------------------------------------------------#
 #------------------------ test forward & backward pass -----------------------#
@@ -174,10 +179,15 @@ n_epochs = int(args.n_train_steps // args.n_steps_per_epoch)
 for i in range(n_epochs):
     print(f'Epoch {i} / {n_epochs} | {args.savepath}')
     trainer.train(n_train_steps=args.n_steps_per_epoch)
-
-    if i % args.eval_freq == 0:
+    
+    if do_eval and (i > 0) and (i % eval_freq == 0):
         plan_args.savepath = logger.savepath = os.path.join(args.savepath, f'epoch_{i}')
         os.makedirs(plan_args.savepath, exist_ok=True)
         stat_save_path = os.path.join(plan_args.savepath, 'eval_stats.pkl')
-        eval_stat_dict = evaluate_policy(policy, env, plan_args, logger, num_eval_episodes=100, exe_steps=plan_args.exe_steps, stat_save_path=stat_save_path)
+        eval_stat_dict = evaluate_policy(
+            policy, env, plan_args, logger,
+            num_eval_episodes=100,
+            exe_steps=plan_args.exe_steps,
+            stat_save_path=stat_save_path,
+        )
         wandb_log_eval_stats(env, eval_stat_dict, plan_args)

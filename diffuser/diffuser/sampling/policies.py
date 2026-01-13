@@ -22,10 +22,23 @@ class GoalConditionedPolicy:
 
     def __call__(self, conditions, batch_size=1, verbose=True, return_attention=False):
         conditions = {k: self.preprocess_fn(v) for k, v in conditions.items()}
-        if len(conditions[0].shape) == 1:
-            multi_input = False
-        else:
+        x0 = conditions[0]
+        K = getattr(self.diffusion_model.model, "max_particles", None)
+        D = getattr(self.diffusion_model.model, "features_dim", None)
+
+        if x0.ndim == 3:
+            # (B,K,D)
             multi_input = True
+        elif x0.ndim == 2 and (K is not None) and (D is not None) and x0.shape == (K, D):
+            # (K,D) single env particles
+            multi_input = False
+        elif x0.ndim == 2:
+            # (B, obs_dim) flattened batch
+            multi_input = True
+        else:
+            # (obs_dim,) single
+            multi_input = False
+
         conditions = self._format_conditions(conditions, batch_size, multi_input=multi_input)
         
         if return_attention:
@@ -60,16 +73,58 @@ class GoalConditionedPolicy:
         return parameters[0].device
 
     def _format_conditions(self, conditions, batch_size, multi_input=False):
-        conditions = utils.apply_dict(
-            self.normalizer.normalize,
-            conditions,
-            'observations',
-        )
+        K = getattr(self.diffusion_model.model, "max_particles", None)
+        D = getattr(self.diffusion_model.model, "features_dim", None)
+
+        def to_BKD(x):
+            # returns either (B,K,D) if possible, else returns x unchanged
+            if (K is None) or (D is None):
+                return x
+
+            if x.ndim == 1:
+                # (K*D,) -> (1,K,D) if matches
+                if x.shape[0] == K * D:
+                    return x.reshape(1, K, D)
+                return x
+
+            if x.ndim == 2:
+                # (K,D) single env particles
+                if x.shape == (K, D):
+                    return x.reshape(1, K, D)
+                # (B, K*D) flattened batch
+                if x.shape[1] == K * D:
+                    return x.reshape(x.shape[0], K, D)
+                return x
+
+            if x.ndim == 3:
+                # already (B,K,D)
+                return x
+
+            return x
+
+        def to_flat(x):
+            # (B,K,D) -> (B, K*D)
+            if (K is None) or (D is None):
+                return x
+            if x.ndim == 3 and x.shape[-2] == K and x.shape[-1] == D:
+                return x.reshape(x.shape[0], K * D)
+            return x
+
+        # 1) make sure observations/goals are (B,K,D) for the particle normalizer
+        conditions = {k: to_BKD(v) for k, v in conditions.items()}
+
+        # 2) normalize in particle space
+        conditions = utils.apply_dict(self.normalizer.normalize, conditions, "observations")
+
+        # 3) flatten back because diffusion model was trained on flattened obs
+        conditions = {k: to_flat(v) for k, v in conditions.items()}
+
+        # 4) torch + repeat if single-env
         conditions = utils.to_torch(conditions, dtype=torch.float32)
         if not multi_input:
             conditions = utils.apply_dict(
                 einops.repeat,
                 conditions,
-                'd -> repeat d', repeat=batch_size,
+                "b d -> (repeat b) d", repeat=batch_size,
             )
         return conditions

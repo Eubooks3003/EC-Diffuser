@@ -103,7 +103,7 @@ class Trainer(object):
 
     def train(self, n_train_steps, front_bg=None, side_bg=None, latent_rep_model=None):
         timer = Timer()
-        for step in range(n_train_steps):
+        for step in range(int(n_train_steps)):
             for i in range(self.gradient_accumulate_every):
                 batch = next(self.dataloader)
                 batch = batch_to_device(batch)
@@ -125,7 +125,18 @@ class Trainer(object):
             if self.step % self.log_freq == 0:
                 infos_str = ' | '.join([f'{key}: {val:8.4f}' for key, val in infos.items()])
                 print(f'{self.step}: {loss:8.4f} | {infos_str} | t: {timer():8.4f}', flush=True)
-                wandb.log({'step':self.step, 'loss': loss, **infos})
+
+                log_dict = {'step': self.step, 'loss': loss, **infos}
+
+                # lightweight offline eval every log
+                eval_stats = self.eval_offline_goal_metrics(
+                    n_batches=5,     # keep small so it’s cheap
+                    goal_tau=2.0
+                )
+                log_dict.update(eval_stats)
+
+                wandb.log(log_dict)
+
 
             if self.step == 0 and self.sample_freq:
                 self.render_reference(self.n_reference, front_bg=front_bg, side_bg=side_bg)
@@ -248,3 +259,65 @@ class Trainer(object):
 
             savepath = os.path.join(self.logdir, f'sample-{self.step}-{i}.png')
             self.renderer.composite(savepath, observations, front_bg=front_bg, side_bg=side_bg)
+    
+    def eval_offline_goal_metrics(self, n_batches=20, goal_tau=0.25):
+        """
+        Offline eval (no simulator):
+        - goal_l2: L2 distance between predicted final obs and goal condition
+        - goal_success_tau: fraction under threshold
+        - a0_mse: first-action MSE vs dataset action (if action_dim > 0)
+        """
+        self.model.eval()
+        self.ema_model.eval()
+
+        goal_l2s = []
+        goal_succs = []
+        a0_mses = []
+
+        with torch.no_grad():
+            for _ in range(n_batches):
+                batch = next(self.dataloader)          # training loader is fine for quick sanity
+                batch = batch_to_device(batch)
+
+                # batch.trajectories: [B, H, action_dim + obs_dim]
+                traj_gt = batch.trajectories
+                B, H, D = traj_gt.shape
+
+                # conditions: dict {0: obs0, H-1: goal} as torch tensors already in dataset
+                cond = batch.conditions
+
+                # sample from EMA model
+                samples = self.ema_model(cond, verbose = False)
+                traj_pred = samples.trajectories  # [B, H, action_dim + obs_dim]
+
+                # split
+                a_dim = self.dataset.action_dim
+                obs_gt = traj_gt[:, :, a_dim:]
+                obs_pr = traj_pred[:, :, a_dim:]
+
+                # goal comes from condition at H-1 (already normalized obs space)
+                goal = cond[self.dataset.horizon - 1]  # [B, obs_dim]
+
+                # compare predicted final obs to goal
+                final_obs = obs_pr[:, -1, :]          # [B, obs_dim]
+                l2 = torch.norm(final_obs - goal, dim=-1)  # [B]
+                goal_l2s.append(l2.mean().item())
+                goal_succs.append((l2 < goal_tau).float().mean().item())
+
+                # first-action mse (if actions exist)
+                if a_dim > 0:
+                    a0_gt = traj_gt[:, 0, :a_dim]
+                    a0_pr = traj_pred[:, 0, :a_dim]
+                    a0_mses.append(torch.mean((a0_pr - a0_gt) ** 2).item())
+
+        out = {
+            "eval/goal_l2": float(np.mean(goal_l2s)),
+            "eval/goal_success_tau": float(np.mean(goal_succs)),
+        }
+        if len(a0_mses) > 0:
+            out["eval/a0_mse"] = float(np.mean(a0_mses))
+
+        # restore
+        self.model.train()
+        self.ema_model.train()
+        return out

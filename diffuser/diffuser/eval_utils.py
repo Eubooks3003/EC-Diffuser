@@ -99,9 +99,10 @@ def evaluate_policy(policy, env, args, logger, num_eval_episodes=100, exe_steps=
             obs = env.reset()
             t = 0
             while t < env.horizon:
-                observation = obs['achieved_goal'][:, :, :].reshape(env.num_envs, -1)
-                goal = obs['desired_goal'][:, :, :].reshape(env.num_envs, -1)
+                observation = obs['achieved_goal']          # (B, K, Dtok)
+                goal = obs['desired_goal']                  # (B, K, Dtok)
                 conditions = {0: observation, args.horizon-1: goal}
+
                 action_0, samples = policy(conditions, batch_size=1, verbose=args.verbose)
 
                 for step in range(exe_steps):

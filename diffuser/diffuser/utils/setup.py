@@ -96,13 +96,25 @@ class Parser(Tap):
         mode_to_args = getattr(module, 'mode_to_args')
         if experiment == 'diffusion':
             # for the diffusion experiment, we will overwrite the params for each key in mode_to_args
-            mode_to_args[mode]['dataset_path'] = get_diffuser_dataset_path(args.dataset_loadbase,
-                                                                        args.num_entity, 
-                                                                        args.input_type, 
-                                                                        rand_color=args.rand_color,
-                                                                        push_t=args.push_t,
-                                                                        kitchen=args.kitchen)
+            if mode not in mode_to_args:
+                raise KeyError(f"Mode '{mode}' not in {args.config}.mode_to_args. Available: {list(mode_to_args.keys())}")
+
+            # If the config provides dataset_path (or override_dataset_path), DO NOT overwrite it
+            override = mode_to_args[mode].get('override_dataset_path', None)
+            if override is not None:
+                mode_to_args[mode]['dataset_path'] = override
+            elif mode_to_args[mode].get('dataset_path', None) is None:
+                mode_to_args[mode]['dataset_path'] = get_diffuser_dataset_path(
+                    args.dataset_loadbase,
+                    args.num_entity,
+                    args.input_type,
+                    rand_color=args.rand_color,
+                    push_t=args.push_t,
+                    kitchen=args.kitchen,
+                )
+
             params.update(mode_to_args[mode])
+
         elif experiment == 'plan':
             # for the planning experiment, we will filter out a subset of the keys from mode_to_args to overwrite the params
             mode_to_args_filter = {}

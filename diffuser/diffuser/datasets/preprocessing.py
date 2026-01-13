@@ -4,7 +4,14 @@ import einops
 from scipy.spatial.transform import Rotation as R
 import pdb
 
-from .d4rl import load_environment
+# diffuser/diffuser/datasets/preprocessing.py
+
+try:
+    from .d4rl import load_environment
+except Exception as e:
+    load_environment = None
+    _D4RL_IMPORT_ERROR = e
+
 
 #-----------------------------------------------------------------------------#
 #-------------------------------- general api --------------------------------#

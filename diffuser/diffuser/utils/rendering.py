@@ -7,14 +7,14 @@ from matplotlib.colors import ListedColormap
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
 import gym
-import mujoco_py as mjc
+# import mujoco_py as mjc
 import warnings
 import cv2 as cv
 
 from .arrays import to_np
 from .video import save_video, save_videos
 
-from diffuser.datasets.d4rl import load_environment
+# from diffuser.datasets.d4rl import load_environment
 from dlp_utils import get_recon_from_dlps
 
 #-----------------------------------------------------------------------------#
@@ -264,11 +264,14 @@ class MuJoCoRenderer:
         ## - 1 because the envs in renderer are fully-observed
         self.observation_dim = np.prod(self.env.observation_space.shape) - 1
         self.action_dim = np.prod(self.env.action_space.shape)
-        try:
-            self.viewer = mjc.MjRenderContextOffscreen(self.env.sim)
-        except:
-            print('[ utils/rendering ] Warning: could not initialize offscreen renderer')
-            self.viewer = None
+
+        # No longer using mujoco_py
+        self.viewer = None
+        # try:
+        #     self.viewer = mjc.MjRenderContextOffscreen(self.env.sim)
+        # except:
+        #     print('[ utils/rendering ] Warning: could not initialize offscreen renderer')
+        #     self.viewer = None
 
     def pad_observation(self, observation):
         state = np.concatenate([

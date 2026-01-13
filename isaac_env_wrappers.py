@@ -15,7 +15,11 @@ import matplotlib.pyplot as plt
 from moviepy.editor import ImageSequenceClip
 
 from gym import spaces
-from gym.core import GoalEnv
+import gym
+try:
+    from gym.core import GoalEnv  # old gym
+except Exception:
+    GoalEnv = gym.Env
 
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.env_checker import check_env
@@ -26,42 +30,71 @@ from dlp_utils import load_pretrained_rep_model, load_latent_classifier, get_dlp
 
 
 class SB3VecEnvAdapter(VecEnv):
-
     def __init__(self, num_envs: int, observation_space: spaces.Space, action_space: spaces.Space):
         super().__init__(num_envs, observation_space, action_space)
+        self._actions = None
 
     def step_async(self, actions):
-        pass
+        self._actions = actions
 
     def step_wait(self):
-        pass
+        return self.step(self._actions)
+
+    def close(self):
+        # important: VecEnv requires this
+        if hasattr(self, "env") and hasattr(self.env, "close"):
+            try:
+                self.env.close()
+            except Exception:
+                pass
 
     def get_attr(self, attr_name, indices=None):
-        pass
+        # SB3 expects a list
+        if indices is None:
+            indices = list(range(self.num_envs))
+        val = getattr(self.env, attr_name)
+        return [val for _ in indices]
 
     def set_attr(self, attr_name, value, indices=None):
-        pass
+        setattr(self.env, attr_name, value)
 
     def env_method(self, method_name, *method_args, indices=None, **method_kwargs):
-        pass
+        method = getattr(self, method_name, None)
+        if method is None:
+            method = getattr(self.env, method_name)
+        out = method(*method_args, **method_kwargs)
+        if indices is None:
+            indices = list(range(self.num_envs))
+        # SB3 expects list-like return for vec env methods
+        return [out for _ in indices]
 
-    def seed(self, seed):
-        pass
+    def seed(self, seed=None):
+        if hasattr(self.env, "seed"):
+            return self.env.seed(seed)
+        return None
 
-    def env_is_wrapped(self):
-        pass
+    def env_is_wrapped(self, wrapper_class, indices=None):
+        if indices is None:
+            indices = list(range(self.num_envs))
+        return [False for _ in indices]
 
-    def render(self):
-        pass
+    def render(self, mode="human"):
+        if hasattr(self.env, "render"):
+            return self.env.render(mode=mode)
+        return None
 
 
-class IsaacPandaPushGoalSB3Wrapper(GoalEnv, SB3VecEnvAdapter):
+
+class IsaacPandaPushGoalSB3Wrapper(SB3VecEnvAdapter):
     def __init__(self, env, obs_mode, n_views, latent_rep_model, latent_classifier, reward_cfg, smorl=False, collect_images=True, **kwargs):
 
         self.env = env
         self.device = self.env.device
         self.collect_images = collect_images
 
+        print("obs_space:", self.env.observation_space)
+        print("act_space:", self.env.action_space)
+        print("num_envs:", self.env.num_envs)
         super().__init__(self.env.num_envs, self.env.observation_space, self.env.action_space)
 
         # Gym specific attributes

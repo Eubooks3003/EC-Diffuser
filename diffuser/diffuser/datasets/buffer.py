@@ -105,16 +105,50 @@ class ReplayBuffer:
 
     def load_paths_from_pickle(self, path, single_view=False):
         paths_dict = pickle.load(open(path, 'rb'))
+
+        # allow meta dicts etc
+        meta = paths_dict.get('meta', None)
+        if isinstance(meta, dict):
+            K_expected = meta.get('K', None) or meta.get('num_entity', None)
+        else:
+            K_expected = None
+
         for key, val in paths_dict.items():
+            # keep meta as-is
+            if key == 'meta':
+                self._dict[key] = val
+                continue
+
+            # Single-view handling ONLY if data is actually packed as 2K
             if single_view and (key == 'observations' or key == 'goals'):
-                total_particles = val.shape[2]
-                val = val[:, :, :total_particles//2, :]
+                if isinstance(val, np.ndarray) and val.ndim == 4:
+                    # val: (E,T,K,D)
+                    E, T, K, D = val.shape
+
+                    # If we know expected K, only slice when K == 2*K_expected
+                    if K_expected is not None:
+                        if K == 2 * K_expected:
+                            val = val[:, :, :K_expected, :]
+                        elif K == K_expected:
+                            pass
+                        else:
+                            raise ValueError(
+                                f"[buffer] unexpected particle dim K={K}, expected {K_expected} or {2*K_expected}"
+                            )
+                    else:
+                        # If we DON'T know expected K, do NOT slice.
+                        # (Your dataset is already single-view K=64.)
+                        pass
+
             if key == 'path_lengths':
                 self._dict[key] = val.astype(np.int32)
             else:
                 self._dict[key] = val.astype(np.float32)
+
         self._count = self._dict['observations'].shape[0]
+
         if 'path_lengths' not in paths_dict:
             self._dict['path_lengths'] = np.array([len(obs) for obs in self._dict['observations']])
-        self.keys = list(paths_dict.keys())
+
+        self.keys = [k for k in paths_dict.keys() if k != 'meta']
         print(f'[ datasets/buffer ] Loaded {self._count} episodes from {path}')
