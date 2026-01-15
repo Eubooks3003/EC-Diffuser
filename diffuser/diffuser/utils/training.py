@@ -329,12 +329,17 @@ class Trainer(object):
         dlp_model,
         calib_h5_path,
         n_episodes=5,
-        max_steps=50,
+        max_steps=500,
         bounds_xyz=((-2,2), (-2,2), (-0.2,2.5)),
         grid_dhw=(64,64,64),
         cams=("agentview","sideview","robot0_eye_in_hand"),
         pixel_stride=2,
         goal_from_env_fn=None,
+
+        save_videos=True,
+        video_dir=None,
+        video_fps=20,
+        video_cams=("agentview",), 
     ):
         """
         True success eval by stepping MimicGen.
@@ -347,6 +352,47 @@ class Trainer(object):
 
         device = next(self.ema_model.parameters()).device
         dlp_model = dlp_model.to(device).eval()
+
+        import os
+        import numpy as np
+        import imageio.v2 as imageio
+
+        def _to_uint8(img):
+            img = np.asarray(img)
+            if img.ndim == 4 and img.shape[0] == 1:
+                img = img[0]
+            # CHW -> HWC if needed
+            if img.ndim == 3 and img.shape[0] in (1,3,4) and img.shape[-1] not in (1,3,4):
+                img = np.transpose(img, (1,2,0))
+            if img.dtype != np.uint8:
+                if img.max() <= 1.5:
+                    img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+                else:
+                    img = np.clip(img, 0, 255).astype(np.uint8)
+            return img
+
+        def _frame_from_raw_obs(raw_obs, cams_to_use):
+            frames = []
+            for cam in cams_to_use:
+                k = f"{cam}_image"
+                if k not in raw_obs:
+                    continue
+                frames.append(_to_uint8(raw_obs[k]))
+            if not frames:
+                return None
+            # concat multi-view horizontally
+            if len(frames) == 1:
+                return frames[0]
+            # make same height if needed (simple crop)
+            h = min(f.shape[0] for f in frames)
+            frames = [f[:h] for f in frames]
+            return np.concatenate(frames, axis=1)
+
+        if save_videos:
+            if video_dir is None:
+                video_dir = os.path.join(self.logdir, "eval_videos", f"step_{self.step}")
+            os.makedirs(video_dir, exist_ok=True)
+
 
         successes = []
         returns = []
@@ -368,7 +414,11 @@ class Trainer(object):
 
             obs_vec = envw.reset()
             ep_ret = 0.0
-
+            frames = []
+            if save_videos and envw.last_raw_obs is not None:
+                fr = _frame_from_raw_obs(envw.last_raw_obs, video_cams)
+                if fr is not None:
+                    frames.append(fr)
             for t in range(max_steps):
                 # build condition dict in *raw token space*
                 cond_np = envw.make_cond(obs_vec, horizon=self.dataset.horizon)
@@ -394,10 +444,20 @@ class Trainer(object):
 
                 obs_vec, r, done, info = envw.step(a0)
                 ep_ret += float(r)
+                if save_videos and envw.last_raw_obs is not None:
+                    fr = _frame_from_raw_obs(envw.last_raw_obs, video_cams)
+                    if fr is not None:
+                        frames.append(fr)
 
                 if done:
                     break
 
+            # ---- new: write video ----
+            if save_videos and len(frames) > 0:
+                out_path = os.path.join(video_dir, f"ep_{ep:03d}.mp4")
+                # macro_block_size=None avoids ffmpeg issues with non-multiple-of-16 sizes
+                imageio.mimsave(out_path, frames, fps=int(video_fps), macro_block_size=None)
+                print(f"[mimicgen eval] wrote video: {out_path}", flush=True)
             # success flag (wrapper tries common info keys; may be None)
             success = bool(info.get("success", False)) if isinstance(info, dict) else False
             successes.append(success)

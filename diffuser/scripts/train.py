@@ -10,6 +10,9 @@ import diffuser.utils as utils
 from diffuser.utils.arrays import set_global_device
 from diffuser.utils.args import ArgsParser
 
+import logging
+logging.basicConfig(level=logging.WARNING, force=True) 
+
 
 # -----------------------------------------------------------------------------#
 #                        make lpwm-dev importable                               #
@@ -280,7 +283,7 @@ for i in range(n_epochs):
                 max_steps=getattr(args, "mimicgen_max_steps", 50),
                 bounds_xyz=getattr(args, "mimicgen_bounds_xyz", ((-2, 2), (-2, 2), (-0.2, 2.5))),
                 grid_dhw=getattr(args, "mimicgen_grid_dhw", (64, 64, 64)),
-                cams=getattr(args, "mimicgen_cams", ("agentview", "sideview", "robot0_eye_in_hand")),
+                cams=getattr(args, "mimicgen_cams", ("agentview", "sideview")),
                 pixel_stride=getattr(args, "mimicgen_pixel_stride", 2),
                 goal_from_env_fn=getattr(args, "goal_from_env_fn", None),
             )

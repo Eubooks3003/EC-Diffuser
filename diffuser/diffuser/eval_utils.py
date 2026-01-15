@@ -369,6 +369,38 @@ def setup_mimicgen_env(args):
     if cam_h is not None:
         env_kwargs["camera_heights"] = cam_h
 
+
+            # --- FIX: robomimic ObsUtils must be initialized before env.reset() ---
+    from robomimic.utils import obs_utils as ObsUtils
+
+    # --- force the cameras you want ---
+    cam_names = ["agentview", "sideview"]  # robosuite camera names
+    env_kwargs["camera_names"] = cam_names
+
+    # --- force depth ON (you need this for pointcloud reconstruction) ---
+    # safest is per-camera lists
+    env_kwargs["camera_depths"]  = [True] * len(cam_names)
+    env_kwargs["camera_heights"] = [getattr(args, "mimicgen_camera_height", 48)] * len(cam_names)
+    env_kwargs["camera_widths"]  = [getattr(args, "mimicgen_camera_width", 48)] * len(cam_names)
+
+    env_kwargs["has_renderer"] = False
+    env_kwargs["has_offscreen_renderer"] = True
+    env_kwargs["use_camera_obs"] = True
+
+    # --- initialize ObsUtils BEFORE env.reset() ever happens ---
+    rgb_keys   = [f"{c}_image" for c in cam_names]
+    depth_keys = [f"{c}_depth" for c in cam_names]
+
+    obs_specs = {
+        "obs": {
+            "rgb": rgb_keys,
+            "depth": depth_keys,
+            "low_dim": [],
+        }
+    }
+    ObsUtils.initialize_obs_utils_with_obs_specs(obs_specs)
+
+
     # 4) Create env (robomimic APIs vary slightly across versions, so be defensive)
     env_name = env_meta.get("env_name", None)
     if env_name is None:
@@ -376,14 +408,27 @@ def setup_mimicgen_env(args):
         env_name = env_meta.get("env", None)
 
     try:
+        env_meta = FileUtils.get_env_metadata_from_dataset(dataset_h5)
+
+        # Ensure key exists and merge overrides here
+        env_meta.setdefault("env_kwargs", {})
+        env_meta["env_kwargs"].update(env_kwargs)
+
         env = EnvUtils.create_env_from_metadata(
             env_meta=env_meta,
-            env_name=env_name,
+            env_name=env_meta.get("env_name", None),
             render=False,
             render_offscreen=True,
             use_image_obs=True,
-            env_kwargs=env_kwargs,
+            use_depth_obs=True
         )
+        o = env.reset()
+        print([k for k in sorted(o.keys()) if "image" in k or "depth" in k])
+        print("agentview_depth:", o["agentview_depth"].shape, float(o["agentview_depth"].min()), float(o["agentview_depth"].max()))
+        print("sideview_depth:",  o["sideview_depth"].shape,  float(o["sideview_depth"].min()),  float(o["sideview_depth"].max()))
+
+        return env
+
     except TypeError:
         # older signatures
         env = EnvUtils.create_env_from_metadata(
@@ -392,6 +437,7 @@ def setup_mimicgen_env(args):
             render=False,
             render_offscreen=True,
             use_image_obs=True,
+            use_obs_depth=True
         )
 
     return env

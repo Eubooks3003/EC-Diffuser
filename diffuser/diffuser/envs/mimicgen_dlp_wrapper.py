@@ -235,6 +235,8 @@ class MimicGenDLPWrapper:
         self.get_goal_raw_obs_fn = get_goal_raw_obs_fn
         self.success_key_candidates = tuple(success_key_candidates)
 
+        self.last_raw_obs = None
+        self.last_info = None
         # calib per cam: dict cam -> dict(K, Tc2w, near, far)
         self.calib = {}
         if calib_h5_path is not None:
@@ -334,6 +336,20 @@ class MimicGenDLPWrapper:
 
             v = idxs[:, 0]
             u = idxs[:, 1]
+
+            rgb = np.asarray(rgb)
+
+            # handle batch dim
+            if rgb.ndim == 4 and rgb.shape[0] == 1:
+                rgb = rgb[0]
+
+            # if CHW -> HWC
+            if rgb.ndim == 3 and rgb.shape[0] in (1, 3, 4) and rgb.shape[-1] not in (1, 3, 4):
+                rgb = np.transpose(rgb, (1, 2, 0))
+
+            # now rgb is HWC, safe to index with v,u
+            rgb_pts = rgb[v, u, :].astype(np.float32)
+
             rgb_pts = rgb[v, u, :].astype(np.float32)
             if rgb_pts.max() > 1.5:
                 rgb_pts /= 255.0
@@ -385,22 +401,26 @@ class MimicGenDLPWrapper:
 
     def reset(self, **kwargs):
         raw_obs = self.env.reset(**kwargs)
+        self.last_raw_obs = raw_obs
+        self.last_info = None
 
         obs_vec, _, _ = self.encode_tokens(raw_obs)
 
-        # goal image/state -> encode once
         if self.get_goal_raw_obs_fn is not None:
             goal_raw = self.get_goal_raw_obs_fn(self.env, raw_obs)
             goal_vec, _, _ = self.encode_tokens(goal_raw)
             self.goal_vec = goal_vec
         else:
-            # fallback: goal = current obs (debug only)
             self.goal_vec = obs_vec.copy()
 
         return obs_vec
 
+
     def step(self, action):
         raw_obs, reward, done, info = self.env.step(action)
+        self.last_raw_obs = raw_obs
+        self.last_info = info
+
         obs_vec, _, _ = self.encode_tokens(raw_obs)
         success = self._get_success_from_info(info)
         if success is not None:
