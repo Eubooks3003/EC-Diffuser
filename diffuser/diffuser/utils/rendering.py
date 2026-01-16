@@ -15,7 +15,9 @@ from .arrays import to_np
 from .video import save_video, save_videos
 
 # from diffuser.datasets.d4rl import load_environment
-from dlp_utils import get_recon_from_dlps
+from dlp_utils import (get_recon_from_dlps, _to_np_no_torch_numpy, _torch_from_any_no_numpy_bridge, 
+                       get_recon_from_dlps_3d, log_rgb_voxels)
+import torch
 
 #-----------------------------------------------------------------------------#
 #------------------------------- helper structs ------------------------------#
@@ -60,6 +62,7 @@ class ParticleRenderer:
     def __init__(self, env, particle_dim=10, single_view=False, latent_rep_model=None, **kwargs):
         self.env = env
         self.latent_rep_model=latent_rep_model
+        print(":atent rep model ", latent_rep_model)
         self.particle_dim = particle_dim
         self.require_bg = True
         self.single_view = single_view
@@ -109,6 +112,304 @@ class ParticleRenderer:
             print(f'Saved {len(paths)} samples to: {savepath}')
 
         return images
+
+import os
+import numpy as np
+import torch
+
+from eval.eval_vox import log_rgb_voxels
+
+
+def _as_torch_f32(x, device: torch.device) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        t = x
+    else:
+        t = torch.from_numpy(np.asarray(x))
+    if t.dtype != torch.float32:
+        t = t.float()
+    return t.to(device)
+
+
+def _coerce_to_1KD(particles, particle_dim: int) -> torch.Tensor:
+    """
+    Accepts:
+      - [Dtok]               -> [1,1,Dtok]
+      - [K,Dtok]             -> [1,K,Dtok]
+      - [B,K,Dtok]           -> [B,K,Dtok]
+      - [B,T,K,Dtok]         -> (handled in composite/renders, not here)
+      - flattened [K*Dtok]   -> infer K via particle_dim if possible
+
+    Returns: [1,K,Dtok] or [B,K,Dtok]
+    """
+    if particles.ndim == 1:
+        # [Dtok] (single set) OR flattened [K*Dtok]
+        D = particles.shape[0]
+        if D == particle_dim:
+            return particles.view(1, 1, particle_dim)
+        if D % particle_dim == 0:
+            K = D // particle_dim
+            return particles.view(1, K, particle_dim)
+        raise ValueError(f"1D particles length {D} not compatible with particle_dim={particle_dim}")
+
+    if particles.ndim == 2:
+        # [K,Dtok]
+        K, Dtok = particles.shape
+        if Dtok != particle_dim:
+            raise ValueError(f"Expected particles shape [K,{particle_dim}], got [K,{Dtok}]")
+        return particles.unsqueeze(0)  # [1,K,Dtok]
+
+    if particles.ndim == 3:
+        # [B,K,Dtok]
+        B, K, Dtok = particles.shape
+        if Dtok != particle_dim:
+            raise ValueError(f"Expected particles shape [B,K,{particle_dim}], got [B,K,{Dtok}]")
+        return particles
+
+    raise ValueError(f"Unsupported particles shape: {tuple(particles.shape)}")
+
+
+class ParticleRenderer3D:
+    """
+    Emulates the voxel debug script:
+
+      x = particles [1,K,Dtok]
+      z       = x[..., 0:3].unsqueeze(1)   # [B,1,K,3]
+      z_scale = x[..., 3:6].unsqueeze(1)   # [B,1,K,3]
+      z_depth = x[..., 6:7].unsqueeze(1)   # [B,1,K,1]
+      obj_on  = x[..., 7:8].unsqueeze(1)   # [B,1,K,1]
+      z_feat  = x[..., 8: ].unsqueeze(1)   # [B,1,K,F]
+
+      dec = model.decode_all(..., warmup=False)
+      log fg_only = dec["dec_objects_trans"][0]
+      log rec_rgb = dec["rec_rgb"][0]
+    """
+
+    def __init__(
+        self,
+        env=None,
+        *,
+        latent_rep_model=None,
+        out_dir=None,
+
+        particle_dim=11,  # should equal Dtok in your buffer
+        # token layout (must match your preprocess/debug)
+        pos_slice=(0, 3),
+        scale_slice=(3, 6),
+        depth_slice=(6, 7),
+        obj_on_slice=(7, 8),
+        feat_slice=(8, None),
+
+        # logging params (match your debug)
+        mode="splat",
+        topk=60000,
+        alpha_thresh=0.05,
+        pad=2.0,
+        show_axes=True,
+    ):
+        self.env = env
+        self.latent_rep_model = latent_rep_model
+        self.out_dir = out_dir or os.path.join(os.getcwd(), "renders_3d")
+
+        self.particle_dim = int(particle_dim)
+
+        self.pos_slice = pos_slice
+        self.scale_slice = scale_slice
+        self.depth_slice = depth_slice
+        self.obj_on_slice = obj_on_slice
+        self.feat_slice = feat_slice
+
+        self.mode = str(mode)
+        self.topk = int(topk)
+        self.alpha_thresh = float(alpha_thresh)
+        self.pad = float(pad)
+        self.show_axes = bool(show_axes)
+
+        # to match older renderer API expectations
+        self.require_bg = False
+
+    def _get_model_and_device(self):
+        if self.env is not None:
+            model = getattr(self.env, "latent_rep_model", None)
+            if model is None:
+                raise ValueError("env provided but env.latent_rep_model is None")
+            device = getattr(self.env, "device", None)
+            if device is None:
+                # fail-fast: don't guess; require explicit env.device
+                raise ValueError("env provided but env.device is None")
+            return model, torch.device(device)
+
+        if self.latent_rep_model is None:
+            raise ValueError("Provide either env with latent_rep_model, or latent_rep_model directly.")
+
+        model = self.latent_rep_model
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            raise ValueError("latent_rep_model has no parameters; cannot infer device.")
+        return model, device
+
+    def _unpack_tokens(self, x_bkd: torch.Tensor):
+        """
+        x_bkd: [B,K,Dtok]
+        returns tensors shaped [B,1,K,*] matching decode_all signature.
+        """
+        if x_bkd.ndim != 3:
+            raise ValueError(f"Expected [B,K,Dtok], got {tuple(x_bkd.shape)}")
+        B, K, Dtok = x_bkd.shape
+        if Dtok != self.particle_dim:
+            raise ValueError(f"Dtok={Dtok} != particle_dim={self.particle_dim}")
+
+        def slc(s):
+            a, b = s
+            return slice(a, b)
+
+        z       = x_bkd[..., slc(self.pos_slice)].unsqueeze(1)     # [B,1,K,3]
+        z_scale = x_bkd[..., slc(self.scale_slice)].unsqueeze(1)   # [B,1,K,3]
+        z_depth = x_bkd[..., slc(self.depth_slice)].unsqueeze(1)   # [B,1,K,?]
+        obj_on  = x_bkd[..., slc(self.obj_on_slice)].unsqueeze(1)  # [B,1,K,?]
+
+        fs0, fs1 = self.feat_slice
+        feat = x_bkd[..., slice(fs0, fs1)].unsqueeze(1)            # [B,1,K,F]
+
+        # print("z shape: ", z.shape)
+        # print("z_scale shape: ", z_scale.shape)
+        # print("z_depth shape: ", z_depth.shape)
+        # print("obj_on shape: ", obj_on.shape)
+        # print("feat shape: ", feat.shape)
+
+        # sanity checks mirroring what you expect
+        if z.shape[-1] != 3:
+            raise ValueError(f"pos_slice must produce 3 dims, got {z.shape}")
+        if z_scale.shape[-1] != 3:
+            raise ValueError(f"scale_slice must produce 3 dims, got {z_scale.shape}")
+        if z_depth.shape[-1] < 1:
+            raise ValueError(f"depth_slice must produce >=1 dim, got {z_depth.shape}")
+        if obj_on.shape[-1] < 1:
+            raise ValueError(f"obj_on_slice must produce >=1 dim, got {obj_on.shape}")
+
+        return z, z_scale, feat, obj_on, z_depth
+
+    @torch.no_grad()
+    def render_volume(self, particles):
+        """
+        Returns (fg_only, rec_rgb) as [3,D,H,W] (not batched) for the FIRST item in batch.
+        """
+        model, device = self._get_model_and_device()
+
+        x = _as_torch_f32(particles, device)
+        x_bkd = _coerce_to_1KD(x, self.particle_dim)  # [B,K,Dtok] (B may be 1)
+        z, z_scale, z_feat, obj_on, z_depth = self._unpack_tokens(x_bkd)
+
+        dec = model.decode_all(
+            z, z_scale, z_feat, obj_on, z_depth,
+            None, None,
+            warmup=False
+        )
+        if not isinstance(dec, dict):
+            raise TypeError(f"decode_all returned {type(dec)}; expected dict")
+
+        if "rec_rgb" not in dec:
+            raise KeyError(f"decode_all missing 'rec_rgb'. Keys: {list(dec.keys())}")
+        if "dec_objects_trans" not in dec:
+            raise KeyError(f"decode_all missing 'dec_objects_trans'. Keys: {list(dec.keys())}")
+
+        rec_rgb = dec["rec_rgb"]
+        fg_only = dec["dec_objects_trans"]
+
+        # Expect [B,3,D,H,W] or [B,C,D,H,W]
+        if not (torch.is_tensor(rec_rgb) and rec_rgb.ndim == 5):
+            raise ValueError(f"dec['rec_rgb'] must be [B,3,D,H,W], got {type(rec_rgb)} {getattr(rec_rgb,'shape',None)}")
+        if not (torch.is_tensor(fg_only) and fg_only.ndim == 5):
+            raise ValueError(f"dec['dec_objects_trans'] must be [B,3,D,H,W], got {type(fg_only)} {getattr(fg_only,'shape',None)}")
+
+        rec0 = rec_rgb[0]
+        fg0  = fg_only[0]
+
+        if rec0.shape[0] != 3:
+            raise ValueError(f"rec_rgb[0] must be 3-channel, got {tuple(rec0.shape)}")
+        if fg0.shape[0] != 3:
+            raise ValueError(f"dec_objects_trans[0] must be 3-channel, got {tuple(fg0.shape)}")
+
+        return fg0, rec0
+
+    @torch.no_grad()
+    def render(self, particles, front_bg=None, side_bg=None, *, tag=None, step=None, **kwargs):
+        """
+        Logs the exact same visuals as debug_dlp_vox.py using log_rgb_voxels.
+        Returns a dummy uint8 image for compatibility with upstream trainer code.
+        """
+        fg0, rec0 = self.render_volume(particles)
+
+        base = "render3d"
+        if tag is not None:
+            base = f"{base}/{tag}"
+
+        log_rgb_voxels(
+            name=f"{base}/fg_only_dec",
+            rgb_vol=fg0,
+            alpha_vol=None,
+            KPx=None,
+            step=step,
+            mode=self.mode,
+            topk=self.topk,
+            alpha_thresh=self.alpha_thresh,
+            pad=self.pad,
+            show_axes=self.show_axes,
+        )
+
+        log_rgb_voxels(
+            name=f"{base}/rec_rgb_dec",
+            rgb_vol=rec0,
+            alpha_vol=None,
+            KPx=None,
+            step=step,
+            mode=self.mode,
+            topk=self.topk,
+            alpha_thresh=self.alpha_thresh,
+            pad=self.pad,
+            show_axes=self.show_axes,
+        )
+
+        return np.zeros((8, 8, 3), dtype=np.uint8)
+
+    def composite(self, savepath, paths, front_bg=None, side_bg=None, **kwargs):
+        """
+        paths: typically [N,H,obs_dim] numpy
+        We iterate and call render() per timestep so you can scroll logs per t.
+        """
+        if not isinstance(paths, np.ndarray):
+            paths = np.asarray(paths)
+
+        if paths.ndim != 3:
+            raise ValueError(f"Expected paths [N,H,Dtok] (or flattened), got {paths.shape}")
+
+        N, H, D = paths.shape
+
+        base_tag = "composite"
+        if savepath is not None:
+            base_tag = os.path.splitext(os.path.basename(savepath))[0]
+
+        step0 = kwargs.get("step", None)
+
+        for n in range(N):
+            for t in range(H):
+                obs_t = paths[n, t]
+                self.render(
+                    obs_t,
+                    tag=f"{base_tag}/sample_{n:02d}/t_{t:03d}",
+                    step=(step0 if step0 is not None else t),
+                )
+
+        return np.zeros((8, 8, 3), dtype=np.uint8)
+
+    def renders(self, samples, front_bg=None, side_bg=None, *, tag=None, step=None, **kwargs):
+        """
+        samples: iterable of particles (usually a batch of independent samples)
+        """
+        imgs = []
+        for i, s in enumerate(samples):
+            imgs.append(self.render(s, tag=(None if tag is None else f"{tag}/i_{i:03d}"), step=step))
+        return np.concatenate(imgs, axis=1)
 
 class MatplotlibRenderer:
     '''

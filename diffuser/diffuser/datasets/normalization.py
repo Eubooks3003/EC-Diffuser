@@ -63,21 +63,51 @@ class DatasetNormalizer:
         return self.normalizers
 
 def flatten(dataset, path_lengths):
-    '''
-        flattens dataset of { key: [ n_episodes x max_path_lenth x dim ] }
-            to { key : [ (n_episodes * sum(path_lengths)) x dim ]}
-    '''
+    """
+    Flatten dataset fields by concatenating across episodes, respecting path_lengths.
+
+    - observations: (N,T,K,D) -> (sumT, K, D)   (keep particle structure)
+    - goals:        (N,T,K,D) -> (sumT, K, D)   (optional; often skipped later)
+    - actions:      (N,T,A)   -> (sumT, A)
+    - rewards/etc:  (N,T,1)   -> (sumT, 1)
+    Skips non-array fields like meta dicts and info_* keys.
+    """
+    import numpy as np
+    import torch
+
+    path_lengths = np.asarray(path_lengths).astype(int)
+    N = len(path_lengths)
+
     flattened = {}
     for key, xs in dataset.items():
-        if len(xs) == 0:
+        # skip non-array fields
+        if xs is None or isinstance(xs, dict):
             continue
-        assert len(xs) == len(path_lengths)
-        if 'info' not in key:
-            flattened[key] = np.concatenate([
-                x[:length]
-                for x, length in zip(xs, path_lengths)
-            ], axis=0)
+        if 'info' in key:
+            continue
+
+        if torch.is_tensor(xs):
+            xs = xs.detach().cpu().numpy()
+        if not isinstance(xs, np.ndarray):
+            continue
+        if xs.ndim < 2:
+            continue
+        if xs.shape[0] != N:
+            continue
+
+        parts = []
+        for i, L in enumerate(path_lengths):
+            parts.append(xs[i, :L])
+
+        cat = np.concatenate(parts, axis=0)  # concatenate along time across episodes
+
+        # IMPORTANT: do NOT flatten particle dims for observations/goals
+        # Keep cat as (sumT, K, D) for particle normalizer.
+        # For non-particle fields, cat will already be (sumT, A) or (sumT, 1)
+        flattened[key] = cat
+
     return flattened
+
 
 #-----------------------------------------------------------------------------#
 #-------------------------- single-field normalizers -------------------------#

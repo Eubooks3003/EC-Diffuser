@@ -53,7 +53,8 @@ class ReplayBuffer:
 
     def items(self):
         return {k: v for k, v in self._dict.items()
-                if k != 'path_lengths'}.items()
+                if k not in ('path_lengths', 'meta')}.items()
+
 
     def _allocate(self, key, array):
         assert key not in self._dict

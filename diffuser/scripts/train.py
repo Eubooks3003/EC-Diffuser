@@ -133,13 +133,13 @@ render_config = utils.Config(
     args.renderer,
     savepath=(args.savepath, "render_config.pkl"),
     env=None,
-    num_entity=args.num_entity,
     particle_dim=args.features_dim,
-    single_view=(args.input_type == "dlp" and not args.multiview),
 )
 
 dataset = dataset_config()
 renderer = render_config()
+
+print("renderer: ", renderer)
 
 observation_dim = dataset.observation_dim
 action_dim = dataset.action_dim
@@ -254,6 +254,8 @@ if do_eval and eval_backend == "mimicgen":
 
     print(f"[mimicgen eval] loading DLP from cfg={dlp_cfg_path} ckpt={dlp_ckpt}", flush=True)
     dlp_model, dlp_cfg = load_dlp_lpwm(dlp_cfg_path, dlp_ckpt, args.device)
+
+    renderer.latent_rep_model = dlp_model
 
     def make_env_fn():
         from diffuser.eval_utils import setup_mimicgen_env
