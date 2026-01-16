@@ -137,6 +137,8 @@ render_config = utils.Config(
 )
 
 dataset = dataset_config()
+
+print("DATASTE TYPE: ", dataset.__class__.__name__)
 renderer = render_config()
 
 print("renderer: ", renderer)

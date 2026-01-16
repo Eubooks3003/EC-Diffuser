@@ -12,13 +12,13 @@ logbase = 'data'
 # IMPORTANT: key must match mode computed in setup.py: "{num_entity}C_{input_type}"
 # With your tokens: --num_entity 64 --input_type dlp  =>  "64C_dlp"
 mode_to_args = {
-  '24C_dlp': {
+  '16C_dlp': {
     'dataset': 'mimicgen_stack_dlp',
     'override_dataset_path': '/home/ellina/Desktop/Code/lpwm-dev/ecdiffuser_data/stack_replay_buffer_dlp_debug.pkl',
     'calib_h5_path': '/home/ellina/Desktop/Code/articubot-on-mimicgen/stack_d1_rgbd_pcd.hdf5',
-    'dlp_ckpt': '/home/ellina/Desktop/Code/lpwm-dev/checkpoints_3d/mimicgen_rgb/mimicgen_rgb_best.pt',
+    'dlp_ckpt': '/home/ellina/Desktop/Code/lpwm-dev/checkpoints_3d/best/best.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': "/home/ellina/Desktop/Code/lpwm-dev/configs/mimicgen_rgb.json",
+    'dlp_cfg': "/home/ellina/Desktop/Code/lpwm-dev/configs/best.json",
     'features_dim': 12,
     'max_particles': 16,
     'multiview': False,
@@ -27,7 +27,7 @@ mode_to_args = {
     'env_config_dir': 'env_config/n_cubes',
     'eval_freq': 1,
     'eval_backend': 'mimicgen',
-    'n_steps_per_epoch': 200,
+    'n_steps_per_epoch': 1e4,
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 48,
     "mimicgen_camera_height": 48,

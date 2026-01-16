@@ -346,7 +346,6 @@ class Trainer(object):
                 device=device,
                 cams=cams,
                 grid_dhw=grid_dhw,
-                bounds_xyz=bounds_xyz,
                 pixel_stride=pixel_stride,
                 calib_h5_path=calib_h5_path,
                 get_goal_raw_obs_fn=goal_from_env_fn,

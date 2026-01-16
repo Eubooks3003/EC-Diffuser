@@ -374,16 +374,22 @@ class ParticleRenderer3D:
 
     def composite(self, savepath, paths, front_bg=None, side_bg=None, **kwargs):
         """
-        paths: typically [N,H,obs_dim] numpy
-        We iterate and call render() per timestep so you can scroll logs per t.
+        paths: [N,H,D]
+        Render a staggered subset of timesteps (evenly spaced), always including start and goal.
         """
         if not isinstance(paths, np.ndarray):
             paths = np.asarray(paths)
 
         if paths.ndim != 3:
-            raise ValueError(f"Expected paths [N,H,Dtok] (or flattened), got {paths.shape}")
+            raise ValueError(f"Expected paths [N,H,D], got {paths.shape}")
 
         N, H, D = paths.shape
+        if H < 1:
+            raise ValueError(f"Need H>=1, got H={H}")
+
+        num_frames = int(kwargs.get("num_frames", 10))
+        if num_frames < 2:
+            raise ValueError(f"num_frames must be >= 2, got {num_frames}")
 
         base_tag = "composite"
         if savepath is not None:
@@ -391,8 +397,23 @@ class ParticleRenderer3D:
 
         step0 = kwargs.get("step", None)
 
+        # ---- choose indices: evenly spaced, include 0 and H-1, unique + sorted ----
+        if H == 1:
+            idxs = [0]
+        else:
+            # linspace gives floats; round to nearest int, then uniquify
+            idxs = np.linspace(0, H - 1, num_frames)
+            idxs = np.unique(np.round(idxs).astype(int)).tolist()
+            # hard ensure endpoints
+            if idxs[0] != 0:
+                idxs = [0] + idxs
+            if idxs[-1] != (H - 1):
+                idxs = idxs + [H - 1]
+            # final unique+sorted in case of duplicates
+            idxs = sorted(set(idxs))
+
         for n in range(N):
-            for t in range(H):
+            for t in idxs:
                 obs_t = paths[n, t]
                 self.render(
                     obs_t,
@@ -401,6 +422,8 @@ class ParticleRenderer3D:
                 )
 
         return np.zeros((8, 8, 3), dtype=np.uint8)
+
+
 
     def renders(self, samples, front_bg=None, side_bg=None, *, tag=None, step=None, **kwargs):
         """
