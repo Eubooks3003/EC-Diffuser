@@ -127,6 +127,7 @@ dataset_config = utils.Config(
     max_path_length=args.max_path_length,
     overfit=args.overfit,
     single_view=(args.input_type == "dlp" and not args.multiview),
+    action_z_scale=getattr(args, 'action_z_scale', 1.0),
 )
 
 render_config = utils.Config(
@@ -306,7 +307,8 @@ for i in range(n_epochs):
                 pixel_stride=getattr(args, "mimicgen_pixel_stride", 2),
                 goal_from_env_fn=getattr(args, "goal_from_env_fn", None),
                 goal_provider=goal_provider,  # NEW: dataset-based goal provider
-                renderer_3d=renderer
+                renderer_3d=renderer,
+                exe_steps=getattr(args, "exe_steps", 1),  # ACTION CHUNKING: how many actions to execute per plan
             )
 
             # avoid double-prefix if eval returns sim/... already

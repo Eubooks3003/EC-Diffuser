@@ -303,7 +303,7 @@ class ParticleLimitsNormalizer(ParticleNormalizer):
         if x_unflat.max() > 1 + eps or x_unflat.min() < -1 - eps:
             print(f'[ datasets/dlp ] Warning: sample out of range | ({x_unflat.min():.4f}, {x_unflat.max():.4f})')
             x_unflat = np.clip(x_unflat, -1, 1)
-        
+
         ## [ -1, 1 ] --> [ 0, 1 ]
         x_unflat = (x_unflat + 1) / 2.
         ret_unflat = x_unflat * (self.maxs - self.mins) + self.mins

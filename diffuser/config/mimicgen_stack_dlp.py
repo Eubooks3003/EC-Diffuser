@@ -23,16 +23,17 @@ mode_to_args = {
     'max_particles': 16,
     'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 102,
+    'max_path_length': 132,
     'env_config_dir': 'env_config/n_cubes',
     'eval_freq': 1,
     'eval_backend': 'mimicgen',
-    'n_steps_per_epoch': 200,
+    'n_steps_per_epoch': 500,
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,
     "mimicgen_max_steps":500,
-    "use_absolute_actions": True
+    "use_absolute_actions": True,
+    'horizon': 5
 
   },
 }
@@ -52,7 +53,7 @@ base = {
         'dropout': 0.0,
 
         'n_diffusion_steps': 5,
-        'action_weight': 10,
+        'action_weight': 50,
 
         'max_particles': 64,
         'positional_bias': False,
@@ -68,6 +69,7 @@ base = {
         'max_path_length': 10,
         'obs_only': False,
         'action_only': False,
+        'action_z_scale': 4.0,  # Scale Z actions by 4x before normalization to amplify Z learning
 
         # serialization
         'logbase': logbase,
@@ -78,7 +80,7 @@ base = {
         'n_steps_per_epoch': 200,
         'loss_type': 'l1',
         'n_train_steps': 2e6,    
-        'batch_size': 1,
+        'batch_size': 16,
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
         'ema_decay': 0.995,
@@ -99,6 +101,9 @@ base = {
         'loss_weights': None,
         'loss_discount': 1,
 
+        # ACTION CHUNKING for eval: execute N actions per plan before replanning
+        'exe_steps': 3,  # With horizon=5, execute 3 actions before replanning
+
     },
 
     'plan': {
@@ -109,7 +114,7 @@ base = {
         'preprocess_fns': [],
         'device': 'cuda:0',
         'seed': 0,
-        'exe_steps': 1,
+        'exe_steps': 3,  # ACTION CHUNKING: execute 3 actions per plan before replanning (was 1)
 
         'loadbase': None,
         'logbase': logbase,

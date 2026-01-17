@@ -286,6 +286,7 @@ class Trainer(object):
         renderer_3d=None,
         render_debug=True,
         render_debug_steps=(0,),
+        exe_steps=1,  # NEW: number of actions to execute from each plan before replanning
     ):
         """
         True success eval by stepping MimicGen.
@@ -294,6 +295,8 @@ class Trainer(object):
         - calib_h5_path: hdf5 with meta/cameras/*
         - goal_from_env_fn: (env, raw_obs) -> raw_goal_obs (optional, legacy)
         - goal_provider: DatasetGoalProvider for paired init_state + goal tokens (recommended)
+        - exe_steps: number of actions to execute from each predicted trajectory before replanning
+                     (action chunking). Default=1 means replan every step.
         """
         from diffuser.envs.mimicgen_dlp_wrapper import MimicGenDLPWrapper
 
@@ -385,6 +388,11 @@ class Trainer(object):
         print("=" * 60)
         print(f"[eval_mimicgen_rollouts] Starting {n_episodes} episodes, max_steps={max_steps}")
         print(f"[eval_mimicgen_rollouts] Goal provider: {'DatasetGoalProvider' if goal_provider is not None else 'None (legacy mode)'}")
+        print(f"[eval_mimicgen_rollouts] ACTION CHUNKING: exe_steps={exe_steps}, horizon={self.dataset.horizon}")
+        if exe_steps > 1:
+            print(f"[eval_mimicgen_rollouts] Will execute {exe_steps} actions per plan before replanning")
+        else:
+            print(f"[eval_mimicgen_rollouts] WARNING: exe_steps=1 means replanning every step (no chunking)")
         print("=" * 60, flush=True)
 
         for ep in range(n_episodes):
@@ -432,47 +440,98 @@ class Trainer(object):
                 fr = _frame_from_raw_obs(envw.last_raw_obs, video_cams)
                 if fr is not None:
                     frames.append(fr)
-            for t in range(max_steps):
-                # build condition dict in *raw token space*
-                cond_np = envw.make_cond(obs_vec, horizon=self.dataset.horizon)
+            # ACTION CHUNKING: track planned actions buffer
+            action_buffer = None  # will hold (H, a_dim) tensor of planned actions
+            action_idx = 0  # which action in buffer to execute next
+            a_dim = self.dataset.action_dim
+            z_scale = getattr(self.dataset, 'action_z_scale', 1.0)
 
-                # normalize exactly like dataset training
-                def norm_obs(v):
-                    # v is flat (obs_dim,)
-                    # your normalizer expects (N, dim)
-                    v_norm = self.dataset.normalizer.normalize(v[None], "observations")[0]
-                    return torch.from_numpy(v_norm).float().to(device)
+            # Helper to normalize observations
+            def norm_obs(v):
+                v_norm = self.dataset.normalizer.normalize(v[None], "observations")[0]
+                return torch.from_numpy(v_norm).float().to(device)
 
-                cond = {k: norm_obs(v)[None, :] for k, v in cond_np.items()}  # add batch dim
+            t = 0
+            while t < max_steps:
+                # Check if we need to replan (no buffer, or exhausted exe_steps actions)
+                need_replan = (action_buffer is None) or (action_idx >= exe_steps) or (action_idx >= action_buffer.shape[0])
 
-                # sample plan from EMA diffusion
-                sample = self.ema_model(cond, verbose=False)
-                traj = sample.trajectories[0]  # (H, action_dim + obs_dim)
+                if need_replan:
+                    # ====== PLANNING PHASE ======
+                    cond_np = envw.make_cond(obs_vec, horizon=self.dataset.horizon)
+                    cond = {k: norm_obs(v)[None, :] for k, v in cond_np.items()}
 
-                a_dim = self.dataset.action_dim
-                a0_norm = traj[0, :a_dim].detach().cpu().numpy().astype(np.float32)
+                    # === GOAL CONDITIONING DIAGNOSTIC (first timestep only) ===
+                    if t == 0:
+                        obs_cond = cond_np[0]
+                        goal_cond = cond_np[self.dataset.horizon - 1]
+                        diff = np.abs(goal_cond - obs_cond)
+                        print(f"\n[GOAL DIAGNOSTIC ep={ep}]")
+                        print(f"  obs vs goal diff: mean={diff.mean():.4f}, max={diff.max():.4f}, std={diff.std():.4f}")
+                        print(f"  obs range: [{obs_cond.min():.4f}, {obs_cond.max():.4f}]")
+                        print(f"  goal range: [{goal_cond.min():.4f}, {goal_cond.max():.4f}]")
 
-                # unnormalize action back to env action space
-                a0 = self.dataset.normalizer.unnormalize(a0_norm[None], "actions")[0]
+                        cond_no_goal = {0: cond[0], self.dataset.horizon - 1: cond[0].clone()}
+                        sample_no_goal = self.ema_model(cond_no_goal, verbose=False)
+                        a0_no_goal = sample_no_goal.trajectories[0, 0, :a_dim].detach().cpu().numpy()
+                        sample_with_goal = self.ema_model(cond, verbose=False)
+                        a0_with_goal = sample_with_goal.trajectories[0, 0, :a_dim].detach().cpu().numpy()
+                        action_diff = np.abs(a0_with_goal - a0_no_goal)
+                        print(f"  Action WITH goal:    [{', '.join([f'{x:.4f}' for x in a0_with_goal])}]")
+                        print(f"  Action WITHOUT goal: [{', '.join([f'{x:.4f}' for x in a0_no_goal])}]")
+                        print(f"  Action diff: mean={action_diff.mean():.4f}, max={action_diff.max():.4f}")
+                        if action_diff.mean() < 0.05:
+                            print(f"  WARNING: Actions barely change with/without goal!")
+                        print()
 
-                obs_vec, r, done, info = envw.step(a0)
+                    # Sample new trajectory from diffusion model
+                    sample = self.ema_model(cond, verbose=False)
+                    traj = sample.trajectories[0]  # (H, action_dim + obs_dim)
+                    action_buffer = traj[:, :a_dim].detach().cpu().numpy().astype(np.float32)  # (H, a_dim)
+                    action_idx = 0
 
-                # Print first action of each episode to verify action format
-                if t == 0:
-                    print(f"[eval ep={ep} t={t}] First action (unnormalized):")
-                    print(f"  pos:     [{a0[0]:.4f}, {a0[1]:.4f}, {a0[2]:.4f}]")
-                    print(f"  rot:     [{a0[3]:.4f}, {a0[4]:.4f}, {a0[5]:.4f}]")
-                    print(f"  gripper: {a0[6]:.4f}")
+                    # Print planning info
+                    n_actions_to_exec = min(exe_steps, action_buffer.shape[0])
+                    print(f"[PLAN] t={t}: Generated {action_buffer.shape[0]}-step plan, will execute {n_actions_to_exec} actions")
+                    if t < 10:  # Show full planned trajectory for first few plans
+                        print(f"  Planned Z trajectory (normalized): {[f'{action_buffer[i, 2]:.3f}' for i in range(min(5, action_buffer.shape[0]))]}")
 
-                # if render_debug and renderer_3d is not None:
-                #     if t in set(render_debug_steps):
-                #         _render_tokens_debug(tag=f"ep_{ep:02d}/t_{t:03d}", obs_vec_flat=obs_vec, horizon_step=t)
+                # ====== EXECUTION PHASE ======
+                # Get current action from buffer
+                a_norm = action_buffer[action_idx]
+
+                # Unnormalize action
+                a = self.dataset.normalizer.unnormalize(a_norm[None], "actions")[0]
+
+                # Unscale Z if action_z_scale was applied during training
+                if z_scale != 1.0:
+                    a[2] /= z_scale
+
+                # Step environment
+                obs_vec, r, done, info = envw.step(a)
+
+                # Print execution info
+                if t < 10:
+                    print(f"[EXEC] t={t}: action_idx={action_idx}/{exe_steps} | pos=[{a[0]:.3f}, {a[1]:.3f}, {a[2]:.3f}] grip={a[6]:.2f}")
+                    if t == 0:
+                        norm = self.dataset.normalizer.normalizers.get('actions', None)
+                        if norm is not None:
+                            if hasattr(norm, 'mins') and hasattr(norm, 'maxs'):
+                                print(f"  normalizer mins: {norm.mins.flatten()}")
+                                print(f"  normalizer maxs: {norm.maxs.flatten()}")
+                            elif hasattr(norm, 'means') and hasattr(norm, 'stds'):
+                                print(f"  normalizer means: {norm.means.flatten()}")
+                                print(f"  normalizer stds: {norm.stds.flatten()}")
+
+                action_idx += 1
                 ep_ret += float(r)
+
                 if save_videos and envw.last_raw_obs is not None:
                     fr = _frame_from_raw_obs(envw.last_raw_obs, video_cams)
                     if fr is not None:
                         frames.append(fr)
 
+                t += 1
                 if done:
                     break
 

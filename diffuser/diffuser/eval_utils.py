@@ -291,7 +291,7 @@ def evaluate_policy(policy, env, plan_args, logger,
         t = 0
 
         while not done:
-            action = policy(obs)
+            action, _ = policy(obs)
             obs, reward, done, info = env.step(action)
             ep_ret += float(reward)
             t += 1

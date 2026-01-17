@@ -25,7 +25,8 @@ class SequenceDataset(torch.utils.data.Dataset):
 
     def __init__(self, dataset_path='', dataset_name='panda_push', horizon=64, obs_only=False,
         normalizer='LimitsNormalizer', particle_normalizer='ParticleGaussianNormalizer', preprocess_fns=[], max_path_length=1000,
-        max_n_episodes=5000, termination_penalty=0, use_padding=True, overfit=False, action_only=False, single_view=False, **kwargs):
+        max_n_episodes=5000, termination_penalty=0, use_padding=True, overfit=False, action_only=False, single_view=False,
+        action_z_scale=1.0, **kwargs):
         self.preprocess_fn = get_preprocess_fn(preprocess_fns, dataset_name)
         self.dataset_path = dataset_path
         self.horizon = horizon
@@ -33,6 +34,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.action_only = action_only
         self.max_path_length = max_path_length
         self.use_padding = use_padding
+        self.action_z_scale = float(action_z_scale)  # Scale factor for Z action dimension
 
         fields = ReplayBuffer(max_n_episodes, max_path_length, termination_penalty)
         assert dataset_path, 'Dataset path must be provided'
@@ -40,6 +42,14 @@ class SequenceDataset(torch.utils.data.Dataset):
         if overfit:
             fields._count = 1
         fields.finalize()
+
+        # Apply Z scaling to actions before normalization
+        if self.action_z_scale != 1.0:
+            print(f'[ datasets/sequence ] Applying Z action scaling: {self.action_z_scale}x')
+            print(f'  Before scaling - Z range: [{fields["actions"][:,:,2].min():.4f}, {fields["actions"][:,:,2].max():.4f}]')
+            fields['actions'][:, :, 2] *= self.action_z_scale
+            print(f'  After scaling  - Z range: [{fields["actions"][:,:,2].min():.4f}, {fields["actions"][:,:,2].max():.4f}]')
+
         self.successful_episode_idxes = fields.successful_episode_idxes
         self.normalizer = DatasetNormalizer(fields, normalizer, particle_normalizer=particle_normalizer, path_lengths=fields['path_lengths'])
         self.indices = self.make_indices(fields.path_lengths, horizon)
