@@ -10,6 +10,7 @@ from .timer import Timer
 from .cloud import sync_logs
 import wandb
 from tqdm import tqdm
+from dlp_utils import log_rgb_voxels
 
 def cycle(dl):
     while True:
@@ -280,6 +281,10 @@ class Trainer(object):
         video_dir=None,
         video_fps=20,
         video_cams=("agentview",), 
+
+        renderer_3d=None,           
+        render_debug=True, 
+        render_debug_steps=(0,),         
     ):
         """
         True success eval by stepping MimicGen.
@@ -327,6 +332,42 @@ class Trainer(object):
             h = min(f.shape[0] for f in frames)
             frames = [f[:h] for f in frames]
             return np.concatenate(frames, axis=1)
+        def _render_tokens_debug(tag, obs_vec_flat, horizon_step=None):
+            if renderer_3d is None:
+                return
+            if obs_vec_flat is None:
+                raise RuntimeError("obs_vec_flat is None")
+
+            # obs_vec_flat is 1D = K*Dtok
+            K = getattr(envw, "K", None)
+            Dtok = getattr(envw, "Dtok", None)
+
+            print("K: ", K)
+            print("Dtok: ", Dtok)
+
+
+            # TODO: Actually make this read from something
+            if K is None:
+                K = 16
+            if Dtok is None:
+                # hard fail-fast: you should set this; but infer if possible
+                if obs_vec_flat.size % K != 0:
+                    raise RuntimeError(f"Cannot infer Dtok: len(obs_vec_flat)={obs_vec_flat.size} not divisible by K={K}")
+                Dtok = obs_vec_flat.size // K
+            
+            print("obs vec flat: ", obs_vec_flat.shape)
+            toks = np.asarray(obs_vec_flat, dtype=np.float32).reshape(1, K, Dtok)  # [1,K,Dtok]
+
+            # Use monotonic step for wandb: prefer global trainer step if provided.
+            step_to_log = 200
+            print("toks: ", toks.shape)
+            renderer_3d.render(
+                toks[0],                              # renderer accepts [K,Dtok] or flat; yours accepts either
+                tag=tag,
+                step=step_to_log,
+                base="eval_debug"
+            )
+
 
         if save_videos:
             if video_dir is None:
@@ -352,6 +393,29 @@ class Trainer(object):
             )
 
             obs_vec = envw.reset()
+
+            if render_debug and renderer_3d is not None:
+                # _render_tokens_debug(tag=f"ep_{ep:02d}/reset_obs", obs_vec_flat=obs_vec, horizon_step=0)
+
+                vox = envw.last_vox  # np [C,D,H,W]
+                print("GT VOX: ", vox.shape )
+                    # avg_rgb
+                log_rgb_voxels(
+                    name=f"eval_debug/ep_{ep:02d}/gt_vox_rgb",
+                    rgb_vol=vox,          # [3,D,H,W]
+                    alpha_vol=None,
+                    KPx=None,
+                    step=int(200),
+                    mode="splat",
+                    topk=60000,
+                    alpha_thresh=0.05,
+                    pad=2.0,
+                    show_axes=True,
+                )
+                # if you want to also see the goal:
+                # if getattr(envw, "goal_vec", None) is not None:
+                #     _render_tokens_debug(tag=f"ep_{ep:02d}/reset_goal", obs_vec_flat=envw.goal_vec, horizon_step=0)
+
             ep_ret = 0.0
             frames = []
             if save_videos and envw.last_raw_obs is not None:
@@ -382,6 +446,12 @@ class Trainer(object):
                 a0 = self.dataset.normalizer.unnormalize(a0_norm[None], "actions")[0]
 
                 obs_vec, r, done, info = envw.step(a0)
+
+                print("Unormalized action: ", a0)
+
+                # if render_debug and renderer_3d is not None:
+                #     if t in set(render_debug_steps):
+                #         _render_tokens_debug(tag=f"ep_{ep:02d}/t_{t:03d}", obs_vec_flat=obs_vec, horizon_step=t)
                 ep_ret += float(r)
                 if save_videos and envw.last_raw_obs is not None:
                     fr = _frame_from_raw_obs(envw.last_raw_obs, video_cams)
@@ -414,3 +484,5 @@ class Trainer(object):
             "sim/avg_len": float(np.mean(lengths)) if len(lengths) else 0.0,
         }
         return out
+    
+

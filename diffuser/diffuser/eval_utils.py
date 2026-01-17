@@ -380,8 +380,8 @@ def setup_mimicgen_env(args):
     # --- force depth ON (you need this for pointcloud reconstruction) ---
     # safest is per-camera lists
     env_kwargs["camera_depths"]  = [True] * len(cam_names)
-    env_kwargs["camera_heights"] = [getattr(args, "mimicgen_camera_height", 48)] * len(cam_names)
-    env_kwargs["camera_widths"]  = [getattr(args, "mimicgen_camera_width", 48)] * len(cam_names)
+    env_kwargs["camera_heights"] = [getattr(args, "mimicgen_camera_height", 256)] * len(cam_names)
+    env_kwargs["camera_widths"]  = [getattr(args, "mimicgen_camera_width", 256)] * len(cam_names)
 
     env_kwargs["has_renderer"] = False
     env_kwargs["has_offscreen_renderer"] = True

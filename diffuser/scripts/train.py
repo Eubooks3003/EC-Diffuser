@@ -290,6 +290,7 @@ for i in range(n_epochs):
                 cams=getattr(args, "mimicgen_cams", ("agentview", "sideview")),
                 pixel_stride=getattr(args, "mimicgen_pixel_stride", 2),
                 goal_from_env_fn=getattr(args, "goal_from_env_fn", None),
+                renderer_3d=renderer
             )
 
             # avoid double-prefix if eval returns sim/... already

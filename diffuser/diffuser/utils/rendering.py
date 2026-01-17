@@ -333,16 +333,17 @@ class ParticleRenderer3D:
         return fg0, rec0
 
     @torch.no_grad()
-    def render(self, particles, front_bg=None, side_bg=None, *, tag=None, step=None, **kwargs):
+    def render(self, particles, front_bg=None, side_bg=None, *, tag=None, step=None, base="base", **kwargs):
         """
         Logs the exact same visuals as debug_dlp_vox.py using log_rgb_voxels.
         Returns a dummy uint8 image for compatibility with upstream trainer code.
         """
         fg0, rec0 = self.render_volume(particles)
 
-        base = "render3d"
         if tag is not None:
             base = f"{base}/{tag}"
+
+        print("Plotting: ", tag, " AT STEP: ", step)
 
         log_rgb_voxels(
             name=f"{base}/fg_only_dec",
@@ -384,6 +385,7 @@ class ParticleRenderer3D:
             raise ValueError(f"Expected paths [N,H,D], got {paths.shape}")
 
         N, H, D = paths.shape
+        print("Horizon: ", H)
         if H < 1:
             raise ValueError(f"Need H>=1, got H={H}")
 
@@ -419,6 +421,7 @@ class ParticleRenderer3D:
                     obs_t,
                     tag=f"{base_tag}/sample_{n:02d}/t_{t:03d}",
                     step=(step0 if step0 is not None else t),
+                    base = "render3d"
                 )
 
         return np.zeros((8, 8, 3), dtype=np.uint8)

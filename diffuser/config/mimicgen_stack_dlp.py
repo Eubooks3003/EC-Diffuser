@@ -14,7 +14,7 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'mimicgen_stack_dlp',
-    'override_dataset_path': '/home/ellina/Desktop/Code/lpwm-dev/ecdiffuser_data/stack_replay_buffer_dlp_debug.pkl',
+    'override_dataset_path': '/home/ellina/Desktop/Code/lpwm-dev/ecdiffuser_data/stack_replay_buffer_dlp.pkl',
     'calib_h5_path': '/home/ellina/Desktop/Code/articubot-on-mimicgen/stack_d1_rgbd_pcd.hdf5',
     'dlp_ckpt': '/home/ellina/Desktop/Code/lpwm-dev/checkpoints_3d/best/best.pt',
     'dlp_ctor': "voxel_models:DLP",
@@ -23,14 +23,14 @@ mode_to_args = {
     'max_particles': 16,
     'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 119,
+    'max_path_length': 132,
     'env_config_dir': 'env_config/n_cubes',
-    'eval_freq': 1,
+    'eval_freq': 20,
     'eval_backend': 'mimicgen',
-    'n_steps_per_epoch': 1e4,
+    'n_steps_per_epoch': 1000,
     "mimicgen_cams": ["agentview", "sideview"],
-    "mimicgen_camera_width": 48,
-    "mimicgen_camera_height": 48,
+    "mimicgen_camera_width": 256,
+    "mimicgen_camera_height": 256,
     "mimicgen_max_steps":500
 
   },
@@ -76,7 +76,7 @@ base = {
         # training
         'n_steps_per_epoch': 200,
         'loss_type': 'l1',
-        'n_train_steps': 5e5,      # small for debug
+        'n_train_steps': 2e6,    
         'batch_size': 1,
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,

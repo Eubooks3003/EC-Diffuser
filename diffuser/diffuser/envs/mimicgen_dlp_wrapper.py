@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import h5py
+from robosuite.utils import camera_utils as CU
 
 from datasets.voxelize_ds_wrapper import VoxelGridXYZ
 
@@ -55,11 +56,11 @@ def pack_tokens_k24_preproc_format(out: dict) -> torch.Tensor:
         raise RuntimeError("DLP output missing key 'z'")
 
 
-    z       = out["z"][:, 0]          # (B,24,3)
-    z_scale = out["z_scale"][:, 0]    # (B,24,3)
-    z_depth = out["z_depth"][:, 0]    # (B,24,3)
-    obj_on  = out["obj_on"][:, 0]     # (B,24,1) or (B,24)
-    z_feat  = out["z_features"][:, 0] # (B,24,F)
+    z       = out["z"][:, 0]          
+    z_scale = out["z_scale"][:, 0]    
+    z_depth = out["z_depth"][:, 0]    
+    obj_on  = out["obj_on"][:, 0]    
+    z_feat  = out["z_features"][:, 0] 
 
     if obj_on.ndim == 2:
         obj_on = obj_on.unsqueeze(-1)
@@ -158,6 +159,7 @@ class MimicGenDLPWrapper:
 
         # calibration
         calib_h5_path=None,
+        crop_bounds={"xmin":-0.5,"xmax":1.5,"ymin":-0.5,"ymax":1.5,"zmin":-0.2,"zmax":2.5},
 
         # goal
         get_goal_raw_obs_fn=None,
@@ -183,16 +185,18 @@ class MimicGenDLPWrapper:
         self.get_goal_raw_obs_fn = get_goal_raw_obs_fn
         self.success_key_candidates = tuple(success_key_candidates)
 
+        self.last_pts_world = None          # [N,3] float32 (optional)
+        self.last_pts_preproc = None        # [M,3] or [M,6] float32 after unit-cube/downsample
+        self.last_vox = None                # [C,D,H,W] float32 (np)
+        self.last_toks = None               # [K,Dtok] float32 (np)
+        self.last_obs_vec = None            # flat [K*Dtok] float32 (np)
         self.last_raw_obs = None
         self.last_info = None
         self.goal_vec = None
 
         # --- load calib ---
         self.calib = {}
-        if calib_h5_path is None:
-            raise RuntimeError("calib_h5_path is required for RGB-D backprojection online.")
-        self._load_calib_from_h5(calib_h5_path)
-
+        self.crop_bounds = crop_bounds 
         # --- bounds_pm consistent with preprocessing ---
         if self.bounds_mode == "fixed":
             self.bounds_pm = parse_fixed_bounds_pm(fixed_bounds)
@@ -209,22 +213,117 @@ class MimicGenDLPWrapper:
 
         # precompute pixel grids cache
         self._precomputed = {}  # (cam,H,W) -> (U,V,invfx,invfy,cx,cy)
+    def _get_robosuite_env_and_sim(self):
+        """
+        Unwrap robomimic EnvRobosuite (and any other wrappers) to reach a robosuite env with .sim.
+        Returns (robosuite_env, sim).
+        """
+        e = self.env
+        seen = set()
 
-    # ---------- calibration ----------
-    def _load_calib_from_h5(self, h5_path):
-        with h5py.File(h5_path, "r") as h5:
-            for cam in self.cams:
-                g = h5.get(f"meta/cameras/{cam}", None)
-                if g is None:
-                    raise KeyError(f"Missing meta/cameras/{cam} in {h5_path}")
-                K = np.asarray(g["K"], dtype=np.float32)
-                T_raw = np.asarray(g["T_cam_world"], dtype=np.float32)
-                near = g.attrs.get("near", None)
-                far  = g.attrs.get("far", None)
-                near = float(near) if near is not None else None
-                far  = float(far)  if far  is not None else None
-                Tc2w = _recover_cam2world(T_raw, K.astype(np.float64))
-                self.calib[cam] = {"K": K, "Tc2w": Tc2w, "near": near, "far": far}
+        # unwrap a few common wrapper fields
+        for _ in range(10):
+            if id(e) in seen:
+                break
+            seen.add(id(e))
+
+            if hasattr(e, "sim"):
+                return e, e.sim
+
+            # robomimic EnvRobosuite typically stores the underlying robosuite env here
+            for attr in ("env", "_env", "base_env", "unwrapped"):
+                if hasattr(e, attr):
+                    e2 = getattr(e, attr)
+                    # some wrappers have unwrapped as property returning itself; guard
+                    if e2 is not None and e2 is not e:
+                        e = e2
+                        break
+            else:
+                # none of the attrs existed
+                break
+
+        raise AttributeError(
+            f"Could not find underlying robosuite env with `.sim`. "
+            f"Got wrapper chain ending at type={type(e)} with attrs={dir(e)}"
+        )
+    def _ensure_env_calib(self, raw_obs):
+        robosuite_env, sim = self._get_robosuite_env_and_sim()
+
+        # OpenCV -> OpenGL camera-frame conversion (x stays, y/z flip)
+        F = np.eye(4, dtype=np.float32)
+        F[1, 1] = -1.0
+        F[2, 2] = -1.0
+
+        for cam in self.cams:
+            depth = np.asarray(raw_obs[f"{cam}_depth"])
+            if depth.ndim == 3 and depth.shape[0] == 1:
+                depth = depth[0]
+            H, W = int(depth.shape[-2]), int(depth.shape[-1])
+
+            prev = self.calib.get(cam, None)
+            if prev is not None and prev["H"] == H and prev["W"] == W:
+                continue
+
+            # Intrinsics at this resolution
+            K = CU.get_camera_intrinsic_matrix(
+                sim, camera_name=cam, camera_height=H, camera_width=W
+            ).astype(np.float32)
+
+            # ---- MuJoCo camera pose (cam frame in world coords) ----
+            # Prefer modern mujoco API if available
+            if hasattr(sim.data, "get_camera_xpos") and hasattr(sim.data, "get_camera_xmat"):
+                pos = sim.data.get_camera_xpos(cam).copy().astype(np.float32)            # (3,)
+                R_c2w_gl = sim.data.get_camera_xmat(cam).copy().reshape(3, 3).astype(np.float32)
+            else:
+                # mujoco-py style arrays
+                try:
+                    cid = sim.model.camera_name2id(cam)
+                    pos = sim.data.cam_xpos[cid].copy().astype(np.float32)
+                    R_c2w_gl = sim.data.cam_xmat[cid].copy().reshape(3, 3).astype(np.float32)
+                except Exception as e:
+                    raise AttributeError(
+                        f"Cannot access camera pose for cam='{cam}'. "
+                        f"Tried sim.data.get_camera_xpos/xmat and sim.data.cam_xpos/xmat. Error: {e}"
+                    )
+
+            Tc2w_gl = np.eye(4, dtype=np.float32)
+            Tc2w_gl[:3, :3] = R_c2w_gl
+            Tc2w_gl[:3,  3] = pos
+
+            # Convert from OpenCV cam coords (your backprojection) to MuJoCo/OpenGL cam coords
+            # world = Tc2w_gl * (F * p_cv)
+            Tc2w = Tc2w_gl @ F
+
+            near = float(sim.model.vis.map.znear)
+            far  = float(sim.model.vis.map.zfar)
+
+            self.calib[cam] = {"K": K, "Tc2w": Tc2w, "near": near, "far": far, "H": H, "W": W}
+
+    def _depth_to_meters_env(self, depth_raw):
+        d = np.asarray(depth_raw)
+        if d.ndim == 3 and d.shape[0] == 1:
+            d = d[0]
+        # robosuite expects a depth buffer in [0,1]
+        _, sim = self._get_robosuite_env_and_sim()
+        return CU.get_real_depth_map(sim, d).astype(np.float32)
+
+    def crop_world(self, xyz, rgb=None):
+        b = self.crop_bounds
+        if b is None:
+            return (xyz, rgb) if rgb is not None else xyz
+
+        m = (
+            (xyz[:, 0] >= b["xmin"]) & (xyz[:, 0] <= b["xmax"]) &
+            (xyz[:, 1] >= b["ymin"]) & (xyz[:, 1] <= b["ymax"]) &
+            (xyz[:, 2] >= b["zmin"]) & (xyz[:, 2] <= b["zmax"])
+        )
+        if not np.any(m):
+            return (xyz, rgb) if rgb is not None else xyz
+        xyz2 = xyz[m]
+        if rgb is None:
+            return xyz2
+        return xyz2, rgb[m]
+
 
     # ---------- obs extraction ----------
     def _get_rgbd_from_obs(self, obs, cam):
@@ -236,11 +335,11 @@ class MimicGenDLPWrapper:
             raise KeyError(f"obs missing key {dep_key}")
         return np.asarray(obs[rgb_key]), np.asarray(obs[dep_key])
 
-    # ---------- backprojection ----------
     def _ensure_precompute(self, cam, H, W):
-        key = (cam, H, W)
+        key = (cam, H, W, self.pixel_stride)
         if key in self._precomputed:
             return self._precomputed[key]
+
         K = self.calib[cam]["K"]
         fx, fy = float(K[0, 0]), float(K[1, 1])
         cx, cy = float(K[0, 2]), float(K[1, 2])
@@ -248,12 +347,13 @@ class MimicGenDLPWrapper:
         vv = np.arange(0, H, self.pixel_stride, dtype=np.int32)
         uu = np.arange(0, W, self.pixel_stride, dtype=np.int32)
         U, V = np.meshgrid(uu, vv)
+
         pre = (U, V, 1.0 / fx, 1.0 / fy, cx, cy)
         self._precomputed[key] = pre
         return pre
 
     def _backproject_cam(self, cam, depth_raw):
-        depth_m = _depth_to_meters(depth_raw, self.calib[cam]["near"], self.calib[cam]["far"])
+        depth_m = self._depth_to_meters_env(depth_raw)  # [H,W] meters
         H, W = depth_m.shape
         U, V, invfx, invfy, cx, cy = self._ensure_precompute(cam, H, W)
 
@@ -272,6 +372,7 @@ class MimicGenDLPWrapper:
 
         idxs = np.stack([V[valid], U[valid]], axis=-1).astype(np.int32)
         return pts_cam, idxs
+
 
     # ---------- preprocessing-faithful pipeline ----------
     def _fuse_xyzrgb_world(self, raw_obs) -> np.ndarray:
@@ -307,6 +408,8 @@ class MimicGenDLPWrapper:
 
         xyz = np.concatenate(all_xyz, axis=0)
         rgb = np.concatenate(all_rgb, axis=0)
+
+        xyz, rgb = self.crop_world(xyz, rgb)
 
         if not np.isfinite(xyz).all():
             finite = np.isfinite(xyz).all(axis=1)
@@ -357,21 +460,58 @@ class MimicGenDLPWrapper:
         vox = vg.to_dense()  # [C,D,H,W]
         return vox
 
+    def _get_cam_calib_from_env(self, cam, raw_obs):
+        sim = self.env.sim
+
+        # infer current render size from the observation
+        depth = np.asarray(raw_obs[f"{cam}_depth"])
+        if depth.ndim == 3 and depth.shape[0] == 1:
+            depth = depth[0]
+        H, W = depth.shape[-2], depth.shape[-1]
+
+        # intrinsics for *this* H,W
+        K = CU.get_camera_intrinsic_matrix(sim, camera_name=cam, camera_height=H, camera_width=W).astype(np.float32)
+
+        # extrinsics (check whether this returns world->cam or cam->world in YOUR robosuite version)
+        # many robosuite versions provide this as world->camera
+        Tw2c = CU.get_camera_extrinsic_matrix(sim, camera_name=cam).astype(np.float32)
+
+        # convert to cam->world
+        Tc2w = np.linalg.inv(Tw2c).astype(np.float32)
+
+        # near/far for depth conversion
+        # robosuite typically uses sim.model.vis.map.znear / zfar
+        near = float(sim.model.vis.map.znear)
+        far  = float(sim.model.vis.map.zfar)
+
+        return K, Tc2w, near, far
+
     @torch.no_grad()
     def encode_tokens(self, raw_obs):
-        pts = self._fuse_xyzrgb_world(raw_obs)                 # [N,3] or [N,6] numpy
-        pts_t = self._preprocess_points_like_TODataset(pts)    # CPU torch
-        vox = self._voxelize_via_wrapper(pts_t)                # [C,D,H,W] device
+        # ---- 1) fused world points (pre-downsample) ----
+        self._ensure_env_calib(raw_obs) 
+        pts = self._fuse_xyzrgb_world(raw_obs)                 # [N,3] or [N,6] np
+        # cache world xyz for debug (drop rgb if present)
+        self.last_pts_world = pts[:, :3].astype(np.float32, copy=True)
+
+        # ---- 2) TODataset-like preproc (unit cube + downsample) ----
+        pts_t = self._preprocess_points_like_TODataset(pts)    # CPU torch [M,3/6]
+        self.last_pts_preproc = pts_t.numpy().astype(np.float32, copy=True)
+
+        # ---- 3) voxelize (THIS is the "GT voxel" fed to DLP) ----
+        vox = self._voxelize_via_wrapper(pts_t)                # torch [C,D,H,W] on device
+        self.last_vox = vox.detach().cpu().numpy().astype(np.float32, copy=True)
+
+        # ---- 4) DLP encode -> tokens ----
         vox_b = vox.unsqueeze(0)                               # [1,C,D,H,W]
-
         out = self.dlp(vox_b, deterministic=True, warmup=False, with_loss=False)
+        toks = pack_tokens_k24_preproc_format(out)             # [1,K,Dtok] torch
+        toks_np = toks[0].detach().cpu().numpy().astype(np.float32, copy=True)  # [K,Dtok]
+        self.last_toks = toks_np
+        flat = toks_np.reshape(-1).astype(np.float32, copy=True)
+        self.last_obs_vec = flat
 
-        toks = pack_tokens_k24_preproc_format(out)             # [B,24,Dtok]
-
-        toks_np = toks[0].detach().cpu().numpy().astype(np.float32)  # (24,Dtok)
-        flat = toks_np.reshape(-1).astype(np.float32)
-        vox_np = vox.detach().cpu().numpy().astype(np.float32)
-        return flat, toks_np, vox_np
+        return flat, toks_np, self.last_vox
 
     # ---------- goal / env ----------
     def _get_success_from_info(self, info):
@@ -389,6 +529,7 @@ class MimicGenDLPWrapper:
     def reset(self, **kwargs):
         raw_obs = self.env.reset(**kwargs)
         self.last_raw_obs = raw_obs
+        self._ensure_env_calib(raw_obs)
         self.last_info = None
 
         obs_vec, _, _ = self.encode_tokens(raw_obs)
