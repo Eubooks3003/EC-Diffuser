@@ -124,6 +124,66 @@ def _recover_cam2world(T_cam_world_like: np.ndarray, K: np.ndarray) -> np.ndarra
     return Tc2w.astype(np.float32)
 
 # ----------------------------
+# Goal Provider for dataset-based init_state + goal pairing
+# ----------------------------
+
+class DatasetGoalProvider:
+    """
+    Provides paired (init_state, goal_tokens) from a preprocessed dataset.
+
+    This ensures that at evaluation time:
+    1. The simulator is reset to the same initial state as a training trajectory
+    2. The goal tokens match what the model saw during training for that trajectory
+
+    Usage:
+        provider = DatasetGoalProvider(data_pkl_path)
+        wrapper = MimicGenDLPWrapper(env, dlp_model, device, goal_provider=provider)
+    """
+
+    def __init__(self, data_pkl_path, shuffle=True):
+        import pickle
+
+        with open(data_pkl_path, 'rb') as f:
+            data = pickle.load(f)
+
+        self.init_states = data['init_states']    # (E, state_dim)
+        self.goals = data['goals'][:, 0]          # (E, K, Dtok) - goal per trajectory
+        self.path_lengths = data['path_lengths']  # (E,)
+        self.num_trajectories = len(self.init_states)
+
+        # Shuffle indices for variety across eval episodes
+        self.indices = np.arange(self.num_trajectories)
+        if shuffle:
+            np.random.shuffle(self.indices)
+
+        self.current_idx = 0
+
+        print(f"[DatasetGoalProvider] Loaded {self.num_trajectories} trajectories")
+        print(f"[DatasetGoalProvider]   init_states: {self.init_states.shape} (simulator states for reset)")
+        print(f"[DatasetGoalProvider]   goals: {self.goals.shape} (DLP tokens for goal conditioning)")
+        print(f"[DatasetGoalProvider]   path_lengths: min={self.path_lengths.min()}, max={self.path_lengths.max()}, mean={self.path_lengths.mean():.1f}")
+
+    def get_init_state_and_goal(self):
+        """
+        Returns the next (init_state, goal_tokens) pair.
+        Cycles through all trajectories.
+        """
+        idx = self.indices[self.current_idx % self.num_trajectories]
+        self.current_idx += 1
+
+        init_state = self.init_states[idx]  # (state_dim,)
+        goal_tokens = self.goals[idx]       # (K, Dtok)
+
+        return init_state, goal_tokens
+
+    def reset_sampling(self, shuffle=True):
+        """Reset to beginning of trajectories, optionally reshuffle."""
+        self.current_idx = 0
+        if shuffle:
+            np.random.shuffle(self.indices)
+
+
+# ----------------------------
 # Wrapper-faithful MimicGenDLPWrapper
 # ----------------------------
 
@@ -161,8 +221,9 @@ class MimicGenDLPWrapper:
         calib_h5_path=None,
         crop_bounds={"xmin":-0.5,"xmax":1.5,"ymin":-0.5,"ymax":1.5,"zmin":-0.2,"zmax":2.5},
 
-        # goal
-        get_goal_raw_obs_fn=None,
+        # goal - NEW: support for dataset-based goal/init_state pairing
+        get_goal_raw_obs_fn=None,       # Legacy: function (env, raw_obs) -> raw_obs for goal
+        goal_provider=None,             # NEW: object with get_init_state_and_goal() method
         success_key_candidates=("success", "task_success", "is_success"),
         pixel_stride=2,
         max_points_backproject=200_000,
@@ -183,6 +244,7 @@ class MimicGenDLPWrapper:
         self.max_points_backproject = int(max_points_backproject)
 
         self.get_goal_raw_obs_fn = get_goal_raw_obs_fn
+        self.goal_provider = goal_provider  # NEW: dataset-based goal provider
         self.success_key_candidates = tuple(success_key_candidates)
 
         self.last_pts_world = None          # [N,3] float32 (optional)
@@ -527,6 +589,51 @@ class MimicGenDLPWrapper:
         return None
 
     def reset(self, **kwargs):
+        """
+        Reset the environment and set up goal conditioning.
+
+        If goal_provider is set, it will:
+        1. Get init_state and goal_tokens from the provider
+        2. Reset the simulator to the init_state (matching training data)
+        3. Use the corresponding goal_tokens for conditioning
+
+        This ensures the goal observation matches the initial state configuration.
+        """
+        # NEW: If goal_provider is available, use it for init_state + goal pairing
+        if self.goal_provider is not None:
+            init_state, goal_tokens = self.goal_provider.get_init_state_and_goal()
+
+            print(f"[MimicGenDLPWrapper] Using DatasetGoalProvider for goal conditioning")
+            print(f"[MimicGenDLPWrapper] Resetting to init_state from trajectory {self.goal_provider.current_idx - 1}")
+
+            # Reset simulator to the training trajectory's initial state
+            # This ensures the scene matches what the goal represents
+            raw_obs = self.env.reset_to({"states": init_state})
+            if raw_obs is None:
+                # Some envs return None from reset_to, need to get obs separately
+                raw_obs = self.env.get_observation()
+
+            print(f"[MimicGenDLPWrapper] ✓ Successfully reset to init_state (shape: {init_state.shape})")
+
+            self.last_raw_obs = raw_obs
+            self._ensure_env_calib(raw_obs)
+            self.last_info = None
+
+            # Encode current observation
+            obs_vec, _, _ = self.encode_tokens(raw_obs)
+
+            # Goal tokens come directly from dataset (already DLP-encoded)
+            # Flatten to match obs_vec format: (K, Dtok) -> (K * Dtok,)
+            self.goal_vec = goal_tokens.reshape(-1).astype(np.float32)
+
+            print(f"[MimicGenDLPWrapper] ✓ Goal conditioning set from dataset")
+            print(f"[MimicGenDLPWrapper]   goal_tokens shape: {goal_tokens.shape} -> flattened: {self.goal_vec.shape}")
+            print(f"[MimicGenDLPWrapper]   obs_vec shape: {obs_vec.shape}")
+
+            return obs_vec
+
+        # Legacy path: standard reset
+        print(f"[MimicGenDLPWrapper] WARNING: No goal_provider set, using legacy reset")
         raw_obs = self.env.reset(**kwargs)
         self.last_raw_obs = raw_obs
         self._ensure_env_calib(raw_obs)
@@ -535,10 +642,12 @@ class MimicGenDLPWrapper:
         obs_vec, _, _ = self.encode_tokens(raw_obs)
 
         if self.get_goal_raw_obs_fn is not None:
+            print(f"[MimicGenDLPWrapper] Using get_goal_raw_obs_fn for goal (legacy)")
             goal_raw = self.get_goal_raw_obs_fn(self.env, raw_obs)
             goal_vec, _, _ = self.encode_tokens(goal_raw)
             self.goal_vec = goal_vec
         else:
+            print(f"[MimicGenDLPWrapper] WARNING: No goal function! Using current obs as goal (will likely fail)")
             self.goal_vec = obs_vec.copy()
 
         return obs_vec

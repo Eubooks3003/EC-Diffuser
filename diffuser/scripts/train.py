@@ -241,6 +241,7 @@ dlp_model = None
 dlp_cfg = None
 make_env_fn = None
 calib_h5_path = None
+goal_provider = None  # NEW: for dataset-based goal conditioning
 
 if do_eval and eval_backend == "mimicgen":
     calib_h5_path = getattr(args, "calib_h5_path", None)
@@ -259,9 +260,23 @@ if do_eval and eval_backend == "mimicgen":
 
     renderer.latent_rep_model = dlp_model
 
+    # NEW: Set up goal provider from dataset for init_state + goal pairing
+    # This ensures eval uses the same (init_state, goal) pairs as training
+    from diffuser.envs.mimicgen_dlp_wrapper import DatasetGoalProvider
+    print("=" * 60)
+    print("[mimicgen eval] Setting up DatasetGoalProvider for goal conditioning")
+    print(f"[mimicgen eval]   Loading from: {args.dataset_path}")
+    goal_provider = DatasetGoalProvider(args.dataset_path, shuffle=True)
+    print("[mimicgen eval] ✓ Goal provider ready - will use paired (init_state, goal_tokens)")
+    print("=" * 60, flush=True)
+
+    # NEW: Check if using absolute actions (control_delta=False)
+    use_absolute_actions = getattr(args, "use_absolute_actions", True)
+    print(f"[mimicgen eval] use_absolute_actions = {use_absolute_actions}", flush=True)
+
     def make_env_fn():
         from diffuser.eval_utils import setup_mimicgen_env
-        return setup_mimicgen_env(args)
+        return setup_mimicgen_env(args, use_absolute_actions=use_absolute_actions)
 
 
 # -----------------------------------------------------------------------------#
@@ -290,6 +305,7 @@ for i in range(n_epochs):
                 cams=getattr(args, "mimicgen_cams", ("agentview", "sideview")),
                 pixel_stride=getattr(args, "mimicgen_pixel_stride", 2),
                 goal_from_env_fn=getattr(args, "goal_from_env_fn", None),
+                goal_provider=goal_provider,  # NEW: dataset-based goal provider
                 renderer_3d=renderer
             )
 

@@ -320,12 +320,19 @@ def evaluate_policy(policy, env, plan_args, logger,
 
     return stats
 
-def setup_mimicgen_env(args):
+def setup_mimicgen_env(args, use_absolute_actions=True):
     """
     Create a MimicGen / RoboSuite env using robomimic metadata from a dataset HDF5.
 
     We use args.calib_h5_path as the dataset file by default (since you already have it),
     but you can also set args.mimicgen_dataset_h5.
+
+    Args:
+        args: Namespace with configuration
+        use_absolute_actions: If True, configure controller for absolute actions
+                             (control_delta=False). The policy outputs absolute
+                             pose targets [x, y, z, rotvec_x, rotvec_y, rotvec_z, gripper]
+                             instead of delta commands.
 
     This function keeps imports local so importing eval_utils doesn't require MimicGen deps
     unless you actually call mimicgen eval.
@@ -356,6 +363,31 @@ def setup_mimicgen_env(args):
     env_kwargs.setdefault("has_renderer", False)
     env_kwargs.setdefault("has_offscreen_renderer", True)
     env_kwargs.setdefault("use_camera_obs", True)
+
+    # 3b) Configure for absolute actions if requested
+    # When use_absolute_actions=True, the controller interprets actions as:
+    #   [goal_x, goal_y, goal_z, rotvec_x, rotvec_y, rotvec_z, gripper]
+    # instead of delta commands
+    if use_absolute_actions:
+        controller_configs = env_kwargs.get("controller_configs", {})
+        if isinstance(controller_configs, dict):
+            controller_configs["control_delta"] = False
+        elif isinstance(controller_configs, list):
+            # Multiple robots - set for all
+            for cfg in controller_configs:
+                if isinstance(cfg, dict):
+                    cfg["control_delta"] = False
+        env_kwargs["controller_configs"] = controller_configs
+        print("=" * 60)
+        print("[setup_mimicgen_env] ✓ Using ABSOLUTE actions (control_delta=False)")
+        print("[setup_mimicgen_env]   Action format: [goal_x, goal_y, goal_z, rotvec_x, rotvec_y, rotvec_z, gripper]")
+        print("[setup_mimicgen_env]   Policy outputs absolute pose targets, NOT deltas")
+        print("=" * 60)
+    else:
+        print("=" * 60)
+        print("[setup_mimicgen_env] Using RELATIVE/DELTA actions (control_delta=True)")
+        print("[setup_mimicgen_env]   Action format: [dx, dy, dz, droll, dpitch, dyaw, gripper]")
+        print("=" * 60)
 
     cams = getattr(args, "mimicgen_cams", None)
     if cams is not None:

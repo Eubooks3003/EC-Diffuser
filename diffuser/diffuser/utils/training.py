@@ -276,22 +276,24 @@ class Trainer(object):
         cams=("agentview","sideview","robot0_eye_in_hand"),
         pixel_stride=2,
         goal_from_env_fn=None,
+        goal_provider=None,         # NEW: DatasetGoalProvider for init_state + goal pairing
 
         save_videos=True,
         video_dir=None,
         video_fps=20,
-        video_cams=("agentview",), 
+        video_cams=("agentview",),
 
-        renderer_3d=None,           
-        render_debug=True, 
-        render_debug_steps=(0,),         
+        renderer_3d=None,
+        render_debug=True,
+        render_debug_steps=(0,),
     ):
         """
         True success eval by stepping MimicGen.
         - make_env_fn: () -> env
         - dlp_model: your 3D DLP (already loaded)
         - calib_h5_path: hdf5 with meta/cameras/*
-        - goal_from_env_fn: (env, raw_obs) -> raw_goal_obs (optional)
+        - goal_from_env_fn: (env, raw_obs) -> raw_goal_obs (optional, legacy)
+        - goal_provider: DatasetGoalProvider for paired init_state + goal tokens (recommended)
         """
         from diffuser.envs.mimicgen_dlp_wrapper import MimicGenDLPWrapper
 
@@ -379,7 +381,14 @@ class Trainer(object):
         returns = []
         lengths = []
 
+        # Print eval configuration
+        print("=" * 60)
+        print(f"[eval_mimicgen_rollouts] Starting {n_episodes} episodes, max_steps={max_steps}")
+        print(f"[eval_mimicgen_rollouts] Goal provider: {'DatasetGoalProvider' if goal_provider is not None else 'None (legacy mode)'}")
+        print("=" * 60, flush=True)
+
         for ep in range(n_episodes):
+            print(f"\n[eval] Episode {ep+1}/{n_episodes}")
             env = make_env_fn()
             envw = MimicGenDLPWrapper(
                 env=env,
@@ -390,6 +399,7 @@ class Trainer(object):
                 pixel_stride=pixel_stride,
                 calib_h5_path=calib_h5_path,
                 get_goal_raw_obs_fn=goal_from_env_fn,
+                goal_provider=goal_provider,  # NEW: dataset-based goal provider
             )
 
             obs_vec = envw.reset()
@@ -447,7 +457,12 @@ class Trainer(object):
 
                 obs_vec, r, done, info = envw.step(a0)
 
-                print("Unormalized action: ", a0)
+                # Print first action of each episode to verify action format
+                if t == 0:
+                    print(f"[eval ep={ep} t={t}] First action (unnormalized):")
+                    print(f"  pos:     [{a0[0]:.4f}, {a0[1]:.4f}, {a0[2]:.4f}]")
+                    print(f"  rot:     [{a0[3]:.4f}, {a0[4]:.4f}, {a0[5]:.4f}]")
+                    print(f"  gripper: {a0[6]:.4f}")
 
                 # if render_debug and renderer_3d is not None:
                 #     if t in set(render_debug_steps):
