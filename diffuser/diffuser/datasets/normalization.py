@@ -62,6 +62,115 @@ class DatasetNormalizer:
     def get_field_normalizers(self):
         return self.normalizers
 
+    def sanity_check_roundtrip(self, dataset, n_samples=3, save_path=None):
+        """
+        Verify that normalize -> unnormalize recovers the original data.
+        Prints diagnostics and optionally saves to a file.
+
+        Args:
+            dataset: dict with 'actions', 'observations', etc.
+            n_samples: number of samples to check
+            save_path: if provided, saves detailed report to this file
+        """
+        print("\n" + "=" * 70)
+        print("NORMALIZER ROUND-TRIP SANITY CHECK")
+        print("=" * 70)
+
+        report_lines = []
+        all_passed = True
+
+        for key in ['actions', 'observations']:
+            if key not in self.normalizers:
+                continue
+            if key not in dataset:
+                continue
+
+            data = dataset[key]
+            normalizer = self.normalizers[key]
+
+            # Flatten if needed to get individual samples
+            if data.ndim == 3:  # (N, T, D) -> take first n_samples trajectories, first timestep
+                samples = data[:n_samples, 0, :]
+            elif data.ndim == 4:  # (N, T, K, D) particles -> take first n_samples, first timestep
+                samples = data[:n_samples, 0, :, :]
+                samples = samples.reshape(n_samples, -1)  # flatten particles for comparison
+            else:
+                samples = data[:n_samples]
+
+            # Round-trip: original -> normalized -> unnormalized
+            normalized = normalizer.normalize(samples)
+            recovered = normalizer.unnormalize(normalized)
+
+            # Compute error
+            abs_error = np.abs(samples - recovered)
+            max_error = abs_error.max()
+            mean_error = abs_error.mean()
+
+            passed = max_error < 1e-5
+            all_passed = all_passed and passed
+            status = "PASS" if passed else "FAIL"
+
+            header = f"\n[{key.upper()}] Round-trip check: {status}"
+            print(header)
+            report_lines.append(header)
+
+            # Show normalizer info
+            norm_info = f"  Normalizer type: {type(normalizer).__name__}"
+            print(norm_info)
+            report_lines.append(norm_info)
+
+            if hasattr(normalizer, 'means') and hasattr(normalizer, 'stds'):
+                stats = f"  means: {np.round(normalizer.means[:7], 4)}..."
+                print(stats)
+                report_lines.append(stats)
+                stats = f"  stds:  {np.round(normalizer.stds[:7], 4)}..."
+                print(stats)
+                report_lines.append(stats)
+                if hasattr(normalizer, 'z') and normalizer.z != 1.0:
+                    z_info = f"  z (temperature): {normalizer.z}"
+                    print(z_info)
+                    report_lines.append(z_info)
+            elif hasattr(normalizer, 'mins') and hasattr(normalizer, 'maxs'):
+                stats = f"  mins: {np.round(normalizer.mins[:7], 4)}..."
+                print(stats)
+                report_lines.append(stats)
+                stats = f"  maxs: {np.round(normalizer.maxs[:7], 4)}..."
+                print(stats)
+                report_lines.append(stats)
+
+            error_info = f"  Max error: {max_error:.2e}, Mean error: {mean_error:.2e}"
+            print(error_info)
+            report_lines.append(error_info)
+
+            # Show sample data for first sample
+            for i in range(min(2, samples.shape[0])):
+                sample_header = f"\n  Sample {i}:"
+                print(sample_header)
+                report_lines.append(sample_header)
+
+                # Show first 7 dimensions (typical action dim)
+                orig_str = f"    Original:     [{', '.join([f'{x:+.4f}' for x in samples[i, :7]])}]"
+                norm_str = f"    Normalized:   [{', '.join([f'{x:+.4f}' for x in normalized[i, :7]])}]"
+                recv_str = f"    Recovered:    [{', '.join([f'{x:+.4f}' for x in recovered[i, :7]])}]"
+                diff_str = f"    Diff (|o-r|): [{', '.join([f'{x:.2e}' for x in abs_error[i, :7]])}]"
+
+                print(orig_str)
+                print(norm_str)
+                print(recv_str)
+                print(diff_str)
+                report_lines.extend([orig_str, norm_str, recv_str, diff_str])
+
+        summary = f"\n{'=' * 70}\nOVERALL: {'ALL CHECKS PASSED' if all_passed else 'SOME CHECKS FAILED'}\n{'=' * 70}\n"
+        print(summary)
+        report_lines.append(summary)
+
+        if save_path:
+            with open(save_path, 'w') as f:
+                f.write('\n'.join(report_lines))
+            print(f"Saved detailed report to: {save_path}")
+
+        return all_passed
+
 def flatten(dataset, path_lengths):
     """
     Flatten dataset fields by concatenating across episodes, respecting path_lengths.
@@ -153,27 +262,37 @@ class DebugNormalizer(Normalizer):
 
 class GaussianNormalizer(Normalizer):
     '''
-        normalizes to zero mean and unit variance
+        normalizes to zero mean and unit variance, with optional temperature scaling.
+
+        z (temperature) controls the effective range:
+          - z=1.0: standard Gaussian normalization (default)
+          - z<1.0: widens the action range (model output ±1 maps to larger values)
+          - z>1.0: narrows the action range
+
+        normalize:   (x - mean) / (z * std)
+        unnormalize: x * (z * std) + mean
     '''
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, z=1.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.means = self.X.mean(axis=0)
         self.stds = self.X.std(axis=0)
-        self.z = 1
+        self.z = z  # temperature scaling factor
 
     def __repr__(self):
         return (
-            f'''[ Normalizer ] dim: {self.mins.size}\n    '''
-            f'''means: {np.round(self.means, 2)}\n    '''
-            f'''stds: {np.round(self.z * self.stds, 2)}\n'''
+            f'''[ GaussianNormalizer ] dim: {self.mins.size}\n    '''
+            f'''means: {np.round(self.means, 4)}\n    '''
+            f'''stds:  {np.round(self.stds, 4)}\n    '''
+            f'''z (temp): {self.z}\n    '''
+            f'''effective_stds (z*std): {np.round(self.z * self.stds, 4)}\n'''
         )
 
     def normalize(self, x):
-        return (x - self.means) / (self.stds + 1e-6)
+        return (x - self.means) / (self.z * self.stds + 1e-6)
 
     def unnormalize(self, x):
-        return x * self.stds + self.means
+        return x * (self.z * self.stds) + self.means
 
 
 class LimitsNormalizer(Normalizer):

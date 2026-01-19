@@ -1,18 +1,18 @@
 import numpy as np
 import torch
 import h5py
-from robosuite.utils import camera_utils as CU
 
 from datasets.voxelize_ds_wrapper import VoxelGridXYZ
+from dlp_utils import log_rgb_voxels
 
 # ----------------------------
-# PLY-equivalent preprocessing
+# PLY-equivalent preprocessing (EXACT MATCH to mimicgen_ply_all_tasks.py)
 # ----------------------------
 
 def center_scale_unit_cube_np(pts: np.ndarray) -> np.ndarray:
     """
-    Identical math to your preprocessing script (but numpy).
-    pts: [N,3] or [N,6] (xyz[0:3], rgb[3:6] optional)
+    Center and isotropically scale to fit in [-1,1]^3.
+    Identical to preprocess_mimicgen_voxels.py
     """
     if pts.ndim != 2 or pts.shape[1] not in (3, 6):
         raise RuntimeError(f"pts must be [N,3] or [N,6], got {pts.shape}")
@@ -43,6 +43,84 @@ def parse_fixed_bounds_pm(bounds_str: str):
     return (pmin, pmax)
 
 # ----------------------------
+# Depth conversion (EXACT MATCH to mimicgen_ply_all_tasks.py)
+# ----------------------------
+
+def _squeeze_hw(d):
+    """Same as squeeze_hw in mimicgen_ply_all_tasks.py"""
+    d = np.asarray(d)
+    if d.ndim == 3:
+        d = np.squeeze(d)
+    if d.ndim != 2:
+        d = d.reshape(d.shape[-2], d.shape[-1])
+    return d
+
+def depth_to_z(depth_raw, mode: str, near_m: float, far_m: float):
+    """
+    Convert depth buffer to metric depth.
+
+    For LIVE robosuite simulator: use mode="robosuite" (default)
+      - Robosuite returns OpenGL depth buffer values ~0.98-0.996
+      - Formula: near / (1 - d * (1 - near/far)) = near*far / (far - d*(far-near))
+
+    For OFFLINE HDF5 data: the preprocessing script auto-picks the best mode
+      - Often "linear" works for pre-converted depth
+    """
+    d = _squeeze_hw(depth_raw).astype(np.float32)
+    dmax = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
+
+    if mode == "as_is":
+        return d
+
+    if dmax > 1.05:
+        # already metric-ish
+        return d
+
+    d = np.clip(d, 0.0, 1.0)
+    n = float(near_m)
+    f = float(far_m)
+
+    if mode == "linear":
+        # Linear interpolation (for pre-converted depth)
+        return n + d * (f - n)
+
+    if mode == "robosuite" or mode == "opengl_inv_simple":
+        # OpenGL depth buffer inversion (matches CU.get_real_depth_map)
+        # Formula: near / (1 - d * (1 - near/far))
+        # Simplified: near * far / (far - d * (far - near))
+        return (n * f) / (f - d * (f - n) + 1e-12)
+
+    if mode == "opengl_ndc":
+        z_ndc = 2.0 * d - 1.0
+        return (2.0 * n * f) / (f + n - z_ndc * (f - n) + 1e-12)
+
+    raise ValueError(f"unknown depth mode {mode}")
+
+def compute_K_from_fovy(fovy_deg, W, H):
+    """
+    EXACT COPY from mimicgen_ply_all_tasks.py
+    Compute intrinsic matrix from field of view.
+    """
+    fovy = np.deg2rad(float(fovy_deg))
+    fy = (H / 2.0) / np.tan(fovy / 2.0)
+    fx = fy * (W / H)
+    cx = (W - 1) / 2.0
+    cy = (H - 1) / 2.0
+    return np.array([[fx, 0, cx],
+                     [0, fy, cy],
+                     [0,  0,  1]], dtype=np.float32)
+
+def mujoco_near_far_meters(sim):
+    """
+    EXACT COPY from mimicgen_ply_all_tasks.py
+    MuJoCo uses znear/zfar * extent (this is the big gotcha)
+    """
+    extent = float(sim.model.stat.extent)
+    znear = float(sim.model.vis.map.znear) * extent
+    zfar  = float(sim.model.vis.map.zfar)  * extent
+    return znear, zfar
+
+# ----------------------------
 # Token packing (exactly like preprocessing)
 # ----------------------------
 
@@ -55,49 +133,21 @@ def pack_tokens_k24_preproc_format(out: dict) -> torch.Tensor:
     if "z" not in out:
         raise RuntimeError("DLP output missing key 'z'")
 
-
-    z       = out["z"][:, 0]          
-    z_scale = out["z_scale"][:, 0]    
-    z_depth = out["z_depth"][:, 0]    
-    obj_on  = out["obj_on"][:, 0]    
-    z_feat  = out["z_features"][:, 0] 
+    z       = out["z"][:, 0]
+    z_scale = out["z_scale"][:, 0]
+    z_depth = out["z_depth"][:, 0]
+    obj_on  = out["obj_on"][:, 0]
+    z_feat  = out["z_features"][:, 0]
 
     if obj_on.ndim == 2:
         obj_on = obj_on.unsqueeze(-1)
 
-    toks = torch.cat([z, z_scale, z_depth, obj_on, z_feat], dim=-1)  # (B,24,Dtok)
+    toks = torch.cat([z, z_scale, z_depth, obj_on, z_feat], dim=-1)
     return toks
 
 # ----------------------------
-# Depth/RGB helpers (fail-fast)
+# Helpers
 # ----------------------------
-
-def _squeeze_hw(d):
-    d = np.asarray(d)
-    if d.ndim == 3:
-        d = np.squeeze(d)
-    if d.ndim != 2:
-        d = d.reshape(d.shape[-2], d.shape[-1])
-    return d.astype(np.float32)
-
-def _depth_to_meters(depth_raw, near, far):
-    d = _squeeze_hw(depth_raw)
-
-    # int buffers -> normalize to [0,1]
-    if np.issubdtype(depth_raw.dtype, np.integer):
-        denom = 65535.0 if depth_raw.dtype == np.uint16 else 255.0
-        d = d / denom
-
-    dmax = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
-    if dmax <= 1.01 and (near is not None) and (far is not None):
-        d = near + d * (far - near)
-    return d.astype(np.float32)
-
-def _apply_T(T, pts):
-    ones = np.ones((pts.shape[0], 1), np.float32)
-    pts_h = np.concatenate([pts, ones], axis=1)
-    out = (T.astype(np.float32) @ pts_h.T).T
-    return out[:, :3]
 
 def _looks_like_rigid(T: np.ndarray, tol=1e-2) -> bool:
     T = np.asarray(T, dtype=np.float64)
@@ -130,14 +180,6 @@ def _recover_cam2world(T_cam_world_like: np.ndarray, K: np.ndarray) -> np.ndarra
 class DatasetGoalProvider:
     """
     Provides paired (init_state, goal_tokens) from a preprocessed dataset.
-
-    This ensures that at evaluation time:
-    1. The simulator is reset to the same initial state as a training trajectory
-    2. The goal tokens match what the model saw during training for that trajectory
-
-    Usage:
-        provider = DatasetGoalProvider(data_pkl_path)
-        wrapper = MimicGenDLPWrapper(env, dlp_model, device, goal_provider=provider)
     """
 
     def __init__(self, data_pkl_path, shuffle=True):
@@ -148,20 +190,16 @@ class DatasetGoalProvider:
 
         self.init_states = data['init_states']    # (E, state_dim)
         self.goals = data['goals'][:, 0]          # (E, K, Dtok) - goal per trajectory
+        self.first_frame_obs = data['observations'][:, 0]  # (E, K, Dtok) - first frame tokens
         self.path_lengths = data['path_lengths']  # (E,)
         self.num_trajectories = len(self.init_states)
 
-        # Shuffle indices for variety across eval episodes
         self.indices = np.arange(self.num_trajectories)
         if shuffle:
             np.random.shuffle(self.indices)
 
         self.current_idx = 0
-
-        print(f"[DatasetGoalProvider] Loaded {self.num_trajectories} trajectories")
-        print(f"[DatasetGoalProvider]   init_states: {self.init_states.shape} (simulator states for reset)")
-        print(f"[DatasetGoalProvider]   goals: {self.goals.shape} (DLP tokens for goal conditioning)")
-        print(f"[DatasetGoalProvider]   path_lengths: min={self.path_lengths.min()}, max={self.path_lengths.max()}, mean={self.path_lengths.mean():.1f}")
+        self.last_idx = None
 
     def get_init_state_and_goal(self):
         """
@@ -170,11 +208,21 @@ class DatasetGoalProvider:
         """
         idx = self.indices[self.current_idx % self.num_trajectories]
         self.current_idx += 1
+        self.last_idx = idx
 
         init_state = self.init_states[idx]  # (state_dim,)
         goal_tokens = self.goals[idx]       # (K, Dtok)
 
         return init_state, goal_tokens
+
+    def get_first_frame_tokens(self):
+        """
+        Returns the preprocessed first frame tokens for the most recently returned trajectory.
+        Use this to compare live encoding vs preprocessing.
+        """
+        if self.last_idx is None:
+            raise RuntimeError("Call get_init_state_and_goal() first")
+        return self.first_frame_obs[self.last_idx]  # (K, Dtok)
 
     def reset_sampling(self, shuffle=True):
         """Reset to beginning of trajectories, optionally reshuffle."""
@@ -184,18 +232,20 @@ class DatasetGoalProvider:
 
 
 # ----------------------------
-# Wrapper-faithful MimicGenDLPWrapper
+# MimicGenDLPWrapper (EXACT MATCH to preprocessing pipeline)
 # ----------------------------
 
 class MimicGenDLPWrapper:
     """
-    Online wrapper that matches preprocessing:
-      RGB-D -> xyzrgb (world) -> (optional) unit-cube norm -> downsample ->
-      voxelize via VoxelGridXYZ -> DLP -> pack_tokens_k24_preproc_format -> flatten
+    Online wrapper that EXACTLY matches the preprocessing pipeline:
+      mimicgen_ply_all_tasks.py -> preprocess_mimicgen_voxels.py
 
-    IMPORTANT:
-      - For training/inference consistency you should use bounds_mode='global' or 'fixed',
-        NOT 'per_item'. But we expose the same options as preprocessing.
+    Key matching points:
+      - Depth conversion: depth_to_z with near*extent, far*extent
+      - Camera transform: flip y/z in cam coords, then R @ pts + pos
+      - Intrinsics: compute_K_from_fovy
+      - Normalization: center_scale_unit_cube (enabled by default)
+      - Voxelization: VoxelGridXYZ with per_item bounds
     """
 
     def __init__(
@@ -203,30 +253,40 @@ class MimicGenDLPWrapper:
         env,
         dlp_model,
         device,
-        cams=("agentview", "sideview", "robot0_eye_in_hand"),
+        cams=("agentview", "sideview"),
 
         # preprocessing-equivalent knobs
         max_points=4096,
-        normalize_to_unit_cube=False,   # MUST match what you used offline
-        include_rgb=True,               # DLP expects avg_rgb voxel usually
+        normalize_to_unit_cube=True,  # DEFAULT TRUE to match preprocess_mimicgen_voxels.py
+        include_rgb=True,
 
-        # voxelization knobs (same as preprocessing script)
+        # depth conversion mode
+        # "robosuite" (default): correct for LIVE simulator (OpenGL depth buffer inversion)
+        # "linear": for offline HDF5 data where preprocessing auto-picked this mode
+        depth_mode="robosuite",
+
+        # voxelization knobs
         grid_dhw=(64, 64, 64),
-        voxel_mode="avg_rgb",           # "avg_rgb"|"occupancy"|"density"|"moments"
-        bounds_mode="per_item",           # "per_item"|"global"|"fixed"
-        fixed_bounds="-1,1,-1,1,-1,1",  # used if bounds_mode="fixed"
-        global_bounds_pm=None,          # required if bounds_mode="global"
+        voxel_mode="avg_rgb",
+        bounds_mode="per_item",  # matches preprocess_mimicgen_voxels.py default
+        fixed_bounds="-1,1,-1,1,-1,1",
+        global_bounds_pm=None,
 
         # calibration
         calib_h5_path=None,
-        crop_bounds={"xmin":-0.5,"xmax":1.5,"ymin":-0.5,"ymax":1.5,"zmin":-0.2,"zmax":2.5},
+        use_h5_calib=False,
+        crop_bounds={"xmin": -1.2, "xmax": 0.5, "ymin": -0.39, "ymax": 0.39, "zmin": -0.5, "zmax": 2.5},
 
-        # goal - NEW: support for dataset-based goal/init_state pairing
-        get_goal_raw_obs_fn=None,       # Legacy: function (env, raw_obs) -> raw_obs for goal
-        goal_provider=None,             # NEW: object with get_init_state_and_goal() method
+        # goal
+        get_goal_raw_obs_fn=None,
+        goal_provider=None,
         success_key_candidates=("success", "task_success", "is_success"),
-        pixel_stride=2,
-        max_points_backproject=200_000,
+        pixel_stride=1,  # DEFAULT 1 to match mimicgen_ply_all_tasks.py
+        max_points_backproject=200_000,  # matches mimicgen_ply_all_tasks.py --max-points
+
+        # voxel saving for offline analysis
+        save_voxels_dir=None,
+        save_points=False,     # also save raw point clouds
     ):
         self.env = env
         self.dlp = dlp_model
@@ -236,6 +296,7 @@ class MimicGenDLPWrapper:
         self.max_points = int(max_points)
         self.normalize_to_unit_cube = bool(normalize_to_unit_cube)
         self.include_rgb = bool(include_rgb)
+        self.depth_mode = str(depth_mode)
 
         self.grid_dhw = tuple(grid_dhw)
         self.voxel_mode = str(voxel_mode)
@@ -244,22 +305,28 @@ class MimicGenDLPWrapper:
         self.max_points_backproject = int(max_points_backproject)
 
         self.get_goal_raw_obs_fn = get_goal_raw_obs_fn
-        self.goal_provider = goal_provider  # NEW: dataset-based goal provider
+        self.goal_provider = goal_provider
         self.success_key_candidates = tuple(success_key_candidates)
 
-        self.last_pts_world = None          # [N,3] float32 (optional)
-        self.last_pts_preproc = None        # [M,3] or [M,6] float32 after unit-cube/downsample
-        self.last_vox = None                # [C,D,H,W] float32 (np)
-        self.last_toks = None               # [K,Dtok] float32 (np)
-        self.last_obs_vec = None            # flat [K*Dtok] float32 (np)
         self.last_raw_obs = None
         self.last_info = None
         self.goal_vec = None
+        self.last_toks = None
+        self.decoded_vox = None
+        self.last_vox = None
+        self.vox = None
 
         # --- load calib ---
         self.calib = {}
-        self.crop_bounds = crop_bounds 
-        # --- bounds_pm consistent with preprocessing ---
+        self.crop_bounds = crop_bounds
+        self.use_h5_calib = bool(use_h5_calib)
+        self.calib_h5_path = calib_h5_path
+        self._h5_calib = None
+
+        if self.use_h5_calib and self.calib_h5_path is not None:
+            self._load_h5_calib(self.calib_h5_path)
+
+        # --- bounds_pm ---
         if self.bounds_mode == "fixed":
             self.bounds_pm = parse_fixed_bounds_pm(fixed_bounds)
         elif self.bounds_mode == "global":
@@ -274,16 +341,23 @@ class MimicGenDLPWrapper:
             raise RuntimeError(f"Unknown bounds_mode={self.bounds_mode}")
 
         # precompute pixel grids cache
-        self._precomputed = {}  # (cam,H,W) -> (U,V,invfx,invfy,cx,cy)
+        self._precomputed = {}
+
+        # voxel saving
+        self.save_voxels_dir = save_voxels_dir
+        self.save_points = save_points
+        self._save_counter = 0
+        self._save_ep_counter = 0
+        if self.save_voxels_dir is not None:
+            import os
+            os.makedirs(self.save_voxels_dir, exist_ok=True)
+            print(f"[MimicGenDLPWrapper] Saving voxels to: {self.save_voxels_dir}")
+
     def _get_robosuite_env_and_sim(self):
-        """
-        Unwrap robomimic EnvRobosuite (and any other wrappers) to reach a robosuite env with .sim.
-        Returns (robosuite_env, sim).
-        """
+        """Unwrap robomimic EnvRobosuite to reach a robosuite env with .sim."""
         e = self.env
         seen = set()
 
-        # unwrap a few common wrapper fields
         for _ in range(10):
             if id(e) in seen:
                 break
@@ -292,29 +366,32 @@ class MimicGenDLPWrapper:
             if hasattr(e, "sim"):
                 return e, e.sim
 
-            # robomimic EnvRobosuite typically stores the underlying robosuite env here
             for attr in ("env", "_env", "base_env", "unwrapped"):
                 if hasattr(e, attr):
                     e2 = getattr(e, attr)
-                    # some wrappers have unwrapped as property returning itself; guard
                     if e2 is not None and e2 is not e:
                         e = e2
                         break
             else:
-                # none of the attrs existed
                 break
 
         raise AttributeError(
             f"Could not find underlying robosuite env with `.sim`. "
             f"Got wrapper chain ending at type={type(e)} with attrs={dir(e)}"
         )
-    def _ensure_env_calib(self, raw_obs):
-        robosuite_env, sim = self._get_robosuite_env_and_sim()
 
-        # OpenCV -> OpenGL camera-frame conversion (x stays, y/z flip)
-        F = np.eye(4, dtype=np.float32)
-        F[1, 1] = -1.0
-        F[2, 2] = -1.0
+    def _ensure_env_calib(self, raw_obs):
+        """
+        Build calibration EXACTLY like mimicgen_ply_all_tasks.py:
+          - K from fovy
+          - near/far * extent
+          - R from cam_xmat (NO transpose)
+          - pos from cam_xpos
+        """
+        _, sim = self._get_robosuite_env_and_sim()
+
+        # Get near/far in meters (multiply by extent!)
+        near_m, far_m = mujoco_near_far_meters(sim)
 
         for cam in self.cams:
             depth = np.asarray(raw_obs[f"{cam}_depth"])
@@ -326,50 +403,40 @@ class MimicGenDLPWrapper:
             if prev is not None and prev["H"] == H and prev["W"] == W:
                 continue
 
-            # Intrinsics at this resolution
-            K = CU.get_camera_intrinsic_matrix(
-                sim, camera_name=cam, camera_height=H, camera_width=W
-            ).astype(np.float32)
+            # Use H5 calibration if available
+            if self._h5_calib is not None and cam in self._h5_calib:
+                h5_cam = self._h5_calib[cam]
+                K = h5_cam["K"]
+                # For H5 calib, we still use the standard transform
+                cam_id = sim.model.camera_name2id(cam)
+                pos = np.array(sim.data.cam_xpos[cam_id], dtype=np.float32)
+                R = np.array(sim.data.cam_xmat[cam_id], dtype=np.float32).reshape(3, 3)
+                self.calib[cam] = {"K": K, "R": R, "pos": pos, "near_m": near_m, "far_m": far_m, "H": H, "W": W}
+                continue
 
-            # ---- MuJoCo camera pose (cam frame in world coords) ----
-            # Prefer modern mujoco API if available
-            if hasattr(sim.data, "get_camera_xpos") and hasattr(sim.data, "get_camera_xmat"):
-                pos = sim.data.get_camera_xpos(cam).copy().astype(np.float32)            # (3,)
-                R_c2w_gl = sim.data.get_camera_xmat(cam).copy().reshape(3, 3).astype(np.float32)
-            else:
-                # mujoco-py style arrays
-                try:
-                    cid = sim.model.camera_name2id(cam)
-                    pos = sim.data.cam_xpos[cid].copy().astype(np.float32)
-                    R_c2w_gl = sim.data.cam_xmat[cid].copy().reshape(3, 3).astype(np.float32)
-                except Exception as e:
-                    raise AttributeError(
-                        f"Cannot access camera pose for cam='{cam}'. "
-                        f"Tried sim.data.get_camera_xpos/xmat and sim.data.cam_xpos/xmat. Error: {e}"
-                    )
+            # EXACT MATCH to mimicgen_ply_all_tasks.py
+            # Intrinsics from fovy
+            cam_id = sim.model.camera_name2id(cam)
+            fovy = float(sim.model.cam_fovy[cam_id])
+            K = compute_K_from_fovy(fovy, W=W, H=H)
 
-            Tc2w_gl = np.eye(4, dtype=np.float32)
-            Tc2w_gl[:3, :3] = R_c2w_gl
-            Tc2w_gl[:3,  3] = pos
+            # Extrinsics: pos and R (NO transpose, NO axis flip - we do that in transform)
+            pos = np.array(sim.data.cam_xpos[cam_id], dtype=np.float32)
+            R = np.array(sim.data.cam_xmat[cam_id], dtype=np.float32).reshape(3, 3)
 
-            # Convert from OpenCV cam coords (your backprojection) to MuJoCo/OpenGL cam coords
-            # world = Tc2w_gl * (F * p_cv)
-            Tc2w = Tc2w_gl @ F
+            self.calib[cam] = {"K": K, "R": R, "pos": pos, "near_m": near_m, "far_m": far_m, "H": H, "W": W}
 
-            near = float(sim.model.vis.map.znear)
-            far  = float(sim.model.vis.map.zfar)
-
-            self.calib[cam] = {"K": K, "Tc2w": Tc2w, "near": near, "far": far, "H": H, "W": W}
-
-    def _depth_to_meters_env(self, depth_raw):
-        d = np.asarray(depth_raw)
-        if d.ndim == 3 and d.shape[0] == 1:
-            d = d[0]
-        # robosuite expects a depth buffer in [0,1]
-        _, sim = self._get_robosuite_env_and_sim()
-        return CU.get_real_depth_map(sim, d).astype(np.float32)
+            # DEBUG: Print all calibration values
+            print(f"\n[DEBUG CALIB] === {cam} ===")
+            print(f"  fovy: {fovy:.4f} deg")
+            print(f"  H x W: {H} x {W}")
+            print(f"  near_m: {near_m:.6f}, far_m: {far_m:.6f}")
+            print(f"  K:\n{K}")
+            print(f"  R:\n{R}")
+            print(f"  pos: {pos}")
 
     def crop_world(self, xyz, rgb=None):
+        """EXACT MATCH to maybe_crop in mimicgen_ply_all_tasks.py"""
         b = self.crop_bounds
         if b is None:
             return (xyz, rgb) if rgb is not None else xyz
@@ -386,8 +453,34 @@ class MimicGenDLPWrapper:
             return xyz2
         return xyz2, rgb[m]
 
+    def _load_h5_calib(self, h5_path):
+        """Load calibration from HDF5 for comparison/fallback."""
+        self._h5_calib = {}
+        with h5py.File(h5_path, "r") as h5:
+            for cam in self.cams:
+                if f"meta/cameras/{cam}" not in h5:
+                    continue
+                g = h5[f"meta/cameras/{cam}"]
+                K = np.asarray(g["K"], dtype=np.float32)
+                T_raw = np.asarray(g["T_cam_world"], dtype=np.float32)
 
-    # ---------- obs extraction ----------
+                near = g.attrs.get("near", None)
+                far = g.attrs.get("far", None)
+                if near is None and "near" in g:
+                    near = float(np.asarray(g["near"]))
+                if far is None and "far" in g:
+                    far = float(np.asarray(g["far"]))
+
+                Tc2w = _recover_cam2world(T_raw, K.astype(np.float64))
+
+                self._h5_calib[cam] = {
+                    "K": K,
+                    "Tc2w": Tc2w,
+                    "T_raw": T_raw,
+                    "near": near,
+                    "far": far,
+                }
+
     def _get_rgbd_from_obs(self, obs, cam):
         rgb_key = f"{cam}_image"
         dep_key = f"{cam}_depth"
@@ -397,29 +490,27 @@ class MimicGenDLPWrapper:
             raise KeyError(f"obs missing key {dep_key}")
         return np.asarray(obs[rgb_key]), np.asarray(obs[dep_key])
 
-    def _ensure_precompute(self, cam, H, W):
-        key = (cam, H, W, self.pixel_stride)
-        if key in self._precomputed:
-            return self._precomputed[key]
+    def _backproject_cam(self, cam, depth_raw):
+        """
+        EXACT MATCH to backproject() in mimicgen_ply_all_tasks.py
+        Returns pts in CAMERA coordinates (OpenCV convention: x-right, y-down, z-forward)
+        """
+        calib = self.calib[cam]
+        K = calib["K"]
+        near_m = calib["near_m"]
+        far_m = calib["far_m"]
 
-        K = self.calib[cam]["K"]
-        fx, fy = float(K[0, 0]), float(K[1, 1])
-        cx, cy = float(K[0, 2]), float(K[1, 2])
+        # Convert depth using the same function as preprocessing
+        z = depth_to_z(depth_raw, mode=self.depth_mode, near_m=near_m, far_m=far_m)
+        print(f"[DEBUG] {cam} depth_raw range: [{depth_raw.min():.4f}, {depth_raw.max():.4f}] -> z range: [{z.min():.4f},    {z.max():.4f}]")  
+        H, W = z.shape
 
+        # Pixel grid with stride (same as preprocessing)
         vv = np.arange(0, H, self.pixel_stride, dtype=np.int32)
         uu = np.arange(0, W, self.pixel_stride, dtype=np.int32)
         U, V = np.meshgrid(uu, vv)
 
-        pre = (U, V, 1.0 / fx, 1.0 / fy, cx, cy)
-        self._precomputed[key] = pre
-        return pre
-
-    def _backproject_cam(self, cam, depth_raw):
-        depth_m = self._depth_to_meters_env(depth_raw)  # [H,W] meters
-        H, W = depth_m.shape
-        U, V, invfx, invfy, cx, cy = self._ensure_precompute(cam, H, W)
-
-        Z = depth_m[V, U]
+        Z = z[V, U]
         valid = np.isfinite(Z) & (Z > 0)
         if not np.any(valid):
             return np.zeros((0, 3), np.float32), np.zeros((0, 2), np.int32)
@@ -428,27 +519,62 @@ class MimicGenDLPWrapper:
         Vv = V[valid].astype(np.float32)
         Zv = Z[valid].astype(np.float32)
 
-        X = (Uv - cx) * invfx * Zv
-        Y = (Vv - cy) * invfy * Zv
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+
+        X = (Uv - cx) / fx * Zv
+        Y = (Vv - cy) / fy * Zv
         pts_cam = np.stack([X, Y, Zv], axis=-1).astype(np.float32)
 
         idxs = np.stack([V[valid], U[valid]], axis=-1).astype(np.int32)
         return pts_cam, idxs
 
+    def _cam_to_world(self, pts_cam, cam):
+        """
+        EXACT MATCH to build_points_for_cam() transform in mimicgen_ply_all_tasks.py:
+          # --- CV -> MuJoCo(OpenGL) camera coords ---
+          pts_gl = pts_cam.copy()
+          pts_gl[:, 1] *= -1.0   # y: down -> up
+          pts_gl[:, 2] *= -1.0   # z: forward -> backward
+          # --- camera -> world ---
+          pts_world = (R @ pts_gl.T).T + pos
+        """
+        calib = self.calib[cam]
+        R = calib["R"]
+        pos = calib["pos"]
 
-    # ---------- preprocessing-faithful pipeline ----------
+        # CV -> MuJoCo(OpenGL) camera coords
+        pts_gl = pts_cam.copy()
+        pts_gl[:, 1] *= -1.0   # y: down -> up
+        pts_gl[:, 2] *= -1.0   # z: forward -> backward
+
+        # camera -> world
+        pts_world = (R @ pts_gl.T).T + pos
+
+        return pts_world.astype(np.float32)
+
     def _fuse_xyzrgb_world(self, raw_obs) -> np.ndarray:
+        """
+        Fuse point clouds from all cameras.
+        EXACT MATCH to the loop in process_task() in mimicgen_ply_all_tasks.py
+        """
         all_xyz, all_rgb = [], []
+
         for cam in self.cams:
             rgb, depth = self._get_rgbd_from_obs(raw_obs, cam)
             pts_cam, idxs = self._backproject_cam(cam, depth)
             if pts_cam.shape[0] == 0:
                 continue
 
+            # DEBUG: Print point cloud stats at each stage
+            print(f"\n[DEBUG PTS] === {cam} ===")
+            print(f"  pts_cam shape: {pts_cam.shape}")
+            print(f"  pts_cam range: x=[{pts_cam[:,0].min():.3f}, {pts_cam[:,0].max():.3f}] y=[{pts_cam[:,1].min():.3f}, {pts_cam[:,1].max():.3f}] z=[{pts_cam[:,2].min():.3f}, {pts_cam[:,2].max():.3f}]")
+
             v = idxs[:, 0]
             u = idxs[:, 1]
 
-            # normalize rgb to HWC float in [0,1]
+            # Handle RGB format
             if rgb.ndim == 4 and rgb.shape[0] == 1:
                 rgb = rgb[0]
             if rgb.ndim == 3 and rgb.shape[0] in (1, 3, 4) and rgb.shape[-1] not in (1, 3, 4):
@@ -460,7 +586,23 @@ class MimicGenDLPWrapper:
             if rgb_pts.max() > 1.5:
                 rgb_pts /= 255.0
 
-            pts_world = _apply_T(self.calib[cam]["Tc2w"], pts_cam)
+            # Transform to world (EXACT MATCH to preprocessing)
+            pts_world = self._cam_to_world(pts_cam, cam)
+
+            # DEBUG: Print world coords before crop
+            print(f"  pts_world (before crop): x=[{pts_world[:,0].min():.3f}, {pts_world[:,0].max():.3f}] y=[{pts_world[:,1].min():.3f}, {pts_world[:,1].max():.3f}] z=[{pts_world[:,2].min():.3f}, {pts_world[:,2].max():.3f}]")
+
+            n_before = pts_world.shape[0]
+            # Crop (EXACT MATCH to preprocessing)
+            pts_world, rgb_pts = self.crop_world(pts_world, rgb_pts)
+
+            # DEBUG: Print after crop
+            print(f"  pts_world (after crop): {n_before} -> {pts_world.shape[0]} pts")
+            if pts_world.shape[0] > 0:
+                print(f"    range: x=[{pts_world[:,0].min():.3f}, {pts_world[:,0].max():.3f}] y=[{pts_world[:,1].min():.3f}, {pts_world[:,1].max():.3f}] z=[{pts_world[:,2].min():.3f}, {pts_world[:,2].max():.3f}]")
+
+            if pts_world.shape[0] == 0:
+                continue
 
             all_xyz.append(pts_world)
             all_rgb.append(rgb_pts)
@@ -471,8 +613,7 @@ class MimicGenDLPWrapper:
         xyz = np.concatenate(all_xyz, axis=0)
         rgb = np.concatenate(all_rgb, axis=0)
 
-        xyz, rgb = self.crop_world(xyz, rgb)
-
+        # Remove non-finite points
         if not np.isfinite(xyz).all():
             finite = np.isfinite(xyz).all(axis=1)
             xyz = xyz[finite]
@@ -480,29 +621,68 @@ class MimicGenDLPWrapper:
         if xyz.shape[0] == 0:
             raise RuntimeError("All reconstructed points were non-finite.")
 
-        # optional speed cap BEFORE TODataset-like downsample
+        # Max points cap (same as --max-points in preprocessing)
         if self.max_points_backproject > 0 and xyz.shape[0] > self.max_points_backproject:
             sel = np.random.choice(xyz.shape[0], self.max_points_backproject, replace=False)
             xyz, rgb = xyz[sel], rgb[sel]
 
+        # DEBUG: Print fused point cloud stats
+        print(f"\n[DEBUG FUSED] Total points: {xyz.shape[0]}")
+        print(f"  xyz range: x=[{xyz[:,0].min():.4f}, {xyz[:,0].max():.4f}] y=[{xyz[:,1].min():.4f}, {xyz[:,1].max():.4f}] z=[{xyz[:,2].min():.4f}, {xyz[:,2].max():.4f}]")
+
         if self.include_rgb:
-            return np.concatenate([xyz, rgb], axis=-1).astype(np.float32)  # [N,6]
-        return xyz.astype(np.float32)  # [N,3]
+            return np.concatenate([xyz, rgb], axis=-1).astype(np.float32)
+        return xyz.astype(np.float32)
 
     def _preprocess_points_like_TODataset(self, pts: np.ndarray) -> torch.Tensor:
-        # pts: [N,3] or [N,6] float32
+        """
+        EXACT MATCH to preprocess_mimicgen_voxels.py:
+          - center_scale_unit_cube (if enabled)
+          - downsample to max_points
+        """
+        # DEBUG: Before normalization
+        xyz_before = pts[:, :3]
+        print(f"\n[DEBUG PREPROCESS] Before normalize: x=[{xyz_before[:,0].min():.4f}, {xyz_before[:,0].max():.4f}] y=[{xyz_before[:,1].min():.4f}, {xyz_before[:,1].max():.4f}] z=[{xyz_before[:,2].min():.4f}, {xyz_before[:,2].max():.4f}]")
+
         if self.normalize_to_unit_cube:
             pts = center_scale_unit_cube_np(pts)
+            # DEBUG: After normalization
+            xyz_after = pts[:, :3]
+            print(f"[DEBUG PREPROCESS] After normalize:  x=[{xyz_after[:,0].min():.4f}, {xyz_after[:,0].max():.4f}] y=[{xyz_after[:,1].min():.4f}, {xyz_after[:,1].max():.4f}] z=[{xyz_after[:,2].min():.4f}, {xyz_after[:,2].max():.4f}]")
+        else:
+            print(f"[DEBUG PREPROCESS] normalize_to_unit_cube=False, skipping normalization")
+
         pts = downsample_np(pts, self.max_points)
-        return torch.from_numpy(pts).float()  # CPU
+        return torch.from_numpy(pts).float()
+
+    def _save_voxel(self, vox: torch.Tensor, pts_t: torch.Tensor = None):
+        """Save voxel (and optionally points) to disk."""
+        import os
+
+        ep_dir = os.path.join(self.save_voxels_dir, f"ep_{self._save_ep_counter:04d}")
+        os.makedirs(ep_dir, exist_ok=True)
+
+        # Save voxel
+        vox_path = os.path.join(ep_dir, f"frame_{self._save_counter:06d}_voxels.pt")
+        torch.save(vox.detach().cpu(), vox_path)
+
+        # Save points if requested
+        if pts_t is not None:
+            pts_path = os.path.join(ep_dir, f"frame_{self._save_counter:06d}_points.pt")
+            torch.save(pts_t.detach().cpu(), pts_path)
+
+        self._save_counter += 1
 
     def _voxelize_via_wrapper(self, pts_t: torch.Tensor) -> torch.Tensor:
+        """
+        EXACT MATCH to voxelize_task() in preprocess_mimicgen_voxels.py:
+          - VoxelGridXYZ with bounds=None (per_item)
+        """
         D, H, W = map(int, self.grid_dhw)
 
         if pts_t.ndim != 2 or pts_t.shape[1] not in (3, 6):
             raise RuntimeError(f"pts_t must be [N,3] or [N,6], got {tuple(pts_t.shape)}")
 
-        # move to device (VoxelGridXYZ handles torch tensors)
         pts_t = pts_t.to(self.device)
 
         xyz = pts_t[:, :3]
@@ -515,67 +695,48 @@ class MimicGenDLPWrapper:
         vg = VoxelGridXYZ(
             points_xyz=xyz,
             colors=colors,
-            grid_whd=(W, H, D),     # wrapper expects (W,H,D)
-            bounds=self.bounds_pm,  # None => per-item; else fixed/global
+            grid_whd=(W, H, D),
+            bounds=self.bounds_pm,
             mode=self.voxel_mode,
         )
-        vox = vg.to_dense()  # [C,D,H,W]
+        vox = vg.to_dense()
         return vox
-
-    def _get_cam_calib_from_env(self, cam, raw_obs):
-        sim = self.env.sim
-
-        # infer current render size from the observation
-        depth = np.asarray(raw_obs[f"{cam}_depth"])
-        if depth.ndim == 3 and depth.shape[0] == 1:
-            depth = depth[0]
-        H, W = depth.shape[-2], depth.shape[-1]
-
-        # intrinsics for *this* H,W
-        K = CU.get_camera_intrinsic_matrix(sim, camera_name=cam, camera_height=H, camera_width=W).astype(np.float32)
-
-        # extrinsics (check whether this returns world->cam or cam->world in YOUR robosuite version)
-        # many robosuite versions provide this as world->camera
-        Tw2c = CU.get_camera_extrinsic_matrix(sim, camera_name=cam).astype(np.float32)
-
-        # convert to cam->world
-        Tc2w = np.linalg.inv(Tw2c).astype(np.float32)
-
-        # near/far for depth conversion
-        # robosuite typically uses sim.model.vis.map.znear / zfar
-        near = float(sim.model.vis.map.znear)
-        far  = float(sim.model.vis.map.zfar)
-
-        return K, Tc2w, near, far
 
     @torch.no_grad()
     def encode_tokens(self, raw_obs):
-        # ---- 1) fused world points (pre-downsample) ----
-        self._ensure_env_calib(raw_obs) 
-        pts = self._fuse_xyzrgb_world(raw_obs)                 # [N,3] or [N,6] np
-        # cache world xyz for debug (drop rgb if present)
-        self.last_pts_world = pts[:, :3].astype(np.float32, copy=True)
+        self._ensure_env_calib(raw_obs)
+        pts = self._fuse_xyzrgb_world(raw_obs)
 
-        # ---- 2) TODataset-like preproc (unit cube + downsample) ----
-        pts_t = self._preprocess_points_like_TODataset(pts)    # CPU torch [M,3/6]
-        self.last_pts_preproc = pts_t.numpy().astype(np.float32, copy=True)
+        pts_t = self._preprocess_points_like_TODataset(pts)
 
-        # ---- 3) voxelize (THIS is the "GT voxel" fed to DLP) ----
-        vox = self._voxelize_via_wrapper(pts_t)                # torch [C,D,H,W] on device
-        self.last_vox = vox.detach().cpu().numpy().astype(np.float32, copy=True)
+        vox = self._voxelize_via_wrapper(pts_t)
 
-        # ---- 4) DLP encode -> tokens ----
-        vox_b = vox.unsqueeze(0)                               # [1,C,D,H,W]
+        # Save voxels if enabled
+        if self.save_voxels_dir is not None:
+            self._save_voxel(vox, pts_t if self.save_points else None)
+
+        vox_b = vox.unsqueeze(0)
         out = self.dlp(vox_b, deterministic=True, warmup=False, with_loss=False)
-        toks = pack_tokens_k24_preproc_format(out)             # [1,K,Dtok] torch
-        toks_np = toks[0].detach().cpu().numpy().astype(np.float32, copy=True)  # [K,Dtok]
+        z = out["z"]
+        z_scale = out["z_scale"]
+        z_depth = out["z_depth"]
+        z_obj_on = out["obj_on"]
+        z_features = out["z_features"]
+        z_bg = out["z_bg_features"]
+
+        dec_out = self.dlp.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg, z_ctx=None)
+        toks = pack_tokens_k24_preproc_format(out)
+        toks_np = toks[0].detach().cpu().numpy().astype(np.float32)
+        flat = toks_np.reshape(-1).astype(np.float32)
+
+        # Store for comparison
         self.last_toks = toks_np
-        flat = toks_np.reshape(-1).astype(np.float32, copy=True)
-        self.last_obs_vec = flat
+        self.decoded_vox = dec_out["dec_objects_trans"][0]  # [3, D, H, W] torch tensor
+        self.last_vox = vox.detach().cpu().numpy()
+        self.vox = vox
 
         return flat, toks_np, self.last_vox
 
-    # ---------- goal / env ----------
     def _get_success_from_info(self, info):
         if info is None:
             return None
@@ -588,52 +749,195 @@ class MimicGenDLPWrapper:
                     return bool(v)
         return None
 
+    def unpack_tokens_to_dlp_format(self, toks_np):
+        """
+        Unpack flat tokens (K, Dtok) back to DLP dict format for decoding.
+        Inverse of pack_tokens_k24_preproc_format.
+
+        Token format: [z(3), z_scale(3), z_depth(1), obj_on(1), z_features(F)]
+        """
+        toks = torch.from_numpy(toks_np).float().to(self.device)
+        if toks.ndim == 2:
+            toks = toks.unsqueeze(0)  # (1, K, Dtok)
+
+        # Add the extra dimension that DLP expects: (B, 1, K, *)
+        toks = toks.unsqueeze(1)  # (B, 1, K, Dtok)
+
+        z = toks[..., :3]           # (B, 1, K, 3)
+        z_scale = toks[..., 3:6]    # (B, 1, K, 3)
+        z_depth = toks[..., 6:7]    # (B, 1, K, 1)
+        obj_on = toks[..., 7:8]     # (B, 1, K, 1)
+        z_features = toks[..., 8:]  # (B, 1, K, F)
+
+        return {
+            "z": z,
+            "z_scale": z_scale,
+            "z_depth": z_depth,
+            "obj_on": obj_on,
+            "z_features": z_features,
+        }
+
+    @torch.no_grad()
+    def decode_particles(self, toks_np):
+        """
+        Decode particle tokens through DLP decoder to get reconstructed voxels.
+
+        Args:
+            toks_np: (K, Dtok) numpy array of packed tokens
+
+        Returns:
+            dict with:
+                - fg_only: (3, D, H, W) torch tensor - foreground objects only
+                - rec_rgb: (3, D, H, W) torch tensor - full reconstruction
+        """
+        dlp_dict = self.unpack_tokens_to_dlp_format(toks_np)
+
+        z = dlp_dict["z"]
+        z_scale = dlp_dict["z_scale"]
+        z_depth = dlp_dict["z_depth"]
+        obj_on = dlp_dict["obj_on"]
+        z_features = dlp_dict["z_features"]
+
+        dec = self.dlp.decode_all(
+            z, z_scale, z_features, obj_on, z_depth,
+            None, None,
+            warmup=False
+        )
+
+        if not isinstance(dec, dict):
+            raise TypeError(f"decode_all returned {type(dec)}; expected dict")
+
+        rec_rgb = dec["rec_rgb"]
+        fg_only = dec["dec_objects_trans"]
+
+        return {
+            "fg_only": fg_only[0],
+            "rec_rgb": rec_rgb[0],
+        }
+
+    @torch.no_grad()
+    def compare_live_vs_dataset_particles(self, dataset_tokens=None, log_to_wandb=False, step=None, prefix="particle_comparison"):
+        """
+        Compare live-encoded particles vs dataset particles by decoding both
+        through the DLP decoder and comparing reconstructed voxels.
+        """
+        if self.last_toks is None or self.last_vox is None:
+            raise RuntimeError("No live encoding available. Call reset() or step() first.")
+
+        if dataset_tokens is None:
+            if self.goal_provider is None:
+                raise RuntimeError("No dataset_tokens provided and no goal_provider available")
+            dataset_tokens = self.goal_provider.get_first_frame_tokens()
+
+        dataset_tokens = np.asarray(dataset_tokens, dtype=np.float32)
+        live_tokens = self.last_toks
+        gt_vox = self.last_vox
+
+        decoded_dataset = self.decode_particles(dataset_tokens)
+        decoded_live = self.decode_particles(live_tokens)
+
+        dataset_fg = decoded_dataset["fg_only"]
+        live_fg = decoded_live["fg_only"]
+        dataset_rec = decoded_dataset["rec_rgb"]
+        live_rec = decoded_live["rec_rgb"]
+
+        token_l2 = np.linalg.norm(live_tokens - dataset_tokens, axis=-1)
+
+        dataset_fg_np = dataset_fg.detach().cpu().numpy()
+        live_fg_np = live_fg.detach().cpu().numpy()
+
+        vox_mse_live_vs_dataset = float(np.mean((live_fg_np - dataset_fg_np) ** 2))
+
+        result = {
+            "token_l2_mean": float(token_l2.mean()),
+            "token_l2_max": float(token_l2.max()),
+            "vox_mse_live_vs_dataset": vox_mse_live_vs_dataset,
+            "gt_vox": gt_vox,
+            "decoded_dataset_fg": dataset_fg,
+            "decoded_dataset_rec": dataset_rec,
+            "decoded_live_fg": live_fg,
+            "decoded_live_rec": live_rec,
+            "dataset_tokens": dataset_tokens,
+            "live_tokens": live_tokens,
+        }
+
+        if log_to_wandb:
+            try:
+                import wandb
+
+                wandb.log({
+                    f"{prefix}/token_l2_mean": result["token_l2_mean"],
+                    f"{prefix}/token_l2_max": result["token_l2_max"],
+                    f"{prefix}/vox_mse_live_vs_dataset": result["vox_mse_live_vs_dataset"],
+                }, step=step)
+
+                log_rgb_voxels(
+                    name=f"{prefix}/gt_vox_from_sim",
+                    rgb_vol=gt_vox,
+                    alpha_vol=None, KPx=None, step=step,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+
+                log_rgb_voxels(
+                    name=f"{prefix}/decoded_dataset_particles_fg",
+                    rgb_vol=dataset_fg,
+                    alpha_vol=None, KPx=None, step=step,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+
+                log_rgb_voxels(
+                    name=f"{prefix}/decoded_live_particles_fg",
+                    rgb_vol=live_fg,
+                    alpha_vol=None, KPx=None, step=step,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+
+                log_rgb_voxels(
+                    name=f"{prefix}/decoded_dataset_particles_rec",
+                    rgb_vol=dataset_rec,
+                    alpha_vol=None, KPx=None, step=step,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+
+                log_rgb_voxels(
+                    name=f"{prefix}/decoded_live_particles_rec",
+                    rgb_vol=live_rec,
+                    alpha_vol=None, KPx=None, step=step,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+
+            except ImportError:
+                pass
+            except Exception as e:
+                print(f"[WARNING] Failed to log to wandb: {e}")
+
+        return result
+
     def reset(self, **kwargs):
-        """
-        Reset the environment and set up goal conditioning.
+        """Reset the environment and set up goal conditioning."""
+        # Increment episode counter for voxel saving
+        if self.save_voxels_dir is not None:
+            self._save_ep_counter += 1
+            self._save_counter = 0
 
-        If goal_provider is set, it will:
-        1. Get init_state and goal_tokens from the provider
-        2. Reset the simulator to the init_state (matching training data)
-        3. Use the corresponding goal_tokens for conditioning
-
-        This ensures the goal observation matches the initial state configuration.
-        """
-        # NEW: If goal_provider is available, use it for init_state + goal pairing
         if self.goal_provider is not None:
             init_state, goal_tokens = self.goal_provider.get_init_state_and_goal()
 
-            print(f"[MimicGenDLPWrapper] Using DatasetGoalProvider for goal conditioning")
-            print(f"[MimicGenDLPWrapper] Resetting to init_state from trajectory {self.goal_provider.current_idx - 1}")
-
-            # Reset simulator to the training trajectory's initial state
-            # This ensures the scene matches what the goal represents
             raw_obs = self.env.reset_to({"states": init_state})
-            if raw_obs is None:
-                # Some envs return None from reset_to, need to get obs separately
-                raw_obs = self.env.get_observation()
-
-            print(f"[MimicGenDLPWrapper] ✓ Successfully reset to init_state (shape: {init_state.shape})")
+            # if raw_obs is None:
+            #     raw_obs = self.env.get_observation()
 
             self.last_raw_obs = raw_obs
             self._ensure_env_calib(raw_obs)
             self.last_info = None
 
-            # Encode current observation
             obs_vec, _, _ = self.encode_tokens(raw_obs)
 
-            # Goal tokens come directly from dataset (already DLP-encoded)
-            # Flatten to match obs_vec format: (K, Dtok) -> (K * Dtok,)
             self.goal_vec = goal_tokens.reshape(-1).astype(np.float32)
-
-            print(f"[MimicGenDLPWrapper] ✓ Goal conditioning set from dataset")
-            print(f"[MimicGenDLPWrapper]   goal_tokens shape: {goal_tokens.shape} -> flattened: {self.goal_vec.shape}")
-            print(f"[MimicGenDLPWrapper]   obs_vec shape: {obs_vec.shape}")
 
             return obs_vec
 
         # Legacy path: standard reset
-        print(f"[MimicGenDLPWrapper] WARNING: No goal_provider set, using legacy reset")
         raw_obs = self.env.reset(**kwargs)
         self.last_raw_obs = raw_obs
         self._ensure_env_calib(raw_obs)
@@ -642,12 +946,10 @@ class MimicGenDLPWrapper:
         obs_vec, _, _ = self.encode_tokens(raw_obs)
 
         if self.get_goal_raw_obs_fn is not None:
-            print(f"[MimicGenDLPWrapper] Using get_goal_raw_obs_fn for goal (legacy)")
             goal_raw = self.get_goal_raw_obs_fn(self.env, raw_obs)
             goal_vec, _, _ = self.encode_tokens(goal_raw)
             self.goal_vec = goal_vec
         else:
-            print(f"[MimicGenDLPWrapper] WARNING: No goal function! Using current obs as goal (will likely fail)")
             self.goal_vec = obs_vec.copy()
 
         return obs_vec

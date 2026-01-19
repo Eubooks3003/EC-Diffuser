@@ -135,6 +135,13 @@ class Parser(Tap):
             
             params.update(mode_to_args_filter)
         
+        # Append action type (absolute vs relative) to exp_name if specified
+        use_absolute = params.get('use_absolute_actions', None)
+        if use_absolute is True:
+            exp_name = exp_name + '_absolute'
+        elif use_absolute is False:
+            exp_name = exp_name + '_relative'
+
         params['prefix'] = params['prefix'] + exp_name
         params['seed'] = args.seed
 

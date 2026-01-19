@@ -287,6 +287,9 @@ class Trainer(object):
         render_debug=True,
         render_debug_steps=(0,),
         exe_steps=1,  # NEW: number of actions to execute from each plan before replanning
+        log_imagined_states=True,  # NEW: decode and log diffuser's predicted future states
+        log_imagined_episode=0,  # which episode to log imagined states for
+        log_imagined_plan_idx=0,  # which plan (replan) within the episode to log
     ):
         """
         True success eval by stepping MimicGen.
@@ -297,6 +300,11 @@ class Trainer(object):
         - goal_provider: DatasetGoalProvider for paired init_state + goal tokens (recommended)
         - exe_steps: number of actions to execute from each predicted trajectory before replanning
                      (action chunking). Default=1 means replan every step.
+        - log_imagined_states: if True, decode and log the diffuser's predicted future observations
+                               to wandb using the 3D renderer. This allows verifying that the
+                               imagined states reconstruct into something reasonable.
+        - log_imagined_episode: which episode to log imagined states for (default 0 = first episode)
+        - log_imagined_plan_idx: which plan within the episode to log (default 0 = first plan)
         """
         from diffuser.envs.mimicgen_dlp_wrapper import MimicGenDLPWrapper
 
@@ -393,6 +401,10 @@ class Trainer(object):
             print(f"[eval_mimicgen_rollouts] Will execute {exe_steps} actions per plan before replanning")
         else:
             print(f"[eval_mimicgen_rollouts] WARNING: exe_steps=1 means replanning every step (no chunking)")
+        if log_imagined_states and renderer_3d is not None:
+            print(f"[eval_mimicgen_rollouts] IMAGINED STATE LOGGING: enabled for ep={log_imagined_episode}, plan={log_imagined_plan_idx}")
+        elif log_imagined_states and renderer_3d is None:
+            print(f"[eval_mimicgen_rollouts] IMAGINED STATE LOGGING: requested but renderer_3d is None, skipping")
         print("=" * 60, flush=True)
 
         for ep in range(n_episodes):
@@ -408,9 +420,11 @@ class Trainer(object):
                 calib_h5_path=calib_h5_path,
                 get_goal_raw_obs_fn=goal_from_env_fn,
                 goal_provider=goal_provider,  # NEW: dataset-based goal provider
+                normalize_to_unit_cube=True,  
             )
 
             obs_vec = envw.reset()
+            # envw.print_params_like_h5_script(envw.last_raw_obs)   
 
             if render_debug and renderer_3d is not None:
                 # _render_tokens_debug(tag=f"ep_{ep:02d}/reset_obs", obs_vec_flat=obs_vec, horizon_step=0)
@@ -430,11 +444,131 @@ class Trainer(object):
                     pad=2.0,
                     show_axes=True,
                 )
+
+                # ====== LIVE vs PREPROCESSED COMPARISON (same initial state!) ======
+                if goal_provider is not None and hasattr(goal_provider, 'get_first_frame_tokens'):
+                    preproc_toks = goal_provider.get_first_frame_tokens()  # (K, Dtok) from pkl
+                    # live_toks = envw.last_toks if envw.last_toks is not None else obs_vec.reshape(16, 12)
+                    if envw.last_toks is not None:
+                        live_toks = envw.last_toks
+                        print(f" Using last_toks from envw")
+                    else:
+                        live_toks = obs_vec.reshape(16, 12)
+                        print(f" Reshaping")
+
+                    print(f"\n[LIVE vs PREPROCESSED - SAME INITIAL STATE]")
+                    print(f"  Preprocessed tokens: range=[{preproc_toks.min():.4f}, {preproc_toks.max():.4f}], mean={preproc_toks.mean():.4f}, std={preproc_toks.std():.4f}")
+                    print(f"  Live tokens:         range=[{live_toks.min():.4f}, {live_toks.max():.4f}], mean={live_toks.mean():.4f}, std={live_toks.std():.4f}")
+
+                    diff = np.abs(preproc_toks - live_toks)
+                    print(f"  DIFF: max={diff.max():.4f}, mean={diff.mean():.4f}, std={diff.std():.4f}")
+
+                    if diff.max() > 0.1:
+                        print(f"  *** SIGNIFICANT MISMATCH DETECTED ***")
+                        # Per-dimension breakdown
+                        dim_names = ["z_x", "z_y", "z_z", "scale_x", "scale_y", "scale_z", "depth", "obj_on", "feat_0", "feat_1", "feat_2", "feat_3"]
+                        print(f"  Per-dimension diff (all 12 dims):")
+                        for d in range(min(len(dim_names), preproc_toks.shape[1])):
+                            p_col = preproc_toks[:, d]
+                            l_col = live_toks[:, d]
+                            col_diff = np.abs(p_col - l_col)
+                            print(f"    {dim_names[d]:8s}: preproc=[{p_col.min():7.3f}, {p_col.max():7.3f}] live=[{l_col.min():7.3f}, {l_col.max():7.3f}] diff_max={col_diff.max():.4f}")
+                    else:
+                        print(f"  ✓ Tokens match well!")
+
+                    # ====== VISUAL COMPARISON: Decode both token sets to voxels ======
+                    if renderer_3d is not None and hasattr(renderer_3d, 'render_volume'):
+                        try:
+                            import torch
+                            # Decode preprocessed tokens to voxels
+                            preproc_fg, preproc_rec = renderer_3d.render_volume(preproc_toks)
+                            log_rgb_voxels(
+                                name=f"eval_debug/ep_{ep:02d}/preproc_decoded_fg",
+                                rgb_vol=preproc_fg.cpu().numpy(),
+                                alpha_vol=None, KPx=None,
+                                step=int(200 + ep),
+                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                            )
+                            log_rgb_voxels(
+                                name=f"eval_debug/ep_{ep:02d}/preproc_decoded_rec",
+                                rgb_vol=preproc_rec.cpu().numpy(),
+                                alpha_vol=None, KPx=None,
+                                step=int(200 + ep),
+                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                            )
+
+                            # Decode live tokens to voxels
+                            live_fg, live_rec = renderer_3d.render_volume(live_toks)
+                            log_rgb_voxels(
+                                name=f"eval_debug/ep_{ep:02d}/live_decoded_fg",
+                                rgb_vol=live_fg.cpu().numpy(),
+                                alpha_vol=None, KPx=None,
+                                step=int(200 + ep),
+                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                            )
+                            log_rgb_voxels(
+                                name=f"eval_debug/ep_{ep:02d}/live_decoded_rec",
+                                rgb_vol=live_rec.cpu().numpy(),
+                                alpha_vol=None, KPx=None,
+                                step=int(200 + ep),
+                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                            )
+
+                            decoded_vox = envw.decoded_vox
+                            log_rgb_voxels(
+                                name=f"eval_debug/ep_{ep:02d}/decoded_vox",
+                                rgb_vol=decoded_vox.cpu().numpy(),
+                                alpha_vol=None, KPx=None,
+                                step=int(200 + ep),
+                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                            )
+
+                            vox = envw.vox
+                            log_rgb_voxels(
+                                name=f"eval_debug/ep_{ep:02d}/vox_from_encode",
+                                rgb_vol=vox.cpu().numpy(),
+                                alpha_vol=None, KPx=None,
+                                step=int(200 + ep),
+                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                            )
+
+                            # Also log the raw GT voxels from simulator for comparison
+                            # (already logged above as gt_vox_rgb, but log again here for side-by-side)
+                            log_rgb_voxels(
+                                name=f"eval_debug/ep_{ep:02d}/gt_vox_from_sim",
+                                rgb_vol=vox,
+                                alpha_vol=None, KPx=None,
+                                step=int(200 + ep),
+                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                            )
+                            print(f"  [VISUAL DEBUG] Logged decoded voxels for preproc and live tokens")
+                        except Exception as e:
+                            print(f"  [VISUAL DEBUG] Failed to render token comparison: {e}")
+                    # ====== END VISUAL COMPARISON ======
+                # ====== END LIVE vs PREPROCESSED ======
+
+                # ====== TOKEN DISTRIBUTION DIAGNOSTIC ======
+                if hasattr(envw, 'goal_vec') and envw.goal_vec is not None:
+                    goal_toks = envw.goal_vec.reshape(16, 12)  # (K, Dtok)
+                    obs_toks = envw.last_toks if envw.last_toks is not None else obs_vec.reshape(24, 12)
+                    print(f"\n[TOKEN DISTRIBUTION DIAGNOSTIC]")
+                    print(f"  Goal tokens (from dataset):  range=[{goal_toks.min():.4f}, {goal_toks.max():.4f}], mean={goal_toks.mean():.4f}, std={goal_toks.std():.4f}")
+                    print(f"  Obs tokens (live encoded):   range=[{obs_toks.min():.4f}, {obs_toks.max():.4f}], mean={obs_toks.mean():.4f}, std={obs_toks.std():.4f}")
+
+                    # Check per-dimension statistics
+                    print(f"  Per-dimension comparison (first 4 dims):")
+                    for d in range(min(4, goal_toks.shape[1])):
+                        g_col = goal_toks[:, d]
+                        o_col = obs_toks[:, d]
+                        print(f"    dim {d}: goal=[{g_col.min():.3f}, {g_col.max():.3f}] obs=[{o_col.min():.3f}, {o_col.max():.3f}]")
+                # ====== END TOKEN DIAGNOSTIC ======
+
                 # if you want to also see the goal:
                 # if getattr(envw, "goal_vec", None) is not None:
                 #     _render_tokens_debug(tag=f"ep_{ep:02d}/reset_goal", obs_vec_flat=envw.goal_vec, horizon_step=0)
 
             ep_ret = 0.0
+            plan_idx = 0  # track how many times we've replanned this episode
             frames = []
             if save_videos and envw.last_raw_obs is not None:
                 fr = _frame_from_raw_obs(envw.last_raw_obs, video_cams)
@@ -495,6 +629,84 @@ class Trainer(object):
                     print(f"[PLAN] t={t}: Generated {action_buffer.shape[0]}-step plan, will execute {n_actions_to_exec} actions")
                     if t < 10:  # Show full planned trajectory for first few plans
                         print(f"  Planned Z trajectory (normalized): {[f'{action_buffer[i, 2]:.3f}' for i in range(min(5, action_buffer.shape[0]))]}")
+
+                    # ====== LOG IMAGINED STATES ======
+                    # Decode and visualize the diffuser's predicted future observations
+                    if log_imagined_states and renderer_3d is not None and ep == log_imagined_episode and plan_idx == log_imagined_plan_idx:
+                        print(f"\n[IMAGINED STATES] Logging decoded predictions for ep={ep}, plan={plan_idx}")
+                        # Extract predicted observations (everything after action_dim)
+                        pred_obs_norm = traj[:, a_dim:].detach().cpu().numpy()  # (H, obs_dim)
+                        # Unnormalize observations
+                        pred_obs = self.dataset.normalizer.unnormalize(pred_obs_norm, "observations")  # (H, obs_dim)
+
+                        # ====== DIAGNOSTIC: Check for clipping and roundtrip loss ======
+                        H = pred_obs.shape[0]
+                        t0_normalized = pred_obs_norm[0]
+                        print(f"  [DIAG] t=0 normalized range: [{t0_normalized.min():.4f}, {t0_normalized.max():.4f}]")
+                        print(f"  [DIAG] t=0 would be clipped: {t0_normalized.max() > 1.0001 or t0_normalized.min() < -1.0001}")
+
+                        # Check a later timestep for comparison
+                        mid_t = min(12, H - 1)
+                        if mid_t > 0:
+                            tmid_normalized = pred_obs_norm[mid_t]
+                            print(f"  [DIAG] t={mid_t} normalized range: [{tmid_normalized.min():.4f}, {tmid_normalized.max():.4f}]")
+                            print(f"  [DIAG] t={mid_t} would be clipped: {tmid_normalized.max() > 1.0001 or tmid_normalized.min() < -1.0001}")
+
+                        # Compare pred_obs[0] with original conditioning (cond_np[0])
+                        if 0 in cond_np:
+                            diff_t0 = np.abs(pred_obs[0] - cond_np[0])
+                            print(f"  [DIAG] pred_obs[0] vs cond_np[0] diff: max={diff_t0.max():.6f}, mean={diff_t0.mean():.6f}")
+                            if diff_t0.max() > 0.01:
+                                print(f"  [DIAG] WARNING: Significant roundtrip loss detected at t=0!")
+                                # Find which dimensions have the largest differences
+                                top_diff_idx = np.argsort(diff_t0)[-5:][::-1]
+                                print(f"  [DIAG] Top 5 differing dims: {top_diff_idx}, diffs: {diff_t0[top_diff_idx]}")
+                        # ====== END DIAGNOSTIC ======
+
+                        # Log a subset of timesteps (start, middle, end)
+                        timesteps_to_log = [0, H // 4, H // 2, 3 * H // 4, H - 1]
+                        timesteps_to_log = sorted(set(t_idx for t_idx in timesteps_to_log if 0 <= t_idx < H))
+
+                        for t_idx in timesteps_to_log:
+                            obs_at_t = pred_obs[t_idx]  # (obs_dim,)
+                            tag = f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/t_{t_idx:03d}_of_{H}"
+                            try:
+                                renderer_3d.render(
+                                    obs_at_t,
+                                    tag=tag,
+                                    step=self.step,
+                                    base="imagined_states"
+                                )
+                                print(f"  Logged imagined state at horizon t={t_idx}/{H}")
+                            except Exception as e:
+                                print(f"  Failed to log imagined state t={t_idx}: {e}")
+
+                        # Also log the conditioning (current obs and goal) for comparison
+                        if 0 in cond_np:
+                            try:
+                                renderer_3d.render(
+                                    cond_np[0],
+                                    tag=f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/cond_t0_current",
+                                    step=self.step,
+                                    base="imagined_states"
+                                )
+                                print(f"  Logged conditioning: current observation")
+                            except Exception as e:
+                                print(f"  Failed to log current obs condition: {e}")
+                        if (self.dataset.horizon - 1) in cond_np:
+                            try:
+                                renderer_3d.render(
+                                    cond_np[self.dataset.horizon - 1],
+                                    tag=f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/cond_goal",
+                                    step=self.step,
+                                    base="imagined_states"
+                                )
+                                print(f"  Logged conditioning: goal observation")
+                            except Exception as e:
+                                print(f"  Failed to log goal condition: {e}")
+                        print()
+
+                    plan_idx += 1  # increment plan counter
 
                 # ====== EXECUTION PHASE ======
                 # Get current action from buffer

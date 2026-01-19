@@ -358,18 +358,18 @@ class ParticleRenderer3D:
             show_axes=self.show_axes,
         )
 
-        log_rgb_voxels(
-            name=f"{base}/rec_rgb_dec",
-            rgb_vol=rec0,
-            alpha_vol=None,
-            KPx=None,
-            step=step,
-            mode=self.mode,
-            topk=self.topk,
-            alpha_thresh=self.alpha_thresh,
-            pad=self.pad,
-            show_axes=self.show_axes,
-        )
+        # log_rgb_voxels(
+        #     name=f"{base}/rec_rgb_dec",
+        #     rgb_vol=rec0,
+        #     alpha_vol=None,
+        #     KPx=None,
+        #     step=step,
+        #     mode=self.mode,
+        #     topk=self.topk,
+        #     alpha_thresh=self.alpha_thresh,
+        #     pad=self.pad,
+        #     show_axes=self.show_axes,
+        # )
 
         return np.zeros((8, 8, 3), dtype=np.uint8)
 

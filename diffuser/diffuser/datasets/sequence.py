@@ -52,6 +52,14 @@ class SequenceDataset(torch.utils.data.Dataset):
 
         self.successful_episode_idxes = fields.successful_episode_idxes
         self.normalizer = DatasetNormalizer(fields, normalizer, particle_normalizer=particle_normalizer, path_lengths=fields['path_lengths'])
+
+        # Sanity check: verify normalize -> unnormalize round-trip
+        self.normalizer.sanity_check_roundtrip(
+            {'actions': fields['actions'], 'observations': fields['observations']},
+            n_samples=3,
+            save_path=None  # Set to a path to save detailed report
+        )
+
         self.indices = self.make_indices(fields.path_lengths, horizon)
 
         self.fields = fields
