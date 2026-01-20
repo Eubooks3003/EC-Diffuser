@@ -14,7 +14,7 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'mimicgen_stack_dlp',
-    'override_dataset_path': '/home/ellina/Desktop/Code/lpwm-dev/ecdiffuser_data/stack_replay_buffer_dlp_debug_gripper_old.pkl',
+    'override_dataset_path': '/home/ellina/Desktop/Code/lpwm-dev/ecdiffuser_data/stack_replay_buffer_dlp_relative.pkl',
     'calib_h5_path': '/home/ellina/Desktop/Code/articubot-on-mimicgen/mimicgen_data/stack_d1/core/stack_d1_rgbd_pcd.hdf5',
     'dlp_ckpt': '/home/ellina/Desktop/Code/lpwm-dev/checkpoints_3d/best/best.pt',
     'dlp_ctor': "voxel_models:DLP",

@@ -166,7 +166,9 @@ class AccTrainer(object):
                 'model': self.model.state_dict(),
                 'ema': self.ema_model.state_dict()
             }
-        savepath = os.path.join(self.logdir, f'state_{epoch}.pt')
+        ckpt_dir = os.path.join(self.logdir, 'ckpt')
+        os.makedirs(ckpt_dir, exist_ok=True)
+        savepath = os.path.join(ckpt_dir, f'state_{epoch}_step{self.step}.pt')
         torch.save(data, savepath)
         print(f'[ utils/training ] Saved model to {savepath}', flush=True)
         if self.bucket is not None:
@@ -176,14 +178,32 @@ class AccTrainer(object):
         '''
             loads model and ema from disk
         '''
-        loadpath = os.path.join(self.logdir, f'state_{epoch}.pt')
+        import glob
+        ckpt_dir = os.path.join(self.logdir, 'ckpt')
+
+        # Try new location + naming first (ckpt/state_{epoch}_step{step}.pt)
+        pattern = os.path.join(ckpt_dir, f'state_{epoch}_step*.pt')
+        matches = glob.glob(pattern)
+        if matches:
+            loadpath = sorted(matches)[-1]
+        else:
+            # Try new naming in old location (state_{epoch}_step{step}.pt)
+            pattern = os.path.join(self.logdir, f'state_{epoch}_step*.pt')
+            matches = glob.glob(pattern)
+            if matches:
+                loadpath = sorted(matches)[-1]
+            else:
+                # Fall back to old naming convention (state_{epoch}.pt)
+                loadpath = os.path.join(self.logdir, f'state_{epoch}.pt')
+
         if self.accelerator is not None:
-            data = torch.load(loadpath,map_location=self.accelerator.device)
+            data = torch.load(loadpath, map_location=self.accelerator.device)
             unwrapped_model = self.accelerator.unwrap_model(self.model)
             unwrapped_model.load_state_dict(data['model'])
         else:
             data = torch.load(loadpath)
             self.model.load_state_dict(data['model'])
+        print(f'[ utils/training ] Loaded model from {loadpath}', flush=True)
         self.step = data['step']
         self.ema_model.load_state_dict(data['ema'])
 
