@@ -10,9 +10,11 @@ POINTMASS_KEYS = ['observations', 'actions', 'next_observations', 'deltas']
 
 class DatasetNormalizer:
 
-    def __init__(self, dataset, normalizer, particle_normalizer=None, path_lengths=None):
+    def __init__(self, dataset, normalizer, particle_normalizer=None, path_lengths=None,
+                 gripper_normalizer=None):
         self.observation_dim = dataset['observations'].shape[-1]
         self.action_dim = dataset['actions'].shape[-1]
+        self.gripper_dim = dataset['gripper_state'].shape[-1] if 'gripper_state' in dataset._dict else 0
 
         if type(normalizer) == str:
             normalizer = eval(normalizer)
@@ -24,6 +26,8 @@ class DatasetNormalizer:
                 print("goals X shape: ", goal_X.shape)
             else:
                 goal_X = None
+        if gripper_normalizer is not None and type(gripper_normalizer) == str:
+            gripper_normalizer = eval(gripper_normalizer)
 
         dataset = flatten(dataset, path_lengths)
         self.normalizers = {}
@@ -38,6 +42,13 @@ class DatasetNormalizer:
                     self.normalizers[key] = particle_normalizer(obs_goal)
                 elif key == 'goals' and particle_normalizer is not None:
                     continue
+                elif key == 'gripper_state':
+                    # Use gripper_normalizer if provided, else use standard normalizer
+                    if gripper_normalizer is not None:
+                        self.normalizers[key] = gripper_normalizer(val)
+                    else:
+                        self.normalizers[key] = GaussianNormalizer(val)
+                    print(f'[ utils/normalization ] Gripper state normalizer: {self.normalizers[key]}')
                 else:
                     self.normalizers[key] = normalizer(val)
             except Exception as e:

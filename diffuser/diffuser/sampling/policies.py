@@ -17,10 +17,23 @@ class GoalConditionedPolicy:
         self.diffusion_model = diffusion_model
         self.normalizer = normalizer
         self.action_dim = diffusion_model.action_dim
+        # Get gripper_dim from the model if available
+        self.gripper_dim = getattr(diffusion_model.model, "gripper_dim", 0)
         self.preprocess_fn = get_policy_preprocess_fn(preprocess_fns)
         self.sample_kwargs = sample_kwargs
 
-    def __call__(self, conditions, batch_size=1, verbose=True, return_attention=False):
+    def __call__(self, conditions, batch_size=1, verbose=True, return_attention=False,
+                 gripper_state=None):
+        """
+        Args:
+            conditions: dict with observation conditions (e.g., {0: initial_obs, horizon-1: goal_obs})
+            batch_size: number of samples to generate
+            verbose: whether to print progress
+            return_attention: whether to return attention weights
+            gripper_state: optional dict with gripper state conditions matching conditions keys
+                          e.g., {0: initial_gripper, horizon-1: goal_gripper}
+                          Each value should be (gripper_dim,) or (B, gripper_dim)
+        """
         conditions = {k: self.preprocess_fn(v) for k, v in conditions.items()}
         x0 = conditions[0]
         K = getattr(self.diffusion_model.model, "max_particles", None)
@@ -39,8 +52,9 @@ class GoalConditionedPolicy:
             # (obs_dim,) single
             multi_input = False
 
-        conditions = self._format_conditions(conditions, batch_size, multi_input=multi_input)
-        
+        conditions = self._format_conditions(conditions, batch_size, multi_input=multi_input,
+                                             gripper_state=gripper_state)
+
         if return_attention:
             samples, att_dict = self.diffusion_model(conditions, verbose=verbose, sort_by_value=False, return_attention=return_attention, **self.sample_kwargs)
             att_dict = {k: utils.to_np(v) for k, v in att_dict.items()}
@@ -48,19 +62,27 @@ class GoalConditionedPolicy:
             samples = self.diffusion_model(conditions, verbose=verbose, sort_by_value=False, return_attention=return_attention, **self.sample_kwargs)
         trajectories = utils.to_np(samples.trajectories)
 
-
-        normed_observations = trajectories[:, :, self.action_dim:]
-        observations = self.normalizer.unnormalize(normed_observations, 'observations')    
+        # Extract components from trajectory: [actions, gripper_state (optional), observations]
+        obs_start_idx = self.action_dim + self.gripper_dim
+        normed_observations = trajectories[:, :, obs_start_idx:]
+        observations = self.normalizer.unnormalize(normed_observations, 'observations')
 
         ## extract action [ batch_size x horizon x transition_dim ]
         actions = trajectories[:, :, :self.action_dim]
         actions = self.normalizer.unnormalize(actions, 'actions')
+
+        ## extract gripper state if present
+        if self.gripper_dim > 0:
+            normed_gripper = trajectories[:, :, self.action_dim:self.action_dim + self.gripper_dim]
+            gripper_out = self.normalizer.unnormalize(normed_gripper, 'gripper_state')
+        else:
+            gripper_out = None
+
         ## extract first action per env if conditions contains multiple envs
         if not multi_input:
             action = actions[0, 0]
         else:
             action = actions[:, 0]
-
 
         trajectories = Trajectories(actions, observations, samples.values)
         if return_attention:
@@ -72,7 +94,16 @@ class GoalConditionedPolicy:
         parameters = list(self.diffusion_model.parameters())
         return parameters[0].device
 
-    def _format_conditions(self, conditions, batch_size, multi_input=False):
+    def _format_conditions(self, conditions, batch_size, multi_input=False, gripper_state=None):
+        """
+        Format conditions for the diffusion model.
+
+        Args:
+            conditions: dict with observation conditions
+            batch_size: number of samples
+            multi_input: whether input is batched
+            gripper_state: optional dict with gripper state for each condition key
+        """
         K = getattr(self.diffusion_model.model, "max_particles", None)
         D = getattr(self.diffusion_model.model, "features_dim", None)
 
@@ -119,7 +150,31 @@ class GoalConditionedPolicy:
         # 3) flatten back because diffusion model was trained on flattened obs
         conditions = {k: to_flat(v) for k, v in conditions.items()}
 
-        # 4) torch + repeat if single-env
+        # 4) Handle gripper state if present
+        if gripper_state is not None and self.gripper_dim > 0:
+            # Normalize gripper state
+            for k, gs in gripper_state.items():
+                if isinstance(gs, np.ndarray):
+                    # Ensure batch dimension
+                    if gs.ndim == 1:
+                        gs = gs.reshape(1, -1)
+                    # Normalize
+                    gs_normed = self.normalizer.normalize(gs, 'gripper_state')
+                    gripper_state[k] = gs_normed
+
+            # Concatenate gripper state with observations in conditions
+            # Format: [gripper_state, observations]
+            for k in conditions.keys():
+                if k in gripper_state:
+                    gs = gripper_state[k]
+                    if isinstance(gs, np.ndarray):
+                        gs = torch.from_numpy(gs).float()
+                    obs = conditions[k]
+                    if isinstance(obs, np.ndarray):
+                        obs = torch.from_numpy(obs).float()
+                    conditions[k] = torch.cat([gs, obs], dim=-1)
+
+        # 5) torch + repeat if single-env
         conditions = utils.to_torch(conditions, dtype=torch.float32)
         if not multi_input:
             conditions = utils.apply_dict(

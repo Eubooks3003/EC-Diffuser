@@ -152,4 +152,11 @@ class ReplayBuffer:
             self._dict['path_lengths'] = np.array([len(obs) for obs in self._dict['observations']])
 
         self.keys = [k for k in paths_dict.keys() if k != 'meta']
+
+        # Report gripper state if present
+        if 'gripper_state' in self._dict:
+            gs = self._dict['gripper_state']
+            print(f'[ datasets/buffer ] Found gripper_state: shape={gs.shape}, '
+                  f'range=[{gs.min():.3f}, {gs.max():.3f}]')
+
         print(f'[ datasets/buffer ] Loaded {self._count} episodes from {path}')

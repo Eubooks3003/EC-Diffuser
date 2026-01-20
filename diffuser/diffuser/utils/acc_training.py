@@ -208,7 +208,10 @@ class AccTrainer(object):
         conditions = to_np(batch.conditions[0])[:,None]
 
         ## [ batch_size x horizon x observation_dim ]
-        normed_observations = trajectories[:, :, self.dataset.action_dim:]
+        # Account for gripper_dim if present
+        gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
+        obs_start_idx = self.dataset.action_dim + gripper_dim
+        normed_observations = trajectories[:, :, obs_start_idx:]
         observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
 
         savepath = os.path.join(self.logdir, f'_sample-reference.png')
@@ -231,12 +234,15 @@ class AccTrainer(object):
                 'b d -> (repeat b) d', repeat=n_samples,
             )
 
-            ## [ n_samples x horizon x (action_dim + observation_dim) ]
+            ## [ n_samples x horizon x (action_dim + gripper_dim + observation_dim) ]
             samples = self.ema_model(conditions)
             trajectories = to_np(samples.trajectories)
 
             ## [ n_samples x horizon x observation_dim ]
-            normed_observations = trajectories[:, :, self.dataset.action_dim:]
+            # Account for gripper_dim if present
+            gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
+            obs_start_idx = self.dataset.action_dim + gripper_dim
+            normed_observations = trajectories[:, :, obs_start_idx:]
 
             # [ 1 x 1 x observation_dim ]
             normed_conditions = to_np(batch.conditions[0])[:,None]

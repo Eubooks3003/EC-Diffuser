@@ -17,3 +17,4 @@ class ArgsParser(utils.Parser):
     exp_note: str = 'adalnpint'
     vis_traj_wandb: bool = True
     planning_only: bool = False
+    random_init_eval: bool = False  # If True, use random env reset instead of dataset init states during eval

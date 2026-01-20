@@ -218,7 +218,10 @@ class Trainer(object):
         conditions = to_np(batch.conditions[0])[:,None]
 
         ## [ batch_size x horizon x observation_dim ]
-        normed_observations = trajectories[:, :, self.dataset.action_dim:]
+        # Account for gripper_dim if present (trajectory format: [actions, gripper_state, observations])
+        gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
+        obs_start_idx = self.dataset.action_dim + gripper_dim
+        normed_observations = trajectories[:, :, obs_start_idx:]
         observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
         savepath = os.path.join(self.logdir, f'_sample-reference.ply')
         self.renderer.composite(savepath, observations, front_bg=front_bg, side_bg=side_bg)
@@ -240,12 +243,15 @@ class Trainer(object):
                 'b d -> (repeat b) d', repeat=n_samples,
             )
 
-            ## [ n_samples x horizon x (action_dim + observation_dim) ]
+            ## [ n_samples x horizon x (action_dim + gripper_dim + observation_dim) ]
             samples = self.ema_model(conditions)
             trajectories = to_np(samples.trajectories)
 
             ## [ n_samples x horizon x observation_dim ]
-            normed_observations = trajectories[:, :, self.dataset.action_dim:]
+            # Account for gripper_dim if present
+            gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
+            obs_start_idx = self.dataset.action_dim + gripper_dim
+            normed_observations = trajectories[:, :, obs_start_idx:]
 
             # [ 1 x 1 x observation_dim ]
             normed_conditions = to_np(batch.conditions[0])[:,None]
@@ -277,6 +283,7 @@ class Trainer(object):
         pixel_stride=2,
         goal_from_env_fn=None,
         goal_provider=None,         # NEW: DatasetGoalProvider for init_state + goal pairing
+        random_init=False,          # If True, use random env reset instead of dataset init states
 
         save_videos=True,
         video_dir=None,
@@ -396,6 +403,7 @@ class Trainer(object):
         print("=" * 60)
         print(f"[eval_mimicgen_rollouts] Starting {n_episodes} episodes, max_steps={max_steps}")
         print(f"[eval_mimicgen_rollouts] Goal provider: {'DatasetGoalProvider' if goal_provider is not None else 'None (legacy mode)'}")
+        print(f"[eval_mimicgen_rollouts] Init mode: {'RANDOM' if random_init else 'DATASET (fixed init states)'}")
         print(f"[eval_mimicgen_rollouts] ACTION CHUNKING: exe_steps={exe_steps}, horizon={self.dataset.horizon}")
         if exe_steps > 1:
             print(f"[eval_mimicgen_rollouts] Will execute {exe_steps} actions per plan before replanning")
@@ -420,7 +428,8 @@ class Trainer(object):
                 calib_h5_path=calib_h5_path,
                 get_goal_raw_obs_fn=goal_from_env_fn,
                 goal_provider=goal_provider,  # NEW: dataset-based goal provider
-                normalize_to_unit_cube=True,  
+                random_init=random_init,      # NEW: random vs dataset init
+                normalize_to_unit_cube=True,
             )
 
             obs_vec = envw.reset()
@@ -585,6 +594,15 @@ class Trainer(object):
                 v_norm = self.dataset.normalizer.normalize(v[None], "observations")[0]
                 return torch.from_numpy(v_norm).float().to(device)
 
+            # Helper to normalize gripper state
+            def norm_gripper(v):
+                v_norm = self.dataset.normalizer.normalize(v[None], "gripper_state")[0]
+                return torch.from_numpy(v_norm).float().to(device)
+
+            # Check if we should use gripper observations
+            use_gripper_obs = getattr(self.dataset, 'use_gripper_obs', False)
+            gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
+
             t = 0
             while t < max_steps:
                 # Check if we need to replan (no buffer, or exhausted exe_steps actions)
@@ -592,31 +610,30 @@ class Trainer(object):
 
                 if need_replan:
                     # ====== PLANNING PHASE ======
-                    cond_np = envw.make_cond(obs_vec, horizon=self.dataset.horizon)
-                    cond = {k: norm_obs(v)[None, :] for k, v in cond_np.items()}
+                    # Build current observation condition
+                    obs_norm = norm_obs(obs_vec)
+                    if use_gripper_obs and gripper_dim > 0:
+                        gripper_cond = envw.get_gripper_cond(horizon=self.dataset.horizon)
+                        if gripper_cond is not None and 0 in gripper_cond:
+                            gripper_norm = norm_gripper(gripper_cond[0])
+                            # Condition format: [gripper_state, observations]
+                            cond_0 = torch.cat([gripper_norm, obs_norm], dim=-1)[None, :]
+                        else:
+                            cond_0 = obs_norm[None, :]
+                    else:
+                        cond_0 = obs_norm[None, :]
 
-                    # === GOAL CONDITIONING DIAGNOSTIC (first timestep only) ===
+                    # Use zeros for goal condition (no goal conditioning)
+                    cond_goal = torch.zeros_like(cond_0)
+
+                    cond = {
+                        0: cond_0,
+                        self.dataset.horizon - 1: cond_goal,
+                    }
+
                     if t == 0:
-                        obs_cond = cond_np[0]
-                        goal_cond = cond_np[self.dataset.horizon - 1]
-                        diff = np.abs(goal_cond - obs_cond)
-                        print(f"\n[GOAL DIAGNOSTIC ep={ep}]")
-                        print(f"  obs vs goal diff: mean={diff.mean():.4f}, max={diff.max():.4f}, std={diff.std():.4f}")
-                        print(f"  obs range: [{obs_cond.min():.4f}, {obs_cond.max():.4f}]")
-                        print(f"  goal range: [{goal_cond.min():.4f}, {goal_cond.max():.4f}]")
-
-                        cond_no_goal = {0: cond[0], self.dataset.horizon - 1: cond[0].clone()}
-                        sample_no_goal = self.ema_model(cond_no_goal, verbose=False)
-                        a0_no_goal = sample_no_goal.trajectories[0, 0, :a_dim].detach().cpu().numpy()
-                        sample_with_goal = self.ema_model(cond, verbose=False)
-                        a0_with_goal = sample_with_goal.trajectories[0, 0, :a_dim].detach().cpu().numpy()
-                        action_diff = np.abs(a0_with_goal - a0_no_goal)
-                        print(f"  Action WITH goal:    [{', '.join([f'{x:.4f}' for x in a0_with_goal])}]")
-                        print(f"  Action WITHOUT goal: [{', '.join([f'{x:.4f}' for x in a0_no_goal])}]")
-                        print(f"  Action diff: mean={action_diff.mean():.4f}, max={action_diff.max():.4f}")
-                        if action_diff.mean() < 0.05:
-                            print(f"  WARNING: Actions barely change with/without goal!")
-                        print()
+                        print(f"\n[EVAL] ep={ep}: Using zero goal conditioning")
+                        print(f"  cond_0 shape: {cond_0.shape}")
 
                     # Sample new trajectory from diffusion model
                     sample = self.ema_model(cond, verbose=False)
@@ -634,8 +651,9 @@ class Trainer(object):
                     # Decode and visualize the diffuser's predicted future observations
                     if log_imagined_states and renderer_3d is not None and ep == log_imagined_episode and plan_idx == log_imagined_plan_idx:
                         print(f"\n[IMAGINED STATES] Logging decoded predictions for ep={ep}, plan={plan_idx}")
-                        # Extract predicted observations (everything after action_dim)
-                        pred_obs_norm = traj[:, a_dim:].detach().cpu().numpy()  # (H, obs_dim)
+                        # Extract predicted observations (skip action_dim + gripper_dim)
+                        obs_start_idx = a_dim + gripper_dim
+                        pred_obs_norm = traj[:, obs_start_idx:].detach().cpu().numpy()  # (H, obs_dim)
                         # Unnormalize observations
                         pred_obs = self.dataset.normalizer.unnormalize(pred_obs_norm, "observations")  # (H, obs_dim)
 
@@ -652,15 +670,14 @@ class Trainer(object):
                             print(f"  [DIAG] t={mid_t} normalized range: [{tmid_normalized.min():.4f}, {tmid_normalized.max():.4f}]")
                             print(f"  [DIAG] t={mid_t} would be clipped: {tmid_normalized.max() > 1.0001 or tmid_normalized.min() < -1.0001}")
 
-                        # Compare pred_obs[0] with original conditioning (cond_np[0])
-                        if 0 in cond_np:
-                            diff_t0 = np.abs(pred_obs[0] - cond_np[0])
-                            print(f"  [DIAG] pred_obs[0] vs cond_np[0] diff: max={diff_t0.max():.6f}, mean={diff_t0.mean():.6f}")
-                            if diff_t0.max() > 0.01:
-                                print(f"  [DIAG] WARNING: Significant roundtrip loss detected at t=0!")
-                                # Find which dimensions have the largest differences
-                                top_diff_idx = np.argsort(diff_t0)[-5:][::-1]
-                                print(f"  [DIAG] Top 5 differing dims: {top_diff_idx}, diffs: {diff_t0[top_diff_idx]}")
+                        # Compare pred_obs[0] with original observation
+                        diff_t0 = np.abs(pred_obs[0] - obs_vec)
+                        print(f"  [DIAG] pred_obs[0] vs obs_vec diff: max={diff_t0.max():.6f}, mean={diff_t0.mean():.6f}")
+                        if diff_t0.max() > 0.01:
+                            print(f"  [DIAG] WARNING: Significant roundtrip loss detected at t=0!")
+                            # Find which dimensions have the largest differences
+                            top_diff_idx = np.argsort(diff_t0)[-5:][::-1]
+                            print(f"  [DIAG] Top 5 differing dims: {top_diff_idx}, diffs: {diff_t0[top_diff_idx]}")
                         # ====== END DIAGNOSTIC ======
 
                         # Log a subset of timesteps (start, middle, end)
@@ -681,29 +698,17 @@ class Trainer(object):
                             except Exception as e:
                                 print(f"  Failed to log imagined state t={t_idx}: {e}")
 
-                        # Also log the conditioning (current obs and goal) for comparison
-                        if 0 in cond_np:
-                            try:
-                                renderer_3d.render(
-                                    cond_np[0],
-                                    tag=f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/cond_t0_current",
-                                    step=self.step,
-                                    base="imagined_states"
-                                )
-                                print(f"  Logged conditioning: current observation")
-                            except Exception as e:
-                                print(f"  Failed to log current obs condition: {e}")
-                        if (self.dataset.horizon - 1) in cond_np:
-                            try:
-                                renderer_3d.render(
-                                    cond_np[self.dataset.horizon - 1],
-                                    tag=f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/cond_goal",
-                                    step=self.step,
-                                    base="imagined_states"
-                                )
-                                print(f"  Logged conditioning: goal observation")
-                            except Exception as e:
-                                print(f"  Failed to log goal condition: {e}")
+                        # Also log the current observation for comparison
+                        try:
+                            renderer_3d.render(
+                                obs_vec,
+                                tag=f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/cond_t0_current",
+                                step=self.step,
+                                base="imagined_states"
+                            )
+                            print(f"  Logged conditioning: current observation")
+                        except Exception as e:
+                            print(f"  Failed to log current obs condition: {e}")
                         print()
 
                     plan_idx += 1  # increment plan counter

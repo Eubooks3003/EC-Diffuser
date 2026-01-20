@@ -9,15 +9,25 @@ The network projects raw features into a latent space, applies a transformer to 
 interactions among particles (and actions), and finally decodes the representations back
 to the original feature dimensions.
 
+Gripper Token Support:
+    When gripper_dim > 0, the model treats the gripper state as an additional token
+    in the transformer sequence. This allows the model to learn gripper-object
+    interactions through attention.
+
+    Gripper state format: [position(3), rotation_6d(6), gripper_open(1)] = 10 dims
+
+    Input format when gripper_dim > 0:
+        x: [batch_size, T, action_dim + gripper_dim + (n_particles * features_dim)]
+
 Usage Example:
     model = AdaLNPINTDenoiser(
         features_dim=10, action_dim=3, hidden_dim=256, projection_dim=256,
         n_head=8, n_layer=6, block_size=50, dropout=0.1,
         predict_delta=False, positional_bias=True, max_particles=4,
         learned_sinusoidal_cond=False, random_fourier_features=False,
-        learned_sinusoidal_dim=16, multiview=False
+        learned_sinusoidal_dim=16, multiview=False, gripper_dim=10
     )
-    # x: [batch_size, time_steps, action_dim + particle_feature_dim]
+    # x: [batch_size, time_steps, action_dim + gripper_dim + particle_feature_dim]
     # t: [batch_size] (e.g., time indices)
     out = model(x, cond=None, time=t)
 """
@@ -54,16 +64,19 @@ class AdaLNPINTDenoiser(nn.Module):
         random_fourier_features (bool): If True, use fixed random Fourier features.
         learned_sinusoidal_dim (int): Dimensionality for the learned sinusoidal (or Fourier) features.
         multiview (bool): If True, use separate encodings for multi-view particle inputs.
+        gripper_dim (int): Dimensionality of gripper state. If > 0, gripper is treated as an
+            additional token. Typical format: [pos(3), rot_6d(6), open(1)] = 10 dims.
     """
     def __init__(self, features_dim=2, action_dim=3, hidden_dim=256, projection_dim=256,
                  n_head=8, n_layer=6, block_size=50, dropout=0.1,
                  predict_delta=False, positional_bias=True, max_particles=4,
                  learned_sinusoidal_cond=False, random_fourier_features=False,
-                 learned_sinusoidal_dim=16, multiview=False, **kwargs):
+                 learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
         self.action_dim = action_dim
+        self.gripper_dim = gripper_dim
         self.predict_delta = predict_delta
         self.projection_dim = projection_dim
         self.max_particles = max_particles
@@ -104,6 +117,16 @@ class AdaLNPINTDenoiser(nn.Module):
             nn.Linear(hidden_dim, self.projection_dim)
         )
 
+        # Gripper state projection network (if gripper_dim > 0).
+        if self.gripper_dim > 0:
+            self.gripper_projection = nn.Sequential(
+                nn.Linear(self.gripper_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.projection_dim)
+            )
+            # Learnable gripper encoding to distinguish from particles.
+            self.gripper_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+
         # Instantiate the AdaLN Particle Transformer.
         self.particle_transformer = AdaLNParticleTransformer(
             self.projection_dim, n_head, n_layer, block_size, self.projection_dim,
@@ -124,6 +147,13 @@ class AdaLNPINTDenoiser(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, self.action_dim)
         )
+        # Gripper decoder (if gripper_dim > 0).
+        if self.gripper_dim > 0:
+            self.gripper_decoder = nn.Sequential(
+                nn.Linear(self.projection_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.gripper_dim)
+            )
         # Particle encoding: either shared or view-specific for multi-view inputs.
         if self.multiview:
             self.view1_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
@@ -139,31 +169,46 @@ class AdaLNPINTDenoiser(nn.Module):
         Forward pass for the denoiser.
 
         Args:
-            x (torch.Tensor): Input tensor of shape [batch_size, T, action_dim + particle_feature_dim].
-                The first action_dim elements are the action features, and the rest are particle features.
+            x (torch.Tensor): Input tensor of shape:
+                - If gripper_dim == 0: [batch_size, T, action_dim + particle_feature_dim]
+                - If gripper_dim > 0:  [batch_size, T, action_dim + gripper_dim + particle_feature_dim]
+                The layout is: [actions, gripper_state (optional), particles]
             cond: (Unused) Additional conditioning (reserved for future use).
             time (torch.Tensor): Tensor of time indices with shape [batch_size]. These are embedded via time_mlp.
             return_attention (bool): If True, returns the attention weights along with the output.
 
         Returns:
-            torch.Tensor or tuple: 
+            torch.Tensor or tuple:
                 - If return_attention is False: output tensor of shape [batch_size, T, output_dim],
-                  where output_dim = action_dim + (n_particles * features_dim).
+                  where output_dim = action_dim + gripper_dim + (n_particles * features_dim).
                 - If return_attention is True: (output, attention_dict)
         """
         # ---------------------------------------------------------------------
-        # Reshape input: separate actions and particle features.
-        # x: [bs, T, action_dim + particle_feature_dim]
+        # Reshape input: separate actions, gripper state, and particle features.
+        # x: [bs, T, action_dim + gripper_dim + particle_feature_dim]
         bs, T, f = x.size()
         actions = x[:, :, :self.action_dim]  # [bs, T, action_dim]
+
+        if self.gripper_dim > 0:
+            gripper_state = x[:, :, self.action_dim:self.action_dim + self.gripper_dim]  # [bs, T, gripper_dim]
+            particle_start_idx = self.action_dim + self.gripper_dim
+        else:
+            gripper_state = None
+            particle_start_idx = self.action_dim
+
         # Reshape remaining features into particles of shape [bs, T, n_particles, features_dim].
-        x_particles = x[:, :, self.action_dim:].view(bs, T, -1, self.features_dim)
+        x_particles = x[:, :, particle_start_idx:].view(bs, T, -1, self.features_dim)
 
         # ---------------------------------------------------------------------
         # Project actions and particles.
         action_particle = self.action_projection(actions)  # [bs, T, projection_dim]
         action_particle = action_particle + self.action_encoding.repeat(bs, T, 1)
         state_particles = self.particle_projection(x_particles)  # [bs, T, n_particles, projection_dim]
+
+        # Project gripper state if present.
+        if self.gripper_dim > 0 and gripper_state is not None:
+            gripper_emb = self.gripper_projection(gripper_state)  # [bs, T, projection_dim]
+            gripper_emb = gripper_emb + self.gripper_encoding.repeat(bs, T, 1)
 
         if self.multiview:
             n_particles = state_particles.size(2) // 2
@@ -175,9 +220,22 @@ class AdaLNPINTDenoiser(nn.Module):
 
         # ---------------------------------------------------------------------
         # Prepare transformer input.
-        # Concatenate the action token with the particle tokens.
-        # Resulting shape: [bs, T, n_tokens, projection_dim], where n_tokens = 1 + n_particles.
-        x_cat = torch.cat([action_particle.unsqueeze(2), new_state_particles], dim=2)
+        # Token sequence: [action_token, gripper_token (optional), particle_token_1, ..., particle_token_N]
+        # Resulting shape: [bs, T, n_tokens, projection_dim]
+        if self.gripper_dim > 0 and gripper_state is not None:
+            # n_tokens = 1 (action) + 1 (gripper) + n_particles
+            x_cat = torch.cat([
+                action_particle.unsqueeze(2),
+                gripper_emb.unsqueeze(2),
+                new_state_particles
+            ], dim=2)
+            gripper_token_idx = 1  # Index of gripper token in the sequence
+            particle_start_token_idx = 2
+        else:
+            # n_tokens = 1 (action) + n_particles
+            x_cat = torch.cat([action_particle.unsqueeze(2), new_state_particles], dim=2)
+            gripper_token_idx = None
+            particle_start_token_idx = 1
 
         # Time embedding: project time indices and add to all tokens.
         t_embed = self.time_mlp(time)  # [bs, projection_dim]
@@ -199,10 +257,18 @@ class AdaLNPINTDenoiser(nn.Module):
         # ---------------------------------------------------------------------
         # Decode transformer output.
         action_decoder_out = self.action_decoder(particles_trans[:, :, 0, :])  # [bs, T, action_dim]
-        particle_decoder_out = self.particle_decoder(particles_trans[:, :, 1:, :])
-        particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
-        # Concatenate action and particle outputs.
-        x_out = torch.cat([action_decoder_out, particle_decoder_out], dim=-1)
+
+        if self.gripper_dim > 0 and gripper_token_idx is not None:
+            gripper_decoder_out = self.gripper_decoder(particles_trans[:, :, gripper_token_idx, :])  # [bs, T, gripper_dim]
+            particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
+            particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
+            # Concatenate action, gripper, and particle outputs.
+            x_out = torch.cat([action_decoder_out, gripper_decoder_out, particle_decoder_out], dim=-1)
+        else:
+            particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
+            particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
+            # Concatenate action and particle outputs.
+            x_out = torch.cat([action_decoder_out, particle_decoder_out], dim=-1)
 
         if return_attention:
             return x_out, attention_dict
@@ -215,10 +281,16 @@ class AdaLNPINTDenoiser(nn.Module):
 if __name__ == '__main__':
     batch_size = 32
     timessteps = 5
+
+    # Test without gripper token
+    print("=" * 60)
+    print("Test 1: Without gripper token (gripper_dim=0)")
+    print("=" * 60)
     model = AdaLNPINTDenoiser(features_dim=10, action_dim=3, hidden_dim=256, projection_dim=256,
                         n_head=8, n_layer=6, block_size=timessteps, dropout=0.1,
                         predict_delta=False, positional_bias=False, max_particles=None,
-                        learned_sinusoidal_cond=False, random_fourier_features=False, learned_sinusoidal_dim=16)
+                        learned_sinusoidal_cond=False, random_fourier_features=False, learned_sinusoidal_dim=16,
+                        gripper_dim=0)
     in_particles = torch.randn(batch_size, timessteps, 240)
     actions = torch.randn(batch_size, timessteps, 3)
     t = torch.randint(0, 1000, (batch_size,), device=in_particles.device).long()
@@ -226,4 +298,31 @@ if __name__ == '__main__':
     # Concatenate actions and particle features.
     x = torch.cat([actions, in_particles], dim=-1)
     model_out = model(x, cond=None, time=t, return_attention=False)
+    print("Input shape:", x.shape)
     print("Output shape:", model_out.shape)
+    assert model_out.shape == x.shape, "Output shape should match input shape"
+
+    # Test with gripper token
+    print("\n" + "=" * 60)
+    print("Test 2: With gripper token (gripper_dim=10)")
+    print("=" * 60)
+    gripper_dim = 10  # pos(3) + rot_6d(6) + open(1)
+    model_with_gripper = AdaLNPINTDenoiser(
+        features_dim=10, action_dim=3, hidden_dim=256, projection_dim=256,
+        n_head=8, n_layer=6, block_size=timessteps, dropout=0.1,
+        predict_delta=False, positional_bias=False, max_particles=None,
+        learned_sinusoidal_cond=False, random_fourier_features=False, learned_sinusoidal_dim=16,
+        gripper_dim=gripper_dim
+    )
+    gripper_state = torch.randn(batch_size, timessteps, gripper_dim)
+
+    # Concatenate actions, gripper state, and particle features.
+    x_with_gripper = torch.cat([actions, gripper_state, in_particles], dim=-1)
+    model_out_with_gripper = model_with_gripper(x_with_gripper, cond=None, time=t, return_attention=False)
+    print("Input shape:", x_with_gripper.shape)
+    print("Output shape:", model_out_with_gripper.shape)
+    assert model_out_with_gripper.shape == x_with_gripper.shape, "Output shape should match input shape"
+
+    print("\n" + "=" * 60)
+    print("All tests passed!")
+    print("=" * 60)

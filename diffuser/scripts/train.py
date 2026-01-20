@@ -128,6 +128,7 @@ dataset_config = utils.Config(
     overfit=args.overfit,
     single_view=(args.input_type == "dlp" and not args.multiview),
     action_z_scale=getattr(args, 'action_z_scale', 1.0),
+    use_gripper_obs=getattr(args, 'use_gripper_obs', False),
 )
 
 render_config = utils.Config(
@@ -146,6 +147,10 @@ print("renderer: ", renderer)
 
 observation_dim = dataset.observation_dim
 action_dim = dataset.action_dim
+gripper_dim = getattr(dataset, 'gripper_dim', 0)
+
+if gripper_dim > 0:
+    print(f"[train] Using gripper observations: gripper_dim={gripper_dim}")
 
 
 # -----------------------------------------------------------------------------#
@@ -167,6 +172,7 @@ model_config = utils.Config(
     max_particles=args.max_particles,
     multiview=args.multiview,
     device=args.device,
+    gripper_dim=gripper_dim,
 )
 
 diffusion_config = utils.Config(
@@ -175,6 +181,7 @@ diffusion_config = utils.Config(
     horizon=args.horizon,
     observation_dim=observation_dim,
     action_dim=action_dim,
+    gripper_dim=gripper_dim,
     n_timesteps=args.n_diffusion_steps,
     loss_type=args.loss_type,
     clip_denoised=args.clip_denoised,
@@ -307,6 +314,7 @@ for i in range(n_epochs):
                 pixel_stride=getattr(args, "mimicgen_pixel_stride", 2),
                 goal_from_env_fn=getattr(args, "goal_from_env_fn", None),
                 goal_provider=goal_provider,  # NEW: dataset-based goal provider
+                random_init=getattr(args, "random_init_eval", False),  # NEW: random vs dataset init
                 renderer_3d=renderer,
                 exe_steps=getattr(args, "exe_steps", 1),  # ACTION CHUNKING: how many actions to execute per plan
             )

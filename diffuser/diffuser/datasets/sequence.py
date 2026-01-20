@@ -26,7 +26,7 @@ class SequenceDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path='', dataset_name='panda_push', horizon=64, obs_only=False,
         normalizer='LimitsNormalizer', particle_normalizer='ParticleGaussianNormalizer', preprocess_fns=[], max_path_length=1000,
         max_n_episodes=5000, termination_penalty=0, use_padding=True, overfit=False, action_only=False, single_view=False,
-        action_z_scale=1.0, **kwargs):
+        action_z_scale=1.0, use_gripper_obs=False, **kwargs):
         self.preprocess_fn = get_preprocess_fn(preprocess_fns, dataset_name)
         self.dataset_path = dataset_path
         self.horizon = horizon
@@ -35,6 +35,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.max_path_length = max_path_length
         self.use_padding = use_padding
         self.action_z_scale = float(action_z_scale)  # Scale factor for Z action dimension
+        self.use_gripper_obs = use_gripper_obs  # Whether to include gripper state in observations
 
         fields = ReplayBuffer(max_n_episodes, max_path_length, termination_penalty)
         assert dataset_path, 'Dataset path must be provided'
@@ -49,6 +50,18 @@ class SequenceDataset(torch.utils.data.Dataset):
             print(f'  Before scaling - Z range: [{fields["actions"][:,:,2].min():.4f}, {fields["actions"][:,:,2].max():.4f}]')
             fields['actions'][:, :, 2] *= self.action_z_scale
             print(f'  After scaling  - Z range: [{fields["actions"][:,:,2].min():.4f}, {fields["actions"][:,:,2].max():.4f}]')
+
+        # Check for gripper state
+        self.has_gripper_state = 'gripper_state' in fields._dict
+        if self.use_gripper_obs and not self.has_gripper_state:
+            print(f'[ datasets/sequence ] WARNING: use_gripper_obs=True but no gripper_state in dataset')
+            self.use_gripper_obs = False
+        if self.has_gripper_state:
+            print(f'[ datasets/sequence ] Found gripper_state in dataset: shape={fields["gripper_state"].shape}')
+            if self.use_gripper_obs:
+                print(f'[ datasets/sequence ] Gripper state will be included in model input')
+            else:
+                print(f'[ datasets/sequence ] Gripper state available but not used (use_gripper_obs=False)')
 
         self.successful_episode_idxes = fields.successful_episode_idxes
         self.normalizer = DatasetNormalizer(fields, normalizer, particle_normalizer=particle_normalizer, path_lengths=fields['path_lengths'])
@@ -65,24 +78,38 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.fields = fields
         self.n_episodes = fields.n_episodes
         self.path_lengths = fields.path_lengths
+
+        # Determine which keys to normalize
         if 'kitchen' in dataset_path:
-            self.normalize(keys=['observations', 'actions'])
+            normalize_keys = ['observations', 'actions']
         else:
-            self.normalize()
+            normalize_keys = ['observations', 'actions', 'goals']
+        if self.use_gripper_obs and self.has_gripper_state:
+            normalize_keys.append('gripper_state')
+        self.normalize(keys=normalize_keys)
+
         self.particle_dim = fields.observations.shape[-1]
         self.observation_dim = fields.normed_observations.shape[-1]
         self.action_dim = fields.normed_actions.shape[-1]
+        self.gripper_dim = fields.gripper_state.shape[-1] if (self.use_gripper_obs and self.has_gripper_state) else 0
         print(f'[ datasets/sequence ] Dataset fields: {self.fields}')
         print(f'[ datasets/sequence ] Dataset normalizer: {self.normalizer}')
+        print(f'[ datasets/sequence ] action_dim={self.action_dim}, gripper_dim={self.gripper_dim}, observation_dim={self.observation_dim}')
 
     def normalize(self, keys=['observations', 'actions', 'goals']):
         '''
             normalize fields that will be predicted by the diffusion model
         '''
         for key in keys:
+            if key not in self.fields._dict:
+                continue
             if key == 'observations' or key == 'goals':
                 array = self.fields[key]    # (n_episodes, max_path_length, n_entities, dim)
                 normed = self.normalizer(array, 'observations')
+            elif key == 'gripper_state':
+                # Gripper state: (n_episodes, max_path_length, gripper_dim)
+                array = self.fields[key].reshape(self.n_episodes*self.max_path_length, -1)
+                normed = self.normalizer(array, key)
             else:
                 array = self.fields[key].reshape(self.n_episodes*self.max_path_length, -1)
                 normed = self.normalizer(array, key)
@@ -103,10 +130,14 @@ class SequenceDataset(torch.utils.data.Dataset):
         indices = np.array(indices)
         return indices
 
-    def get_conditions(self, observations):
+    def get_conditions(self, observations, gripper_state=None):
         '''
             condition on current observation for planning
+            If gripper_state is provided, it's concatenated with observations in conditions
         '''
+        if gripper_state is not None:
+            # Conditions include gripper state: [gripper_state, observations]
+            return {0: np.concatenate([gripper_state[0], observations[0]], axis=-1)}
         return {0: observations[0]}
 
     def __len__(self):
@@ -118,11 +149,21 @@ class SequenceDataset(torch.utils.data.Dataset):
         observations = self.fields.normed_observations[path_ind, start:end]
         actions = self.fields.normed_actions[path_ind, start:end]
 
-        conditions = self.get_conditions(observations)
+        # Get gripper state if available and requested
+        if self.use_gripper_obs and self.has_gripper_state:
+            gripper_state = self.fields.normed_gripper_state[path_ind, start:end]
+        else:
+            gripper_state = None
+
+        conditions = self.get_conditions(observations, gripper_state)
         if self.obs_only:
             trajectories = observations
         else:
-            trajectories = np.concatenate([actions, observations], axis=-1)
+            # Trajectory format: [actions, gripper_state (optional), observations]
+            if gripper_state is not None:
+                trajectories = np.concatenate([actions, gripper_state, observations], axis=-1)
+            else:
+                trajectories = np.concatenate([actions, observations], axis=-1)
         batch = Batch(trajectories, conditions)
         return batch
 
@@ -160,13 +201,25 @@ class GoalDataset(SequenceDataset):
 
         # Fetch observations and actions
         if self.action_only:
-            observations = np.concatenate([self.fields.normed_observations[path_ind, start:start+1].repeat(actual_end-1-start, axis=0), 
+            observations = np.concatenate([self.fields.normed_observations[path_ind, start:start+1].repeat(actual_end-1-start, axis=0),
                                            goal])
         else:
             observations = np.concatenate([self.fields.normed_observations[path_ind, start:actual_end-1],
                                            goal])
         actions = np.concatenate([self.fields.normed_actions[path_ind, start:actual_end-1],
                                   self.normalizer.normalize(np.zeros((1, self.action_dim), dtype=self.fields.normed_actions.dtype), 'actions')])
+
+        # Get gripper state if available and requested
+        if self.use_gripper_obs and self.has_gripper_state:
+            # Get gripper state for the goal (last timestep)
+            goal_gripper = self.fields.normed_gripper_state[path_ind, path_length-1:path_length]
+            gripper_state = np.concatenate([
+                self.fields.normed_gripper_state[path_ind, start:actual_end-1],
+                goal_gripper
+            ])
+        else:
+            gripper_state = None
+
         # Handle padding
         if padding_needed > 0:
             # Pad observations with the last observation repeated
@@ -175,19 +228,33 @@ class GoalDataset(SequenceDataset):
             # Pad actions with zeros
             last_action = actions[-1]
             actions = np.vstack([actions] + [last_action] * padding_needed)
+            # Pad gripper state if present
+            if gripper_state is not None:
+                last_gripper = gripper_state[-1]
+                gripper_state = np.vstack([gripper_state] + [last_gripper] * padding_needed)
 
-        conditions = self.get_conditions(observations)
+        conditions = self.get_conditions(observations, gripper_state)
         if self.obs_only:
             trajectories = observations
         else:
-            trajectories = np.concatenate([actions, observations], axis=-1)
+            # Trajectory format: [actions, gripper_state (optional), observations]
+            if gripper_state is not None:
+                trajectories = np.concatenate([actions, gripper_state, observations], axis=-1)
+            else:
+                trajectories = np.concatenate([actions, observations], axis=-1)
         batch = Batch(trajectories, conditions)
         return batch
 
-    def get_conditions(self, observations):
+    def get_conditions(self, observations, gripper_state=None):
         '''
             condition on both the current observation and the last observation in the plan
+            If gripper_state is provided, it's concatenated with observations in conditions
         '''
+        if gripper_state is not None:
+            return {
+                0: np.concatenate([gripper_state[0], observations[0]], axis=-1).copy(),
+                self.horizon - 1: np.concatenate([gripper_state[-1], observations[-1]], axis=-1).copy(),
+            }
         return {
             0: observations[0].copy(),
             self.horizon - 1: observations[-1].copy(),

@@ -6,6 +6,87 @@ from datasets.voxelize_ds_wrapper import VoxelGridXYZ
 from dlp_utils import log_rgb_voxels
 
 # ----------------------------
+# Gripper state extraction (matches ec_diffuser_mimicgen_preprocess.py)
+# ----------------------------
+
+def quat_to_rot6d(quat: np.ndarray) -> np.ndarray:
+    """
+    Convert quaternion (x,y,z,w) to 6D rotation representation.
+    6D = first two columns of rotation matrix, flattened.
+    """
+    x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+
+    # Rotation matrix from quaternion
+    # First column
+    r00 = 1 - 2*(y*y + z*z)
+    r10 = 2*(x*y + w*z)
+    r20 = 2*(x*z - w*y)
+
+    # Second column
+    r01 = 2*(x*y - w*z)
+    r11 = 1 - 2*(x*x + z*z)
+    r21 = 2*(y*z + w*x)
+
+    # Stack first two columns as 6D representation
+    rot6d = np.stack([r00, r10, r20, r01, r11, r21], axis=-1)
+    return rot6d.astype(np.float32)
+
+
+def extract_gripper_state_from_obs(raw_obs: dict) -> np.ndarray:
+    """
+    Extract gripper state from robosuite raw observation dict.
+
+    Gripper state format: [pos(3), rot_6d(6), gripper_open(1)] = 10 dims
+
+    Returns:
+        gripper_state: [10,] array
+    """
+    # End-effector position (3D)
+    eef_pos_key = None
+    for key in ["robot0_eef_pos", "eef_pos"]:
+        if key in raw_obs:
+            eef_pos_key = key
+            break
+    if eef_pos_key is None:
+        raise RuntimeError(f"Cannot find eef_pos in raw_obs. Available keys: {list(raw_obs.keys())}")
+    eef_pos = np.asarray(raw_obs[eef_pos_key], dtype=np.float32).flatten()[:3]
+
+    # End-effector quaternion (4D) -> convert to 6D rotation
+    eef_quat_key = None
+    for key in ["robot0_eef_quat", "eef_quat"]:
+        if key in raw_obs:
+            eef_quat_key = key
+            break
+    if eef_quat_key is None:
+        raise RuntimeError(f"Cannot find eef_quat in raw_obs. Available keys: {list(raw_obs.keys())}")
+    eef_quat = np.asarray(raw_obs[eef_quat_key], dtype=np.float32).flatten()[:4]
+    eef_rot6d = quat_to_rot6d(eef_quat)  # [6,]
+
+    # Gripper state (openness) - typically from gripper joint positions
+    gripper_key = None
+    for key in ["robot0_gripper_qpos", "gripper_qpos"]:
+        if key in raw_obs:
+            gripper_key = key
+            break
+
+    if gripper_key is not None:
+        gripper_qpos = np.asarray(raw_obs[gripper_key], dtype=np.float32).flatten()
+        # Take mean of two finger positions as gripper openness (normalized)
+        # MimicGen gripper: 0 = closed, 0.04 = open (for Panda)
+        gripper_open = np.mean(gripper_qpos)
+        # Normalize to roughly [-1, 1] range
+        gripper_open = (gripper_open - 0.02) / 0.02
+        gripper_open = np.array([gripper_open], dtype=np.float32)
+    else:
+        # Fallback: use 0 if no gripper state available
+        gripper_open = np.array([0.0], dtype=np.float32)
+
+    # Concatenate: [pos(3), rot6d(6), gripper_open(1)] = 10 dims
+    gripper_state = np.concatenate([eef_pos, eef_rot6d, gripper_open], axis=-1)
+    return gripper_state.astype(np.float32)
+
+
+# ----------------------------
 # PLY-equivalent preprocessing (EXACT MATCH to mimicgen_ply_all_tasks.py)
 # ----------------------------
 
@@ -194,6 +275,13 @@ class DatasetGoalProvider:
         self.path_lengths = data['path_lengths']  # (E,)
         self.num_trajectories = len(self.init_states)
 
+        # Load gripper state if available (E, Tmax, 10)
+        self.gripper_state = data.get('gripper_state', None)
+        if self.gripper_state is not None:
+            print(f"[DatasetGoalProvider] Found gripper_state: shape={self.gripper_state.shape}")
+        else:
+            print(f"[DatasetGoalProvider] No gripper_state in dataset")
+
         self.indices = np.arange(self.num_trajectories)
         if shuffle:
             np.random.shuffle(self.indices)
@@ -214,6 +302,35 @@ class DatasetGoalProvider:
         goal_tokens = self.goals[idx]       # (K, Dtok)
 
         return init_state, goal_tokens
+
+    def get_goal_gripper_state(self):
+        """
+        Returns the goal gripper state for the most recently returned trajectory.
+        Goal is the last valid timestep's gripper state.
+
+        Returns:
+            gripper_state: [10,] array, or None if not available
+        """
+        if self.gripper_state is None:
+            return None
+        if self.last_idx is None:
+            raise RuntimeError("Call get_init_state_and_goal() first")
+
+        idx = self.last_idx
+        path_len = self.path_lengths[idx]
+        # Goal gripper state is from the last timestep
+        goal_gripper = self.gripper_state[idx, path_len - 1]  # [10,]
+        return goal_gripper.astype(np.float32)
+
+    def get_first_frame_gripper_state(self):
+        """
+        Returns the first frame gripper state for the most recently returned trajectory.
+        """
+        if self.gripper_state is None:
+            return None
+        if self.last_idx is None:
+            raise RuntimeError("Call get_init_state_and_goal() first")
+        return self.gripper_state[self.last_idx, 0].astype(np.float32)  # [10,]
 
     def get_first_frame_tokens(self):
         """
@@ -280,6 +397,7 @@ class MimicGenDLPWrapper:
         # goal
         get_goal_raw_obs_fn=None,
         goal_provider=None,
+        random_init=False,  # If True, use random env reset instead of dataset init states
         success_key_candidates=("success", "task_success", "is_success"),
         pixel_stride=1,  # DEFAULT 1 to match mimicgen_ply_all_tasks.py
         max_points_backproject=200_000,  # matches mimicgen_ply_all_tasks.py --max-points
@@ -306,6 +424,7 @@ class MimicGenDLPWrapper:
 
         self.get_goal_raw_obs_fn = get_goal_raw_obs_fn
         self.goal_provider = goal_provider
+        self.random_init = bool(random_init)
         self.success_key_candidates = tuple(success_key_candidates)
 
         self.last_raw_obs = None
@@ -315,6 +434,8 @@ class MimicGenDLPWrapper:
         self.decoded_vox = None
         self.last_vox = None
         self.vox = None
+        self.last_gripper_state = None  # [10,] gripper state from last obs
+        self.goal_gripper_state = None  # [10,] gripper state for goal
 
         # --- load calib ---
         self.calib = {}
@@ -914,7 +1035,12 @@ class MimicGenDLPWrapper:
         return result
 
     def reset(self, **kwargs):
-        """Reset the environment and set up goal conditioning."""
+        """Reset the environment and set up goal conditioning.
+
+        If random_init=True (set in __init__), uses random environment reset.
+        Otherwise, uses dataset init states from goal_provider.
+        Goal tokens always come from dataset when goal_provider is available.
+        """
         # Increment episode counter for voxel saving
         if self.save_voxels_dir is not None:
             self._save_ep_counter += 1
@@ -923,9 +1049,12 @@ class MimicGenDLPWrapper:
         if self.goal_provider is not None:
             init_state, goal_tokens = self.goal_provider.get_init_state_and_goal()
 
-            raw_obs = self.env.reset_to({"states": init_state})
-            # if raw_obs is None:
-            #     raw_obs = self.env.get_observation()
+            if self.random_init:
+                # Random initialization - ignore dataset init_state
+                raw_obs = self.env.reset(**kwargs)
+            else:
+                # Dataset initialization - use exact init_state from dataset
+                raw_obs = self.env.reset_to({"states": init_state})
 
             self.last_raw_obs = raw_obs
             self._ensure_env_calib(raw_obs)
@@ -933,7 +1062,16 @@ class MimicGenDLPWrapper:
 
             obs_vec, _, _ = self.encode_tokens(raw_obs)
 
+            # Extract gripper state from live observation
+            self.last_gripper_state = extract_gripper_state_from_obs(raw_obs)
+
+            # Goal tokens always come from dataset
             self.goal_vec = goal_tokens.reshape(-1).astype(np.float32)
+
+            # Goal gripper state from dataset if available, else use current
+            self.goal_gripper_state = self.goal_provider.get_goal_gripper_state()
+            if self.goal_gripper_state is None:
+                self.goal_gripper_state = self.last_gripper_state.copy()
 
             return obs_vec
 
@@ -945,12 +1083,18 @@ class MimicGenDLPWrapper:
 
         obs_vec, _, _ = self.encode_tokens(raw_obs)
 
+        # Extract gripper state from live observation
+        self.last_gripper_state = extract_gripper_state_from_obs(raw_obs)
+
         if self.get_goal_raw_obs_fn is not None:
             goal_raw = self.get_goal_raw_obs_fn(self.env, raw_obs)
             goal_vec, _, _ = self.encode_tokens(goal_raw)
             self.goal_vec = goal_vec
+            # Extract goal gripper state
+            self.goal_gripper_state = extract_gripper_state_from_obs(goal_raw)
         else:
             self.goal_vec = obs_vec.copy()
+            self.goal_gripper_state = self.last_gripper_state.copy()
 
         return obs_vec
 
@@ -960,6 +1104,10 @@ class MimicGenDLPWrapper:
         self.last_info = info
 
         obs_vec, _, _ = self.encode_tokens(raw_obs)
+
+        # Extract gripper state from live observation
+        self.last_gripper_state = extract_gripper_state_from_obs(raw_obs)
+
         success = self._get_success_from_info(info)
         if success is not None:
             info = dict(info)
@@ -967,9 +1115,30 @@ class MimicGenDLPWrapper:
         return obs_vec, float(reward), bool(done), info
 
     def make_cond(self, obs_vec, horizon):
+        """
+        Create condition dict for diffusion model.
+
+        Returns:
+            cond_np: dict mapping timestep -> observations (without gripper state)
+        """
         if self.goal_vec is None:
             raise RuntimeError("Call reset() before make_cond().")
         return {
             0: obs_vec.copy(),
             horizon - 1: self.goal_vec.copy(),
+        }
+
+    def get_gripper_cond(self, horizon):
+        """
+        Get gripper state conditions for current and goal.
+
+        Returns:
+            dict mapping timestep -> gripper_state [10,]
+            Returns None if gripper state not available.
+        """
+        if self.last_gripper_state is None or self.goal_gripper_state is None:
+            return None
+        return {
+            0: self.last_gripper_state.copy(),
+            horizon - 1: self.goal_gripper_state.copy(),
         }
