@@ -208,9 +208,10 @@ class AccTrainer(object):
         conditions = to_np(batch.conditions[0])[:,None]
 
         ## [ batch_size x horizon x observation_dim ]
-        # Account for gripper_dim if present
+        # Account for gripper_dim and bg_dim if present
         gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
-        obs_start_idx = self.dataset.action_dim + gripper_dim
+        bg_dim = getattr(self.dataset, 'bg_dim', 0)
+        obs_start_idx = self.dataset.action_dim + gripper_dim + bg_dim
         normed_observations = trajectories[:, :, obs_start_idx:]
         observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
 
@@ -239,9 +240,10 @@ class AccTrainer(object):
             trajectories = to_np(samples.trajectories)
 
             ## [ n_samples x horizon x observation_dim ]
-            # Account for gripper_dim if present
+            # Account for gripper_dim and bg_dim if present
             gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
-            obs_start_idx = self.dataset.action_dim + gripper_dim
+            bg_dim = getattr(self.dataset, 'bg_dim', 0)
+            obs_start_idx = self.dataset.action_dim + gripper_dim + bg_dim
             normed_observations = trajectories[:, :, obs_start_idx:]
 
             # [ 1 x 1 x observation_dim ]

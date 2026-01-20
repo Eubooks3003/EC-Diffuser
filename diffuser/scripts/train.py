@@ -148,9 +148,12 @@ print("renderer: ", renderer)
 observation_dim = dataset.observation_dim
 action_dim = dataset.action_dim
 gripper_dim = getattr(dataset, 'gripper_dim', 0)
+bg_dim = getattr(dataset, 'bg_dim', 0)
 
 if gripper_dim > 0:
     print(f"[train] Using gripper observations: gripper_dim={gripper_dim}")
+if bg_dim > 0:
+    print(f"[train] Using background features: bg_dim={bg_dim}")
 
 
 # -----------------------------------------------------------------------------#
@@ -173,6 +176,7 @@ model_config = utils.Config(
     multiview=args.multiview,
     device=args.device,
     gripper_dim=gripper_dim,
+    bg_dim=bg_dim,
 )
 
 diffusion_config = utils.Config(
@@ -182,6 +186,7 @@ diffusion_config = utils.Config(
     observation_dim=observation_dim,
     action_dim=action_dim,
     gripper_dim=gripper_dim,
+    bg_dim=bg_dim,
     n_timesteps=args.n_diffusion_steps,
     loss_type=args.loss_type,
     clip_denoised=args.clip_denoised,

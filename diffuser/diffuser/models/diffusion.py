@@ -57,7 +57,7 @@ class GaussianDiffusion(nn.Module):
     def __init__(self, model, horizon, observation_dim, action_dim, n_timesteps=1000,
         loss_type='l1', clip_denoised=False, predict_epsilon=True,
         action_weight=1.0, loss_discount=1.0, loss_weights=None, obs_only=False, action_only=False,
-        gripper_dim=0,
+        gripper_dim=0, bg_dim=0,
     ):
         super().__init__()
         self.horizon = horizon
@@ -65,8 +65,9 @@ class GaussianDiffusion(nn.Module):
         self.observation_dim = observation_dim
         self.action_dim = action_dim
         self.gripper_dim = gripper_dim
-        # transition_dim includes: actions + gripper_state (optional) + observations
-        self.transition_dim = observation_dim + action_dim + gripper_dim
+        self.bg_dim = bg_dim
+        # transition_dim includes: actions + gripper_state (optional) + bg_features (optional) + observations
+        self.transition_dim = observation_dim + action_dim + gripper_dim + bg_dim
         self.model = model
 
         betas = cosine_beta_schedule(n_timesteps)

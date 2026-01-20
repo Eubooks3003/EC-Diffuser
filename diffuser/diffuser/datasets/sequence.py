@@ -26,7 +26,7 @@ class SequenceDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path='', dataset_name='panda_push', horizon=64, obs_only=False,
         normalizer='LimitsNormalizer', particle_normalizer='ParticleGaussianNormalizer', preprocess_fns=[], max_path_length=1000,
         max_n_episodes=5000, termination_penalty=0, use_padding=True, overfit=False, action_only=False, single_view=False,
-        action_z_scale=1.0, use_gripper_obs=False, **kwargs):
+        action_z_scale=1.0, use_gripper_obs=False, use_bg_obs=False, **kwargs):
         self.preprocess_fn = get_preprocess_fn(preprocess_fns, dataset_name)
         self.dataset_path = dataset_path
         self.horizon = horizon
@@ -36,6 +36,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.use_padding = use_padding
         self.action_z_scale = float(action_z_scale)  # Scale factor for Z action dimension
         self.use_gripper_obs = use_gripper_obs  # Whether to include gripper state in observations
+        self.use_bg_obs = use_bg_obs  # Whether to include background features in observations
 
         fields = ReplayBuffer(max_n_episodes, max_path_length, termination_penalty)
         assert dataset_path, 'Dataset path must be provided'
@@ -63,6 +64,18 @@ class SequenceDataset(torch.utils.data.Dataset):
             else:
                 print(f'[ datasets/sequence ] Gripper state available but not used (use_gripper_obs=False)')
 
+        # Check for bg_features
+        self.has_bg_features = 'bg_features' in fields._dict
+        if self.use_bg_obs and not self.has_bg_features:
+            print(f'[ datasets/sequence ] WARNING: use_bg_obs=True but no bg_features in dataset')
+            self.use_bg_obs = False
+        if self.has_bg_features:
+            print(f'[ datasets/sequence ] Found bg_features in dataset: shape={fields["bg_features"].shape}')
+            if self.use_bg_obs:
+                print(f'[ datasets/sequence ] Background features will be included in model input')
+            else:
+                print(f'[ datasets/sequence ] Background features available but not used (use_bg_obs=False)')
+
         self.successful_episode_idxes = fields.successful_episode_idxes
         self.normalizer = DatasetNormalizer(fields, normalizer, particle_normalizer=particle_normalizer, path_lengths=fields['path_lengths'])
 
@@ -86,15 +99,18 @@ class SequenceDataset(torch.utils.data.Dataset):
             normalize_keys = ['observations', 'actions', 'goals']
         if self.use_gripper_obs and self.has_gripper_state:
             normalize_keys.append('gripper_state')
+        if self.use_bg_obs and self.has_bg_features:
+            normalize_keys.append('bg_features')
         self.normalize(keys=normalize_keys)
 
         self.particle_dim = fields.observations.shape[-1]
         self.observation_dim = fields.normed_observations.shape[-1]
         self.action_dim = fields.normed_actions.shape[-1]
         self.gripper_dim = fields.gripper_state.shape[-1] if (self.use_gripper_obs and self.has_gripper_state) else 0
+        self.bg_dim = fields.bg_features.shape[-1] if (self.use_bg_obs and self.has_bg_features) else 0
         print(f'[ datasets/sequence ] Dataset fields: {self.fields}')
         print(f'[ datasets/sequence ] Dataset normalizer: {self.normalizer}')
-        print(f'[ datasets/sequence ] action_dim={self.action_dim}, gripper_dim={self.gripper_dim}, observation_dim={self.observation_dim}')
+        print(f'[ datasets/sequence ] action_dim={self.action_dim}, gripper_dim={self.gripper_dim}, bg_dim={self.bg_dim}, observation_dim={self.observation_dim}')
 
     def normalize(self, keys=['observations', 'actions', 'goals']):
         '''
@@ -130,15 +146,18 @@ class SequenceDataset(torch.utils.data.Dataset):
         indices = np.array(indices)
         return indices
 
-    def get_conditions(self, observations, gripper_state=None):
+    def get_conditions(self, observations, gripper_state=None, bg_features=None):
         '''
             condition on current observation for planning
-            If gripper_state is provided, it's concatenated with observations in conditions
+            Conditions are concatenated: [gripper_state (optional), bg_features (optional), observations]
         '''
+        parts = []
         if gripper_state is not None:
-            # Conditions include gripper state: [gripper_state, observations]
-            return {0: np.concatenate([gripper_state[0], observations[0]], axis=-1)}
-        return {0: observations[0]}
+            parts.append(gripper_state[0])
+        if bg_features is not None:
+            parts.append(bg_features[0])
+        parts.append(observations[0])
+        return {0: np.concatenate(parts, axis=-1)}
 
     def __len__(self):
         return len(self.indices)
@@ -155,15 +174,24 @@ class SequenceDataset(torch.utils.data.Dataset):
         else:
             gripper_state = None
 
-        conditions = self.get_conditions(observations, gripper_state)
+        # Get bg_features if available and requested
+        if self.use_bg_obs and self.has_bg_features:
+            bg_features = self.fields.normed_bg_features[path_ind, start:end]
+        else:
+            bg_features = None
+
+        conditions = self.get_conditions(observations, gripper_state, bg_features)
         if self.obs_only:
             trajectories = observations
         else:
-            # Trajectory format: [actions, gripper_state (optional), observations]
+            # Trajectory format: [actions, gripper_state (optional), bg_features (optional), observations]
+            traj_parts = [actions]
             if gripper_state is not None:
-                trajectories = np.concatenate([actions, gripper_state, observations], axis=-1)
-            else:
-                trajectories = np.concatenate([actions, observations], axis=-1)
+                traj_parts.append(gripper_state)
+            if bg_features is not None:
+                traj_parts.append(bg_features)
+            traj_parts.append(observations)
+            trajectories = np.concatenate(traj_parts, axis=-1)
         batch = Batch(trajectories, conditions)
         return batch
 
@@ -220,6 +248,17 @@ class GoalDataset(SequenceDataset):
         else:
             gripper_state = None
 
+        # Get bg_features if available and requested
+        if self.use_bg_obs and self.has_bg_features:
+            # Get bg_features for the goal (last timestep)
+            goal_bg = self.fields.normed_bg_features[path_ind, path_length-1:path_length]
+            bg_features = np.concatenate([
+                self.fields.normed_bg_features[path_ind, start:actual_end-1],
+                goal_bg
+            ])
+        else:
+            bg_features = None
+
         # Handle padding
         if padding_needed > 0:
             # Pad observations with the last observation repeated
@@ -232,30 +271,42 @@ class GoalDataset(SequenceDataset):
             if gripper_state is not None:
                 last_gripper = gripper_state[-1]
                 gripper_state = np.vstack([gripper_state] + [last_gripper] * padding_needed)
+            # Pad bg_features if present
+            if bg_features is not None:
+                last_bg = bg_features[-1]
+                bg_features = np.vstack([bg_features] + [last_bg] * padding_needed)
 
-        conditions = self.get_conditions(observations, gripper_state)
+        conditions = self.get_conditions(observations, gripper_state, bg_features)
         if self.obs_only:
             trajectories = observations
         else:
-            # Trajectory format: [actions, gripper_state (optional), observations]
+            # Trajectory format: [actions, gripper_state (optional), bg_features (optional), observations]
+            traj_parts = [actions]
             if gripper_state is not None:
-                trajectories = np.concatenate([actions, gripper_state, observations], axis=-1)
-            else:
-                trajectories = np.concatenate([actions, observations], axis=-1)
+                traj_parts.append(gripper_state)
+            if bg_features is not None:
+                traj_parts.append(bg_features)
+            traj_parts.append(observations)
+            trajectories = np.concatenate(traj_parts, axis=-1)
         batch = Batch(trajectories, conditions)
         return batch
 
-    def get_conditions(self, observations, gripper_state=None):
+    def get_conditions(self, observations, gripper_state=None, bg_features=None):
         '''
             condition on both the current observation and the last observation in the plan
-            If gripper_state is provided, it's concatenated with observations in conditions
+            Conditions are concatenated: [gripper_state (optional), bg_features (optional), observations]
         '''
+        parts_0 = []
+        parts_end = []
         if gripper_state is not None:
-            return {
-                0: np.concatenate([gripper_state[0], observations[0]], axis=-1).copy(),
-                self.horizon - 1: np.concatenate([gripper_state[-1], observations[-1]], axis=-1).copy(),
-            }
+            parts_0.append(gripper_state[0])
+            parts_end.append(gripper_state[-1])
+        if bg_features is not None:
+            parts_0.append(bg_features[0])
+            parts_end.append(bg_features[-1])
+        parts_0.append(observations[0])
+        parts_end.append(observations[-1])
         return {
-            0: observations[0].copy(),
-            self.horizon - 1: observations[-1].copy(),
+            0: np.concatenate(parts_0, axis=-1).copy(),
+            self.horizon - 1: np.concatenate(parts_end, axis=-1).copy(),
         }

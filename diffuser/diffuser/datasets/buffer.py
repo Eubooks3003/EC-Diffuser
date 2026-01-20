@@ -159,4 +159,10 @@ class ReplayBuffer:
             print(f'[ datasets/buffer ] Found gripper_state: shape={gs.shape}, '
                   f'range=[{gs.min():.3f}, {gs.max():.3f}]')
 
+        # Report bg_features if present
+        if 'bg_features' in self._dict:
+            bg = self._dict['bg_features']
+            print(f'[ datasets/buffer ] Found bg_features: shape={bg.shape}, '
+                  f'range=[{bg.min():.3f}, {bg.max():.3f}]')
+
         print(f'[ datasets/buffer ] Loaded {self._count} episodes from {path}')

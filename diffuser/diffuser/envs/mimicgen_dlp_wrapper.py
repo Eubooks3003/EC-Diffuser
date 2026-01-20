@@ -282,6 +282,13 @@ class DatasetGoalProvider:
         else:
             print(f"[DatasetGoalProvider] No gripper_state in dataset")
 
+        # Load bg_features if available (E, Tmax, bg_dim)
+        self.bg_features = data.get('bg_features', None)
+        if self.bg_features is not None:
+            print(f"[DatasetGoalProvider] Found bg_features: shape={self.bg_features.shape}")
+        else:
+            print(f"[DatasetGoalProvider] No bg_features in dataset")
+
         self.indices = np.arange(self.num_trajectories)
         if shuffle:
             np.random.shuffle(self.indices)
@@ -331,6 +338,35 @@ class DatasetGoalProvider:
         if self.last_idx is None:
             raise RuntimeError("Call get_init_state_and_goal() first")
         return self.gripper_state[self.last_idx, 0].astype(np.float32)  # [10,]
+
+    def get_goal_bg_features(self):
+        """
+        Returns the goal bg_features for the most recently returned trajectory.
+        Goal is the last valid timestep's bg_features.
+
+        Returns:
+            bg_features: [bg_dim,] array, or None if not available
+        """
+        if self.bg_features is None:
+            return None
+        if self.last_idx is None:
+            raise RuntimeError("Call get_init_state_and_goal() first")
+
+        idx = self.last_idx
+        path_len = self.path_lengths[idx]
+        # Goal bg_features is from the last timestep
+        goal_bg = self.bg_features[idx, path_len - 1]  # [bg_dim,]
+        return goal_bg.astype(np.float32)
+
+    def get_first_frame_bg_features(self):
+        """
+        Returns the first frame bg_features for the most recently returned trajectory.
+        """
+        if self.bg_features is None:
+            return None
+        if self.last_idx is None:
+            raise RuntimeError("Call get_init_state_and_goal() first")
+        return self.bg_features[self.last_idx, 0].astype(np.float32)  # [bg_dim,]
 
     def get_first_frame_tokens(self):
         """
@@ -436,6 +472,8 @@ class MimicGenDLPWrapper:
         self.vox = None
         self.last_gripper_state = None  # [10,] gripper state from last obs
         self.goal_gripper_state = None  # [10,] gripper state for goal
+        self.last_bg_features = None  # [bg_dim,] background features from last obs
+        self.goal_bg_features = None  # [bg_dim,] background features for goal
 
         # --- load calib ---
         self.calib = {}
@@ -856,6 +894,9 @@ class MimicGenDLPWrapper:
         self.last_vox = vox.detach().cpu().numpy()
         self.vox = vox
 
+        # Store background features: z_bg is [B, 1, bg_dim], extract [bg_dim]
+        self.last_bg_features = z_bg[0, 0].detach().cpu().numpy().astype(np.float32)
+
         return flat, toks_np, self.last_vox
 
     def _get_success_from_info(self, info):
@@ -1073,6 +1114,11 @@ class MimicGenDLPWrapper:
             if self.goal_gripper_state is None:
                 self.goal_gripper_state = self.last_gripper_state.copy()
 
+            # Goal bg_features from dataset if available, else use current
+            self.goal_bg_features = self.goal_provider.get_goal_bg_features()
+            if self.goal_bg_features is None:
+                self.goal_bg_features = self.last_bg_features.copy() if self.last_bg_features is not None else None
+
             return obs_vec
 
         # Legacy path: standard reset
@@ -1092,9 +1138,12 @@ class MimicGenDLPWrapper:
             self.goal_vec = goal_vec
             # Extract goal gripper state
             self.goal_gripper_state = extract_gripper_state_from_obs(goal_raw)
+            # Extract goal bg_features (already stored by encode_tokens)
+            self.goal_bg_features = self.last_bg_features.copy() if self.last_bg_features is not None else None
         else:
             self.goal_vec = obs_vec.copy()
             self.goal_gripper_state = self.last_gripper_state.copy()
+            self.goal_bg_features = self.last_bg_features.copy() if self.last_bg_features is not None else None
 
         return obs_vec
 
@@ -1141,4 +1190,19 @@ class MimicGenDLPWrapper:
         return {
             0: self.last_gripper_state.copy(),
             horizon - 1: self.goal_gripper_state.copy(),
+        }
+
+    def get_bg_cond(self, horizon):
+        """
+        Get background features conditions for current and goal.
+
+        Returns:
+            dict mapping timestep -> bg_features [bg_dim,]
+            Returns None if bg_features not available.
+        """
+        if self.last_bg_features is None or self.goal_bg_features is None:
+            return None
+        return {
+            0: self.last_bg_features.copy(),
+            horizon - 1: self.goal_bg_features.copy(),
         }

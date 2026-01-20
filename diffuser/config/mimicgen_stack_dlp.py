@@ -14,14 +14,16 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'mimicgen_stack_dlp',
-    'override_dataset_path': '/home/ellina/Desktop/Code/lpwm-dev/ecdiffuser_data/stack_replay_buffer_dlp_debug_gripper.pkl',
+    'override_dataset_path': '/home/ellina/Desktop/Code/lpwm-dev/ecdiffuser_data/stack_replay_buffer_dlp_debug_gripper_old.pkl',
     'calib_h5_path': '/home/ellina/Desktop/Code/articubot-on-mimicgen/mimicgen_data/stack_d1/core/stack_d1_rgbd_pcd.hdf5',
     'dlp_ckpt': '/home/ellina/Desktop/Code/lpwm-dev/checkpoints_3d/best/best.pt',
     'dlp_ctor': "voxel_models:DLP",
     'dlp_cfg': "/home/ellina/Desktop/Code/lpwm-dev/configs/best.json",
     'features_dim': 12,
     'gripper_dim': 10,
-    'use_gripper_obs': True,  # Enable gripper state as model input
+    'use_gripper_obs': False,  # Enable gripper state as model input
+    'bg_dim': 2,
+    'use_bg_obs': False,  # Enable background features as model input
     'max_particles': 16,
     'multiview': False,
     'device': 'cuda:0',
@@ -38,7 +40,6 @@ mode_to_args = {
     "use_absolute_actions": False,
     'horizon': 16,
     'exe_steps': 8
-
   },
 }
 

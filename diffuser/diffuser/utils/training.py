@@ -218,9 +218,10 @@ class Trainer(object):
         conditions = to_np(batch.conditions[0])[:,None]
 
         ## [ batch_size x horizon x observation_dim ]
-        # Account for gripper_dim if present (trajectory format: [actions, gripper_state, observations])
+        # Account for gripper_dim and bg_dim if present (trajectory format: [actions, gripper_state, bg_features, observations])
         gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
-        obs_start_idx = self.dataset.action_dim + gripper_dim
+        bg_dim = getattr(self.dataset, 'bg_dim', 0)
+        obs_start_idx = self.dataset.action_dim + gripper_dim + bg_dim
         normed_observations = trajectories[:, :, obs_start_idx:]
         observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
         savepath = os.path.join(self.logdir, f'_sample-reference.ply')
@@ -248,9 +249,10 @@ class Trainer(object):
             trajectories = to_np(samples.trajectories)
 
             ## [ n_samples x horizon x observation_dim ]
-            # Account for gripper_dim if present
+            # Account for gripper_dim and bg_dim if present
             gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
-            obs_start_idx = self.dataset.action_dim + gripper_dim
+            bg_dim = getattr(self.dataset, 'bg_dim', 0)
+            obs_start_idx = self.dataset.action_dim + gripper_dim + bg_dim
             normed_observations = trajectories[:, :, obs_start_idx:]
 
             # [ 1 x 1 x observation_dim ]
@@ -599,9 +601,16 @@ class Trainer(object):
                 v_norm = self.dataset.normalizer.normalize(v[None], "gripper_state")[0]
                 return torch.from_numpy(v_norm).float().to(device)
 
-            # Check if we should use gripper observations
+            # Helper to normalize bg_features
+            def norm_bg(v):
+                v_norm = self.dataset.normalizer.normalize(v[None], "bg_features")[0]
+                return torch.from_numpy(v_norm).float().to(device)
+
+            # Check if we should use gripper observations and bg_features
             use_gripper_obs = getattr(self.dataset, 'use_gripper_obs', False)
             gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
+            use_bg_obs = getattr(self.dataset, 'use_bg_obs', False)
+            bg_dim = getattr(self.dataset, 'bg_dim', 0)
 
             t = 0
             while t < max_steps:
@@ -611,17 +620,29 @@ class Trainer(object):
                 if need_replan:
                     # ====== PLANNING PHASE ======
                     # Build current observation condition
-                    obs_norm = norm_obs(obs_vec)
+                    # Condition format: [gripper_state (optional), bg_features (optional), observations]
+                    cond_parts = []
+
+                    # Add gripper state if enabled
                     if use_gripper_obs and gripper_dim > 0:
                         gripper_cond = envw.get_gripper_cond(horizon=self.dataset.horizon)
                         if gripper_cond is not None and 0 in gripper_cond:
                             gripper_norm = norm_gripper(gripper_cond[0])
-                            # Condition format: [gripper_state, observations]
-                            cond_0 = torch.cat([gripper_norm, obs_norm], dim=-1)[None, :]
-                        else:
-                            cond_0 = obs_norm[None, :]
-                    else:
-                        cond_0 = obs_norm[None, :]
+                            cond_parts.append(gripper_norm)
+
+                    # Add bg_features if enabled
+                    if use_bg_obs and bg_dim > 0:
+                        bg_cond = envw.get_bg_cond(horizon=self.dataset.horizon)
+                        if bg_cond is not None and 0 in bg_cond:
+                            bg_norm = norm_bg(bg_cond[0])
+                            cond_parts.append(bg_norm)
+
+                    # Add observations
+                    obs_norm = norm_obs(obs_vec)
+                    cond_parts.append(obs_norm)
+
+                    # Concatenate all parts
+                    cond_0 = torch.cat(cond_parts, dim=-1)[None, :]
 
                     # Use zeros for goal condition (no goal conditioning)
                     cond_goal = torch.zeros_like(cond_0)
@@ -651,8 +672,8 @@ class Trainer(object):
                     # Decode and visualize the diffuser's predicted future observations
                     if log_imagined_states and renderer_3d is not None and ep == log_imagined_episode and plan_idx == log_imagined_plan_idx:
                         print(f"\n[IMAGINED STATES] Logging decoded predictions for ep={ep}, plan={plan_idx}")
-                        # Extract predicted observations (skip action_dim + gripper_dim)
-                        obs_start_idx = a_dim + gripper_dim
+                        # Extract predicted observations (skip action_dim + gripper_dim + bg_dim)
+                        obs_start_idx = a_dim + gripper_dim + bg_dim
                         pred_obs_norm = traj[:, obs_start_idx:].detach().cpu().numpy()  # (H, obs_dim)
                         # Unnormalize observations
                         pred_obs = self.dataset.normalizer.unnormalize(pred_obs_norm, "observations")  # (H, obs_dim)
