@@ -905,6 +905,13 @@ class MimicGenDLPWrapper:
         for k in self.success_key_candidates:
             if k in info:
                 v = info[k]
+                # Handle nested dict like {'task': True} from MimicGen
+                if isinstance(v, dict):
+                    # Check for 'task' key or take any True value
+                    if 'task' in v:
+                        return bool(v['task'])
+                    # Fallback: return True if any value is True
+                    return any(bool(val) for val in v.values())
                 if isinstance(v, (bool, np.bool_)):
                     return bool(v)
                 if isinstance(v, (int, float, np.integer, np.floating)):
