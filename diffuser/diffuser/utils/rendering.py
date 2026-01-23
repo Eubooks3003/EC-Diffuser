@@ -314,11 +314,16 @@ class ParticleRenderer3D:
         z_bg = None
         if bg_features is not None:
             z_bg = _as_torch_f32(bg_features, device)
+            print(f"[render_volume] bg_features input shape: {bg_features.shape if hasattr(bg_features, 'shape') else type(bg_features)}")
+            print(f"[render_volume] z_bg after conversion: {z_bg.shape}, range=[{z_bg.min():.4f}, {z_bg.max():.4f}]")
             if z_bg.ndim == 1:
                 z_bg = z_bg.unsqueeze(0)  # [1, bg_dim]
             # Add time dimension to match [B, 1, bg_dim] expected by decode_all
             if z_bg.ndim == 2:
                 z_bg = z_bg.unsqueeze(1)  # [B, 1, bg_dim]
+            print(f"[render_volume] z_bg final shape: {z_bg.shape}")
+        else:
+            print("[render_volume] WARNING: bg_features is None, background will be zeros")
 
         dec = model.decode_all(
             z, z_scale, z_feat, obj_on, z_depth,
@@ -337,6 +342,18 @@ class ParticleRenderer3D:
         rec_rgb = dec["rec_rgb"]
         fg_only = dec["dec_objects_trans"]
         bg_rec = dec.get("bg_rec", None)
+        bg_mask = dec.get("bg_mask", None)
+
+        # Debug output
+        print(f"[render_volume] decode_all keys: {list(dec.keys())}")
+        print(f"[render_volume] rec_rgb shape: {rec_rgb.shape}, range=[{rec_rgb.min():.4f}, {rec_rgb.max():.4f}]")
+        print(f"[render_volume] fg_only shape: {fg_only.shape}, range=[{fg_only.min():.4f}, {fg_only.max():.4f}]")
+        if bg_rec is not None:
+            print(f"[render_volume] bg_rec shape: {bg_rec.shape}, range=[{bg_rec.min():.4f}, {bg_rec.max():.4f}]")
+        else:
+            print("[render_volume] bg_rec is None!")
+        if bg_mask is not None:
+            print(f"[render_volume] bg_mask shape: {bg_mask.shape}, range=[{bg_mask.min():.4f}, {bg_mask.max():.4f}]")
 
         # Expect [B, 3, D, H, W] or [B, C, D, H, W]
         if not (torch.is_tensor(rec_rgb) and rec_rgb.ndim == 5):

@@ -238,14 +238,39 @@ class Trainer(object):
         conditions = to_np(batch.conditions[0])[:,None]
 
         ## [ batch_size x horizon x observation_dim ]
-        # Account for gripper_dim and bg_dim if present (trajectory format: [actions, gripper_state, bg_features, observations])
+        # Trajectory format: [actions, gripper_state, bg_features, observations]
         gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
         bg_dim = getattr(self.dataset, 'bg_dim', 0)
-        obs_start_idx = self.dataset.action_dim + gripper_dim + bg_dim
+        action_dim = self.dataset.action_dim
+
+        # Extract bg_features if present
+        bg_features_seq = None
+        if bg_dim > 0:
+            bg_start_idx = action_dim + gripper_dim
+            bg_end_idx = bg_start_idx + bg_dim
+            normed_bg = trajectories[:, :, bg_start_idx:bg_end_idx]
+            bg_features_seq = self.dataset.normalizer.unnormalize(normed_bg, 'bg_features')
+
+        obs_start_idx = action_dim + gripper_dim + bg_dim
         normed_observations = trajectories[:, :, obs_start_idx:]
         observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
+
+        # Debug: check bg_features status
+        print(f"[render_reference] Dataset info:")
+        print(f"  use_bg_obs: {getattr(self.dataset, 'use_bg_obs', 'N/A')}")
+        print(f"  has_bg_features: {getattr(self.dataset, 'has_bg_features', 'N/A')}")
+        print(f"  bg_dim: {bg_dim}")
+        print(f"  bg_features_seq is None: {bg_features_seq is None}")
+        if bg_features_seq is not None:
+            print(f"  bg_features_seq shape: {bg_features_seq.shape}, range=[{bg_features_seq.min():.4f}, {bg_features_seq.max():.4f}]")
+
         savepath = os.path.join(self.logdir, f'_sample-reference.ply')
-        self.renderer.composite(savepath, observations, front_bg=front_bg, side_bg=side_bg, log_bg=True, log_full=True)
+        self.renderer.composite(
+            savepath, observations,
+            front_bg=front_bg, side_bg=side_bg,
+            bg_features_seq=bg_features_seq,
+            log_bg=(bg_dim > 0), log_full=(bg_dim > 0)
+        )
 
     def render_samples(self, batch_size=2, n_samples=2, front_bg=None, side_bg=None):
         '''
@@ -264,31 +289,65 @@ class Trainer(object):
                 'b d -> (repeat b) d', repeat=n_samples,
             )
 
-            ## [ n_samples x horizon x (action_dim + gripper_dim + observation_dim) ]
+            ## [ n_samples x horizon x (action_dim + gripper_dim + bg_dim + observation_dim) ]
             samples = self.ema_model(conditions)
             trajectories = to_np(samples.trajectories)
 
-            ## [ n_samples x horizon x observation_dim ]
-            # Account for gripper_dim and bg_dim if present
+            ## Extract dimensions
             gripper_dim = getattr(self.dataset, 'gripper_dim', 0)
             bg_dim = getattr(self.dataset, 'bg_dim', 0)
-            obs_start_idx = self.dataset.action_dim + gripper_dim + bg_dim
+            action_dim = self.dataset.action_dim
+
+            ## Extract bg_features if present
+            bg_features_seq = None
+            if bg_dim > 0:
+                bg_start_idx = action_dim + gripper_dim
+                bg_end_idx = bg_start_idx + bg_dim
+                normed_bg = trajectories[:, :, bg_start_idx:bg_end_idx]
+                # Get condition bg_features for prepending
+                # Conditions include [gripper_state, bg_features, observations]
+                cond_gripper_dim = gripper_dim
+                cond_bg_start = cond_gripper_dim
+                cond_bg_end = cond_bg_start + bg_dim
+                normed_cond_bg = to_np(batch.conditions[0])[:, cond_bg_start:cond_bg_end][:, None]
+                # Prepend condition bg to trajectory bg
+                normed_bg = np.concatenate([
+                    np.repeat(normed_cond_bg, n_samples, axis=0),
+                    normed_bg
+                ], axis=1)
+                bg_features_seq = self.dataset.normalizer.unnormalize(normed_bg, 'bg_features')
+
+            ## [ n_samples x horizon x observation_dim ]
+            obs_start_idx = action_dim + gripper_dim + bg_dim
             normed_observations = trajectories[:, :, obs_start_idx:]
 
             # [ 1 x 1 x observation_dim ]
             normed_conditions = to_np(batch.conditions[0])[:,None]
+            # Extract just observations from conditions (skip gripper and bg)
+            cond_obs_start = gripper_dim + bg_dim
+            normed_cond_obs = normed_conditions[:, :, cond_obs_start:]
 
             ## [ n_samples x (horizon + 1) x observation_dim ]
             normed_observations = np.concatenate([
-                np.repeat(normed_conditions, n_samples, axis=0),
+                np.repeat(normed_cond_obs, n_samples, axis=0),
                 normed_observations
             ], axis=1)
 
             ## [ n_samples x (horizon + 1) x observation_dim ]
             observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
 
+            # Debug: check bg_features status
+            print(f"[render_samples] bg_dim={bg_dim}, bg_features_seq is None: {bg_features_seq is None}")
+            if bg_features_seq is not None:
+                print(f"[render_samples] bg_features_seq shape: {bg_features_seq.shape}, range=[{bg_features_seq.min():.4f}, {bg_features_seq.max():.4f}]")
+
             savepath = os.path.join(self.logdir, f'sample-{self.step}-{i}.png')
-            self.renderer.composite(savepath, observations, front_bg=front_bg, side_bg=side_bg, log_bg=True, log_full=True)
+            self.renderer.composite(
+                savepath, observations,
+                front_bg=front_bg, side_bg=side_bg,
+                bg_features_seq=bg_features_seq,
+                log_bg=(bg_dim > 0), log_full=(bg_dim > 0)
+            )
     
 
     @torch.no_grad()

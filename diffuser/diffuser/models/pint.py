@@ -71,12 +71,13 @@ class AdaLNPINTDenoiser(nn.Module):
                  n_head=8, n_layer=6, block_size=50, dropout=0.1,
                  predict_delta=False, positional_bias=True, max_particles=4,
                  learned_sinusoidal_cond=False, random_fourier_features=False,
-                 learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, **kwargs):
+                 learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, bg_dim=0, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
         self.action_dim = action_dim
         self.gripper_dim = gripper_dim
+        self.bg_dim = bg_dim
         self.predict_delta = predict_delta
         self.projection_dim = projection_dim
         self.max_particles = max_particles
@@ -191,10 +192,18 @@ class AdaLNPINTDenoiser(nn.Module):
 
         if self.gripper_dim > 0:
             gripper_state = x[:, :, self.action_dim:self.action_dim + self.gripper_dim]  # [bs, T, gripper_dim]
-            particle_start_idx = self.action_dim + self.gripper_dim
         else:
             gripper_state = None
-            particle_start_idx = self.action_dim
+
+        # Extract bg_features if present (will be passed through unchanged)
+        if self.bg_dim > 0:
+            bg_start = self.action_dim + self.gripper_dim
+            bg_features = x[:, :, bg_start:bg_start + self.bg_dim]  # [bs, T, bg_dim]
+        else:
+            bg_features = None
+
+        # particle_start_idx accounts for actions, gripper_state, and bg_features
+        particle_start_idx = self.action_dim + self.gripper_dim + self.bg_dim
 
         # Reshape remaining features into particles of shape [bs, T, n_particles, features_dim].
         x_particles = x[:, :, particle_start_idx:].view(bs, T, -1, self.features_dim)
@@ -262,13 +271,19 @@ class AdaLNPINTDenoiser(nn.Module):
             gripper_decoder_out = self.gripper_decoder(particles_trans[:, :, gripper_token_idx, :])  # [bs, T, gripper_dim]
             particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
             particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
-            # Concatenate action, gripper, and particle outputs.
-            x_out = torch.cat([action_decoder_out, gripper_decoder_out, particle_decoder_out], dim=-1)
+            # Concatenate action, gripper, bg_features (passthrough), and particle outputs.
+            if self.bg_dim > 0 and bg_features is not None:
+                x_out = torch.cat([action_decoder_out, gripper_decoder_out, bg_features, particle_decoder_out], dim=-1)
+            else:
+                x_out = torch.cat([action_decoder_out, gripper_decoder_out, particle_decoder_out], dim=-1)
         else:
             particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
             particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
-            # Concatenate action and particle outputs.
-            x_out = torch.cat([action_decoder_out, particle_decoder_out], dim=-1)
+            # Concatenate action, bg_features (passthrough), and particle outputs.
+            if self.bg_dim > 0 and bg_features is not None:
+                x_out = torch.cat([action_decoder_out, bg_features, particle_decoder_out], dim=-1)
+            else:
+                x_out = torch.cat([action_decoder_out, particle_decoder_out], dim=-1)
 
         if return_attention:
             return x_out, attention_dict

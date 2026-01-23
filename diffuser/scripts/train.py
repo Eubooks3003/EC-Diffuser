@@ -129,6 +129,7 @@ dataset_config = utils.Config(
     single_view=(args.input_type == "dlp" and not args.multiview),
     action_z_scale=getattr(args, 'action_z_scale', 1.0),
     use_gripper_obs=getattr(args, 'use_gripper_obs', False),
+    use_bg_obs=getattr(args, 'use_bg_obs', False),
 )
 
 render_config = utils.Config(
