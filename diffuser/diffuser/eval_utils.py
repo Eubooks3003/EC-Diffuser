@@ -340,13 +340,18 @@ def extract_mimicgen_task_name(h5_path):
             return None
 
         # Map env_name to task key
-        # Examples: "Threading_D0" -> "threading", "Hammer_Cleanup_D0" -> "hammer_cleanup"
-        # Remove _D0, _D1, etc. suffix and convert to lowercase with underscores
-        task = env_name.lower()
-
-        # Remove trailing _d0, _d1, etc.
+        # Examples: "Threading_D0" -> "threading", "HammerCleanup_D0" -> "hammer_cleanup"
+        # Convert CamelCase to snake_case, then remove _D0, _D1, etc. suffix
         import re
-        task = re.sub(r'_d\d+$', '', task)
+
+        # First convert CamelCase to snake_case (e.g., HammerCleanup -> hammer_cleanup)
+        task = re.sub(r'(?<!^)(?=[A-Z])', '_', env_name).lower()
+
+        # Remove trailing _d_0, _d_1, etc. (the underscore before D is added by camelcase conversion)
+        task = re.sub(r'_d_?\d+$', '', task)
+
+        # Clean up double underscores and trailing underscores
+        task = re.sub(r'_+', '_', task).rstrip('_')
 
         # Known mappings (env_name patterns -> TASK_SPECIFIC_BOUNDS keys)
         # Also includes common variations/aliases

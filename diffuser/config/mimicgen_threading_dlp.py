@@ -13,7 +13,7 @@ logbase = 'data'
 # With your tokens: --num_entity 64 --input_type dlp  =>  "64C_dlp"
 mode_to_args = {
   '16C_dlp': {
-    'dataset': 'mimicgen_stack_dlp',
+    'dataset': 'threading',
     'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/threading_d0/core/1_traj_with_gripper_and_bg.pkl',
     'calib_h5_path': '/home/ubuntu/ellina/data/mimicgen/threading_d0/core/threading_d0.hdf5',
     'dlp_ckpt': '/home/ubuntu/ellina/data/mimicgen/threading_d0/core/dlp_ckpt/best.pt',
@@ -29,9 +29,9 @@ mode_to_args = {
     'device': 'cuda:0',
     'max_path_length': 194,
     'env_config_dir': 'env_config/n_cubes',
-    'eval_freq': 1,
+    'eval_freq': 20,
     'eval_backend': 'mimicgen',
-    'n_steps_per_epoch': 100,
+    'n_steps_per_epoch': 500,
     'save_freq': 10**9,  # Disable step-based saves; checkpoints now sync with eval_freq in train.py
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
@@ -41,7 +41,7 @@ mode_to_args = {
     "use_absolute_actions": False,
     'horizon': 16,
     'exe_steps': 8,
-    "random_init": False
+    "random_init": True
   },
 }
 

@@ -13,25 +13,25 @@ logbase = 'data'
 # With your tokens: --num_entity 64 --input_type dlp  =>  "64C_dlp"
 mode_to_args = {
   '16C_dlp': {
-    'dataset': 'mimicgen_stack_dlp',
-    'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/square_d0/core/200_traj_with_gripper.pkl',
+    'dataset': 'square',
+    'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/square_d0/core/200_traj_with_gripper_and_bg.pkl',
     'calib_h5_path': '/home/ubuntu/ellina/data/mimicgen/square_d0/core/square_d0.hdf5',
     'dlp_ckpt': '/home/ubuntu/ellina/data/mimicgen/square_d0/core/dlp_ckpt/best.pt',
     'dlp_ctor': "voxel_models:DLP",
     'dlp_cfg': "/home/ubuntu/ellina/data/mimicgen/square_d0/core/dlp_ckpt/hparams.json",
     'features_dim': 12,
     'gripper_dim': 10,
-    'use_gripper_obs': False,  # Enable gripper state as model input
+    'use_gripper_obs': True,  # Enable gripper state as model input
     'bg_dim': 2,
-    'use_bg_obs': False,  # Enable background features as model input
+    'use_bg_obs': True,  # Enable background features as model input
     'max_particles': 16,
     'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 102,
+    'max_path_length': 172,
     'env_config_dir': 'env_config/n_cubes',
-    'eval_freq': 1,
+    'eval_freq': 20,
     'eval_backend': 'mimicgen',
-    'n_steps_per_epoch': 100,
+    'n_steps_per_epoch': 500,
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,
@@ -39,7 +39,8 @@ mode_to_args = {
     "mimicgen_pixel_stride": 1, 
     "use_absolute_actions": False,
     'horizon': 16,
-    'exe_steps': 8
+    'exe_steps': 8,
+    "random_init": True
   },
 }
 

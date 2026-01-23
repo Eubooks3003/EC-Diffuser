@@ -558,10 +558,14 @@ class Trainer(object):
                     if renderer_3d is not None and hasattr(renderer_3d, 'render_volume'):
                         try:
                             import torch
-                            # Decode preprocessed tokens to voxels
-                            preproc_dec = renderer_3d.render_volume(preproc_toks)
+                            # Get bg_features for full reconstruction visualization
+                            bg_features = envw.last_bg_features if hasattr(envw, 'last_bg_features') else None
+
+                            # Decode preprocessed tokens to voxels (with bg_features for full reconstruction)
+                            preproc_dec = renderer_3d.render_volume(preproc_toks, bg_features=bg_features)
                             preproc_fg = preproc_dec['fg_only']
                             preproc_rec = preproc_dec['rec_rgb']
+                            preproc_bg = preproc_dec.get('bg_only')
                             log_rgb_voxels(
                                 name=f"eval_debug/ep_{ep:02d}/preproc_decoded_fg",
                                 rgb_vol=preproc_fg.cpu().numpy(),
@@ -576,11 +580,21 @@ class Trainer(object):
                                 step=int(200 + ep),
                                 mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
                             )
+                            # Log background-only if available
+                            if preproc_bg is not None:
+                                log_rgb_voxels(
+                                    name=f"eval_debug/ep_{ep:02d}/preproc_decoded_bg",
+                                    rgb_vol=preproc_bg.cpu().numpy(),
+                                    alpha_vol=None, KPx=None,
+                                    step=int(200 + ep),
+                                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                                )
 
-                            # Decode live tokens to voxels
-                            live_dec = renderer_3d.render_volume(live_toks)
+                            # Decode live tokens to voxels (with bg_features for full reconstruction)
+                            live_dec = renderer_3d.render_volume(live_toks, bg_features=bg_features)
                             live_fg = live_dec['fg_only']
                             live_rec = live_dec['rec_rgb']
+                            live_bg = live_dec.get('bg_only')
                             log_rgb_voxels(
                                 name=f"eval_debug/ep_{ep:02d}/live_decoded_fg",
                                 rgb_vol=live_fg.cpu().numpy(),
@@ -595,6 +609,15 @@ class Trainer(object):
                                 step=int(200 + ep),
                                 mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
                             )
+                            # Log background-only if available
+                            if live_bg is not None:
+                                log_rgb_voxels(
+                                    name=f"eval_debug/ep_{ep:02d}/live_decoded_bg",
+                                    rgb_vol=live_bg.cpu().numpy(),
+                                    alpha_vol=None, KPx=None,
+                                    step=int(200 + ep),
+                                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                                )
 
                             decoded_vox = envw.decoded_vox
                             log_rgb_voxels(

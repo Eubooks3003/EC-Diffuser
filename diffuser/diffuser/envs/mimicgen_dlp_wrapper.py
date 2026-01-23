@@ -438,7 +438,7 @@ class MimicGenDLPWrapper:
         cams=("agentview", "sideview"),
 
         # preprocessing-equivalent knobs
-        max_points=4096,
+        max_points=20000,
         normalize_to_unit_cube=True,  # DEFAULT TRUE to match preprocess_mimicgen_voxels.py
         include_rgb=True,
 
@@ -615,24 +615,13 @@ class MimicGenDLPWrapper:
             # Intrinsics from fovy
             cam_id = sim.model.camera_name2id(cam)
             fovy = float(sim.model.cam_fovy[cam_id])
-            print("fovy: ", fovy)
             K = compute_K_from_fovy(fovy, W=W, H=H)
-            print("K: ", K)
 
             # Extrinsics: pos and R (NO transpose, NO axis flip - we do that in transform)
             pos = np.array(sim.data.cam_xpos[cam_id], dtype=np.float32)
             R = np.array(sim.data.cam_xmat[cam_id], dtype=np.float32).reshape(3, 3)
 
             self.calib[cam] = {"K": K, "R": R, "pos": pos, "near_m": near_m, "far_m": far_m, "H": H, "W": W}
-
-            # DEBUG: Print all calibration values
-            print(f"\n[DEBUG CALIB] === {cam} ===")
-            print(f"  fovy: {fovy:.4f} deg")
-            print(f"  H x W: {H} x {W}")
-            print(f"  near_m: {near_m:.6f}, far_m: {far_m:.6f}")
-            print(f"  K:\n{K}")
-            print(f"  R:\n{R}")
-            print(f"  pos: {pos}")
 
     def crop_world(self, xyz, rgb=None):
         """EXACT MATCH to maybe_crop in mimicgen_ply_all_tasks.py"""
@@ -701,7 +690,6 @@ class MimicGenDLPWrapper:
 
         # Convert depth using the same function as preprocessing
         z = depth_to_z(depth_raw, mode=self.depth_mode, near_m=near_m, far_m=far_m)
-        print(f"[DEBUG] {cam} depth_raw range: [{depth_raw.min():.4f}, {depth_raw.max():.4f}] -> z range: [{z.min():.4f},    {z.max():.4f}]")  
         H, W = z.shape
 
         # Pixel grid with stride (same as preprocessing)
@@ -765,11 +753,6 @@ class MimicGenDLPWrapper:
             if pts_cam.shape[0] == 0:
                 continue
 
-            # DEBUG: Print point cloud stats at each stage
-            print(f"\n[DEBUG PTS] === {cam} ===")
-            print(f"  pts_cam shape: {pts_cam.shape}")
-            print(f"  pts_cam range: x=[{pts_cam[:,0].min():.3f}, {pts_cam[:,0].max():.3f}] y=[{pts_cam[:,1].min():.3f}, {pts_cam[:,1].max():.3f}] z=[{pts_cam[:,2].min():.3f}, {pts_cam[:,2].max():.3f}]")
-
             v = idxs[:, 0]
             u = idxs[:, 1]
 
@@ -788,17 +771,8 @@ class MimicGenDLPWrapper:
             # Transform to world (EXACT MATCH to preprocessing)
             pts_world = self._cam_to_world(pts_cam, cam)
 
-            # DEBUG: Print world coords before crop
-            print(f"  pts_world (before crop): x=[{pts_world[:,0].min():.3f}, {pts_world[:,0].max():.3f}] y=[{pts_world[:,1].min():.3f}, {pts_world[:,1].max():.3f}] z=[{pts_world[:,2].min():.3f}, {pts_world[:,2].max():.3f}]")
-
-            n_before = pts_world.shape[0]
             # Crop (EXACT MATCH to preprocessing)
             pts_world, rgb_pts = self.crop_world(pts_world, rgb_pts)
-
-            # DEBUG: Print after crop
-            print(f"  pts_world (after crop): {n_before} -> {pts_world.shape[0]} pts")
-            if pts_world.shape[0] > 0:
-                print(f"    range: x=[{pts_world[:,0].min():.3f}, {pts_world[:,0].max():.3f}] y=[{pts_world[:,1].min():.3f}, {pts_world[:,1].max():.3f}] z=[{pts_world[:,2].min():.3f}, {pts_world[:,2].max():.3f}]")
 
             if pts_world.shape[0] == 0:
                 continue
@@ -825,10 +799,6 @@ class MimicGenDLPWrapper:
             sel = np.random.choice(xyz.shape[0], self.max_points_backproject, replace=False)
             xyz, rgb = xyz[sel], rgb[sel]
 
-        # DEBUG: Print fused point cloud stats
-        print(f"\n[DEBUG FUSED] Total points: {xyz.shape[0]}")
-        print(f"  xyz range: x=[{xyz[:,0].min():.4f}, {xyz[:,0].max():.4f}] y=[{xyz[:,1].min():.4f}, {xyz[:,1].max():.4f}] z=[{xyz[:,2].min():.4f}, {xyz[:,2].max():.4f}]")
-
         if self.include_rgb:
             return np.concatenate([xyz, rgb], axis=-1).astype(np.float32)
         return xyz.astype(np.float32)
@@ -839,17 +809,8 @@ class MimicGenDLPWrapper:
           - center_scale_unit_cube (if enabled)
           - downsample to max_points
         """
-        # DEBUG: Before normalization
-        xyz_before = pts[:, :3]
-        print(f"\n[DEBUG PREPROCESS] Before normalize: x=[{xyz_before[:,0].min():.4f}, {xyz_before[:,0].max():.4f}] y=[{xyz_before[:,1].min():.4f}, {xyz_before[:,1].max():.4f}] z=[{xyz_before[:,2].min():.4f}, {xyz_before[:,2].max():.4f}]")
-
         if self.normalize_to_unit_cube:
             pts = center_scale_unit_cube_np(pts)
-            # DEBUG: After normalization
-            xyz_after = pts[:, :3]
-            print(f"[DEBUG PREPROCESS] After normalize:  x=[{xyz_after[:,0].min():.4f}, {xyz_after[:,0].max():.4f}] y=[{xyz_after[:,1].min():.4f}, {xyz_after[:,1].max():.4f}] z=[{xyz_after[:,2].min():.4f}, {xyz_after[:,2].max():.4f}]")
-        else:
-            print(f"[DEBUG PREPROCESS] normalize_to_unit_cube=False, skipping normalization")
 
         pts = downsample_np(pts, self.max_points)
         return torch.from_numpy(pts).float()

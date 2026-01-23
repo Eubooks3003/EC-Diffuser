@@ -244,7 +244,7 @@ wandb_run = wandb.init(
     sync_tensorboard=False,
     settings=wandb.Settings(start_method="fork"),
 )
-wandb_run.name = args.savepath.split("/")[-1]
+wandb_run.name = f"{args.dataset}_H{args.horizon}_exe{getattr(args, 'exe_steps', 1)}"
 
 
 # -----------------------------------------------------------------------------#
