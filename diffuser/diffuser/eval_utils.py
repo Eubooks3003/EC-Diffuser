@@ -320,6 +320,68 @@ def evaluate_policy(policy, env, plan_args, logger,
 
     return stats
 
+def extract_mimicgen_task_name(h5_path):
+    """
+    Extract the task name from a MimicGen/robomimic HDF5 dataset.
+
+    Maps env_name (e.g., "Threading_D0", "Hammer_Cleanup_D0") to the task key
+    used in TASK_SPECIFIC_BOUNDS (e.g., "threading", "hammer_cleanup").
+
+    Returns:
+        task_name: str or None if not found
+    """
+    from robomimic.utils import file_utils as FileUtils
+
+    try:
+        env_meta = FileUtils.get_env_metadata_from_dataset(h5_path)
+        env_name = env_meta.get("env_name", None) or env_meta.get("env", None)
+
+        if env_name is None:
+            return None
+
+        # Map env_name to task key
+        # Examples: "Threading_D0" -> "threading", "Hammer_Cleanup_D0" -> "hammer_cleanup"
+        # Remove _D0, _D1, etc. suffix and convert to lowercase with underscores
+        task = env_name.lower()
+
+        # Remove trailing _d0, _d1, etc.
+        import re
+        task = re.sub(r'_d\d+$', '', task)
+
+        # Known mappings (env_name patterns -> TASK_SPECIFIC_BOUNDS keys)
+        # Also includes common variations/aliases
+        task_mappings = {
+            "threading": "threading",
+            "threading_cleanup": "threading",  # Alias - same bounds as threading
+            "hammer_cleanup": "hammer_cleanup",
+            "nut_assembly": "nut_assembly",
+            "pick_place": "pick_place",
+            "square": "square",
+            "stack_three": "stack_three",
+            "kitchen": "kitchen",
+            "coffee": "coffee",
+            "coffee_preparation": "coffee_preparation",
+            "mug_cleanup": "mug_cleanup",
+            "three_piece_assembly": "three_piece_assembly",
+        }
+
+        # Direct match
+        if task in task_mappings:
+            return task_mappings[task]
+
+        # Partial match (e.g., "threading_d0" contains "threading")
+        for key in task_mappings:
+            if key in task:
+                return task_mappings[key]
+
+        print(f"[extract_mimicgen_task_name] Warning: Could not map env_name '{env_name}' to known task")
+        return None
+
+    except Exception as e:
+        print(f"[extract_mimicgen_task_name] Warning: Failed to extract task name: {e}")
+        return None
+
+
 def setup_mimicgen_env(args, use_absolute_actions=True):
     """
     Create a MimicGen / RoboSuite env using robomimic metadata from a dataset HDF5.

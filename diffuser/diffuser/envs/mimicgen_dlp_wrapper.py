@@ -5,6 +5,29 @@ import h5py
 from datasets.voxelize_ds_wrapper import VoxelGridXYZ
 from dlp_utils import log_rgb_voxels
 
+# Task-specific bounds from preprocess_mimicgen_voxels.py
+# These define the voxelization workspace for each task
+TASK_SPECIFIC_BOUNDS = {
+    "hammer_cleanup": {"xmin": -0.4, "xmax": 0.2, "ymin": -0.4, "ymax": 0.4, "zmin": 0.7, "zmax": 1.4},
+    "nut_assembly": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.1, "zmax": 1.6},
+    "pick_place": {"xmin": -0.5, "xmax": 0.3, "ymin": -0.5, "ymax": 1.0, "zmin": 0.0, "zmax": 1.7},
+    "square": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.0, "zmax": 1.6},
+    "stack_three": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
+    "threading": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
+    "kitchen": {"xmin": -0.5, "xmax": 0.3, "ymin": -0.4, "ymax": 0.4, "zmin": 0.9, "zmax": 1.4},
+    "coffee": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
+    "coffee_preparation": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
+    "mug_cleanup": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.5, "zmin": 0.2, "zmax": 1.6},
+    "three_piece_assembly": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
+}
+
+
+def bounds_dict_to_tuple(bounds_dict):
+    """Convert a bounds dictionary to (pmin, pmax) tuples for VoxelGridXYZ."""
+    pmin = (bounds_dict["xmin"], bounds_dict["ymin"], bounds_dict["zmin"])
+    pmax = (bounds_dict["xmax"], bounds_dict["ymax"], bounds_dict["zmax"])
+    return (pmin, pmax)
+
 # ----------------------------
 # Gripper state extraction (matches ec_diffuser_mimicgen_preprocess.py)
 # ----------------------------
@@ -421,9 +444,10 @@ class MimicGenDLPWrapper:
         # voxelization knobs
         grid_dhw=(64, 64, 64),
         voxel_mode="avg_rgb",
-        bounds_mode="per_item",  # matches preprocess_mimicgen_voxels.py default
+        bounds_mode="fixed",  # use fixed task-specific bounds
         fixed_bounds="-1,1,-1,1,-1,1",
         global_bounds_pm=None,
+        task=None,  # task name for task-specific bounds (e.g., "coffee", "kitchen")
 
         # calibration
         calib_h5_path=None,
@@ -486,8 +510,16 @@ class MimicGenDLPWrapper:
             self._load_h5_calib(self.calib_h5_path)
 
         # --- bounds_pm ---
+        self.task = task
         if self.bounds_mode == "fixed":
-            self.bounds_pm = parse_fixed_bounds_pm(fixed_bounds)
+            # Use task-specific bounds if task is provided and exists in TASK_SPECIFIC_BOUNDS
+            if task is not None and task in TASK_SPECIFIC_BOUNDS:
+                self.bounds_pm = bounds_dict_to_tuple(TASK_SPECIFIC_BOUNDS[task])
+                print(f"[MimicGenDLPWrapper] Using task-specific bounds for '{task}': {self.bounds_pm}")
+            else:
+                self.bounds_pm = parse_fixed_bounds_pm(fixed_bounds)
+                if task is not None:
+                    print(f"[MimicGenDLPWrapper] Warning: task '{task}' not found in TASK_SPECIFIC_BOUNDS, using fixed_bounds")
         elif self.bounds_mode == "global":
             if global_bounds_pm is None:
                 raise RuntimeError("bounds_mode='global' requires global_bounds_pm=(pmin_tuple,pmax_tuple) computed offline.")

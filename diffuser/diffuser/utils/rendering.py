@@ -290,19 +290,40 @@ class ParticleRenderer3D:
         return z, z_scale, feat, obj_on, z_depth
 
     @torch.no_grad()
-    def render_volume(self, particles):
+    def render_volume(self, particles, bg_features=None):
         """
-        Returns (fg_only, rec_rgb) as [3,D,H,W] (not batched) for the FIRST item in batch.
+        Decode particles (and optionally bg_features) through DLP.
+
+        Args:
+            particles: [K, Dtok] or [B, K, Dtok] - foreground particle tokens
+            bg_features: [bg_dim] or [B, bg_dim] or None - background features
+
+        Returns:
+            dict with keys:
+                'fg_only': [3, D, H, W] - foreground objects only (dec_objects_trans)
+                'rec_rgb': [3, D, H, W] - full reconstruction (fg + bg)
+                'bg_only': [3, D, H, W] or None - background only (bg_rec[:3])
         """
         model, device = self._get_model_and_device()
 
         x = _as_torch_f32(particles, device)
-        x_bkd = _coerce_to_1KD(x, self.particle_dim)  # [B,K,Dtok] (B may be 1)
+        x_bkd = _coerce_to_1KD(x, self.particle_dim)  # [B, K, Dtok] (B may be 1)
         z, z_scale, z_feat, obj_on, z_depth = self._unpack_tokens(x_bkd)
+
+        # Prepare bg_features if provided
+        z_bg = None
+        if bg_features is not None:
+            z_bg = _as_torch_f32(bg_features, device)
+            if z_bg.ndim == 1:
+                z_bg = z_bg.unsqueeze(0)  # [1, bg_dim]
+            # Add time dimension to match [B, 1, bg_dim] expected by decode_all
+            if z_bg.ndim == 2:
+                z_bg = z_bg.unsqueeze(1)  # [B, 1, bg_dim]
 
         dec = model.decode_all(
             z, z_scale, z_feat, obj_on, z_depth,
-            None, None,
+            z_bg,  # Pass bg_features (or None)
+            None,  # z_ctx
             warmup=False
         )
         if not isinstance(dec, dict):
@@ -315,68 +336,150 @@ class ParticleRenderer3D:
 
         rec_rgb = dec["rec_rgb"]
         fg_only = dec["dec_objects_trans"]
+        bg_rec = dec.get("bg_rec", None)
 
-        # Expect [B,3,D,H,W] or [B,C,D,H,W]
+        # Expect [B, 3, D, H, W] or [B, C, D, H, W]
         if not (torch.is_tensor(rec_rgb) and rec_rgb.ndim == 5):
             raise ValueError(f"dec['rec_rgb'] must be [B,3,D,H,W], got {type(rec_rgb)} {getattr(rec_rgb,'shape',None)}")
         if not (torch.is_tensor(fg_only) and fg_only.ndim == 5):
             raise ValueError(f"dec['dec_objects_trans'] must be [B,3,D,H,W], got {type(fg_only)} {getattr(fg_only,'shape',None)}")
 
         rec0 = rec_rgb[0]
-        fg0  = fg_only[0]
+        fg0 = fg_only[0]
 
-        if rec0.shape[0] != 3:
-            raise ValueError(f"rec_rgb[0] must be 3-channel, got {tuple(rec0.shape)}")
-        if fg0.shape[0] != 3:
-            raise ValueError(f"dec_objects_trans[0] must be 3-channel, got {tuple(fg0.shape)}")
+        if rec0.shape[0] < 3:
+            raise ValueError(f"rec_rgb[0] must have at least 3 channels, got {tuple(rec0.shape)}")
+        if fg0.shape[0] < 3:
+            raise ValueError(f"dec_objects_trans[0] must have at least 3 channels, got {tuple(fg0.shape)}")
 
-        return fg0, rec0
+        # Extract first 3 channels (RGB) if there are more (e.g., depth channel)
+        rec0 = rec0[:3]
+        fg0 = fg0[:3]
+
+        # Extract background if available
+        bg0 = None
+        if bg_rec is not None and torch.is_tensor(bg_rec) and bg_rec.ndim == 5:
+            bg0 = bg_rec[0]
+            if bg0.shape[0] >= 3:
+                bg0 = bg0[:3]  # RGB channels only
+
+        return {
+            'fg_only': fg0,
+            'rec_rgb': rec0,
+            'bg_only': bg0,
+        }
 
     @torch.no_grad()
-    def render(self, particles, front_bg=None, side_bg=None, *, tag=None, step=None, base="base", **kwargs):
+    def render(
+        self,
+        particles,
+        front_bg=None,
+        side_bg=None,
+        *,
+        bg_features=None,
+        tag=None,
+        step=None,
+        base="base",
+        log_fg=True,
+        log_bg=False,
+        log_full=False,
+        **kwargs
+    ):
         """
-        Logs the exact same visuals as debug_dlp_vox.py using log_rgb_voxels.
-        Returns a dummy uint8 image for compatibility with upstream trainer code.
+        Decode particles and log voxel visualizations to wandb.
+
+        Args:
+            particles: [K, Dtok] or [B, K, Dtok] - foreground particle tokens
+            front_bg, side_bg: Unused, kept for API compatibility
+            bg_features: [bg_dim] or None - background features for reconstruction
+            tag: Optional tag for wandb logging path
+            step: Wandb logging step
+            base: Base path for wandb logging
+            log_fg: If True, log foreground-only reconstruction
+            log_bg: If True, log background-only reconstruction (requires bg_features)
+            log_full: If True, log full reconstruction (fg + bg)
+
+        Returns:
+            Dummy uint8 image for compatibility with upstream code.
         """
-        fg0, rec0 = self.render_volume(particles)
+        dec_out = self.render_volume(particles, bg_features=bg_features)
+        fg0 = dec_out['fg_only']
+        rec0 = dec_out['rec_rgb']
+        bg0 = dec_out['bg_only']
 
         if tag is not None:
             base = f"{base}/{tag}"
 
-        print("Plotting: ", tag, " AT STEP: ", step)
+        print(f"Plotting: {tag} at step={step} (fg={log_fg}, bg={log_bg}, full={log_full})")
 
-        log_rgb_voxels(
-            name=f"{base}/fg_only_dec",
-            rgb_vol=fg0,
-            alpha_vol=None,
-            KPx=None,
-            step=step,
-            mode=self.mode,
-            topk=self.topk,
-            alpha_thresh=self.alpha_thresh,
-            pad=self.pad,
-            show_axes=self.show_axes,
-        )
+        # Log foreground-only
+        if log_fg:
+            log_rgb_voxels(
+                name=f"{base}/fg_only",
+                rgb_vol=fg0,
+                alpha_vol=None,
+                KPx=None,
+                step=step,
+                mode=self.mode,
+                topk=self.topk,
+                alpha_thresh=self.alpha_thresh,
+                pad=self.pad,
+                show_axes=self.show_axes,
+            )
 
-        # log_rgb_voxels(
-        #     name=f"{base}/rec_rgb_dec",
-        #     rgb_vol=rec0,
-        #     alpha_vol=None,
-        #     KPx=None,
-        #     step=step,
-        #     mode=self.mode,
-        #     topk=self.topk,
-        #     alpha_thresh=self.alpha_thresh,
-        #     pad=self.pad,
-        #     show_axes=self.show_axes,
-        # )
+        # Log background-only (if available and requested)
+        if log_bg and bg0 is not None:
+            log_rgb_voxels(
+                name=f"{base}/bg_only",
+                rgb_vol=bg0,
+                alpha_vol=None,
+                KPx=None,
+                step=step,
+                mode=self.mode,
+                topk=self.topk,
+                alpha_thresh=self.alpha_thresh,
+                pad=self.pad,
+                show_axes=self.show_axes,
+            )
+
+        # Log full reconstruction (fg + bg)
+        if log_full:
+            log_rgb_voxels(
+                name=f"{base}/rec_full",
+                rgb_vol=rec0,
+                alpha_vol=None,
+                KPx=None,
+                step=step,
+                mode=self.mode,
+                topk=self.topk,
+                alpha_thresh=self.alpha_thresh,
+                pad=self.pad,
+                show_axes=self.show_axes,
+            )
 
         return np.zeros((8, 8, 3), dtype=np.uint8)
 
-    def composite(self, savepath, paths, front_bg=None, side_bg=None, **kwargs):
+    def composite(
+        self,
+        savepath,
+        paths,
+        front_bg=None,
+        side_bg=None,
+        bg_features_seq=None,
+        **kwargs
+    ):
         """
-        paths: [N,H,D]
-        Render a staggered subset of timesteps (evenly spaced), always including start and goal.
+        Render a sequence of observations.
+
+        Args:
+            savepath: Base path for saving (used for tag naming)
+            paths: [N, H, D] - N trajectories, H timesteps, D token dimensions
+            front_bg, side_bg: Unused, kept for API compatibility
+            bg_features_seq: [N, H, bg_dim] or [H, bg_dim] or None - background features per timestep
+            **kwargs:
+                num_frames: Number of frames to render (evenly spaced)
+                step: Wandb step
+                log_fg, log_bg, log_full: What to render (passed to render())
         """
         if not isinstance(paths, np.ndarray):
             paths = np.asarray(paths)
@@ -389,7 +492,7 @@ class ParticleRenderer3D:
         if H < 1:
             raise ValueError(f"Need H>=1, got H={H}")
 
-        num_frames = int(kwargs.get("num_frames", 10))
+        num_frames = int(kwargs.pop("num_frames", 10))
         if num_frames < 2:
             raise ValueError(f"num_frames must be >= 2, got {num_frames}")
 
@@ -397,7 +500,12 @@ class ParticleRenderer3D:
         if savepath is not None:
             base_tag = os.path.splitext(os.path.basename(savepath))[0]
 
-        step0 = kwargs.get("step", None)
+        step0 = kwargs.pop("step", None)
+
+        # Extract render options
+        log_fg = kwargs.pop("log_fg", True)
+        log_bg = kwargs.pop("log_bg", False)
+        log_full = kwargs.pop("log_full", False)
 
         # ---- choose indices: evenly spaced, include 0 and H-1, unique + sorted ----
         if H == 1:
@@ -417,24 +525,60 @@ class ParticleRenderer3D:
         for n in range(N):
             for t in idxs:
                 obs_t = paths[n, t]
+
+                # Get bg_features for this timestep if available
+                bg_t = None
+                if bg_features_seq is not None:
+                    bg_arr = np.asarray(bg_features_seq)
+                    if bg_arr.ndim == 3:
+                        # [N, H, bg_dim]
+                        bg_t = bg_arr[n, t]
+                    elif bg_arr.ndim == 2:
+                        # [H, bg_dim] - same bg for all N
+                        bg_t = bg_arr[t]
+
                 self.render(
                     obs_t,
+                    bg_features=bg_t,
                     tag=f"{base_tag}/sample_{n:02d}/t_{t:03d}",
                     step=(step0 if step0 is not None else t),
-                    base = "render3d"
+                    base="render3d",
+                    log_fg=log_fg,
+                    log_bg=log_bg,
+                    log_full=log_full,
+                    **kwargs
                 )
 
         return np.zeros((8, 8, 3), dtype=np.uint8)
 
 
 
-    def renders(self, samples, front_bg=None, side_bg=None, *, tag=None, step=None, **kwargs):
+    def renders(self, samples, front_bg=None, side_bg=None, *, bg_features_list=None, tag=None, step=None, **kwargs):
         """
-        samples: iterable of particles (usually a batch of independent samples)
+        Render multiple samples.
+
+        Args:
+            samples: iterable of particles (usually a batch of independent samples)
+            front_bg, side_bg: Unused, kept for API compatibility
+            bg_features_list: list of bg_features per sample, or None
+            tag: Base tag for wandb logging
+            step: Wandb step
+            **kwargs: Passed to render() (log_fg, log_bg, log_full, etc.)
         """
         imgs = []
         for i, s in enumerate(samples):
-            imgs.append(self.render(s, tag=(None if tag is None else f"{tag}/i_{i:03d}"), step=step))
+            bg_i = None
+            if bg_features_list is not None and i < len(bg_features_list):
+                bg_i = bg_features_list[i]
+            imgs.append(
+                self.render(
+                    s,
+                    bg_features=bg_i,
+                    tag=(None if tag is None else f"{tag}/i_{i:03d}"),
+                    step=step,
+                    **kwargs
+                )
+            )
         return np.concatenate(imgs, axis=1)
 
 class MatplotlibRenderer:

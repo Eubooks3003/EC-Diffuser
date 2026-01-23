@@ -245,7 +245,7 @@ class Trainer(object):
         normed_observations = trajectories[:, :, obs_start_idx:]
         observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
         savepath = os.path.join(self.logdir, f'_sample-reference.ply')
-        self.renderer.composite(savepath, observations, front_bg=front_bg, side_bg=side_bg)
+        self.renderer.composite(savepath, observations, front_bg=front_bg, side_bg=side_bg, log_bg=True, log_full=True)
 
     def render_samples(self, batch_size=2, n_samples=2, front_bg=None, side_bg=None):
         '''
@@ -288,7 +288,7 @@ class Trainer(object):
             observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
 
             savepath = os.path.join(self.logdir, f'sample-{self.step}-{i}.png')
-            self.renderer.composite(savepath, observations, front_bg=front_bg, side_bg=side_bg)
+            self.renderer.composite(savepath, observations, front_bg=front_bg, side_bg=side_bg, log_bg=True, log_full=True)
     
 
     @torch.no_grad()
@@ -306,6 +306,7 @@ class Trainer(object):
         goal_from_env_fn=None,
         goal_provider=None,         # NEW: DatasetGoalProvider for init_state + goal pairing
         random_init=False,          # If True, use random env reset instead of dataset init states
+        task=None,                  # Task name for task-specific voxel bounds (e.g., "threading", "hammer_cleanup")
 
         save_videos=True,
         video_dir=None,
@@ -452,6 +453,7 @@ class Trainer(object):
                 goal_provider=goal_provider,  # NEW: dataset-based goal provider
                 random_init=random_init,      # NEW: random vs dataset init
                 normalize_to_unit_cube=True,
+                task=task,                    # Task name for task-specific voxel bounds
             )
 
             obs_vec = envw.reset()
@@ -512,7 +514,9 @@ class Trainer(object):
                         try:
                             import torch
                             # Decode preprocessed tokens to voxels
-                            preproc_fg, preproc_rec = renderer_3d.render_volume(preproc_toks)
+                            preproc_dec = renderer_3d.render_volume(preproc_toks)
+                            preproc_fg = preproc_dec['fg_only']
+                            preproc_rec = preproc_dec['rec_rgb']
                             log_rgb_voxels(
                                 name=f"eval_debug/ep_{ep:02d}/preproc_decoded_fg",
                                 rgb_vol=preproc_fg.cpu().numpy(),
@@ -529,7 +533,9 @@ class Trainer(object):
                             )
 
                             # Decode live tokens to voxels
-                            live_fg, live_rec = renderer_3d.render_volume(live_toks)
+                            live_dec = renderer_3d.render_volume(live_toks)
+                            live_fg = live_dec['fg_only']
+                            live_rec = live_dec['rec_rgb']
                             log_rgb_voxels(
                                 name=f"eval_debug/ep_{ep:02d}/live_decoded_fg",
                                 rgb_vol=live_fg.cpu().numpy(),

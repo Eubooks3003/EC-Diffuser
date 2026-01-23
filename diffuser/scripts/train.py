@@ -287,6 +287,16 @@ if do_eval and eval_backend == "mimicgen":
     use_absolute_actions = getattr(args, "use_absolute_actions", True)
     print(f"[mimicgen eval] use_absolute_actions = {use_absolute_actions}", flush=True)
 
+    # Extract task name from HDF5 for task-specific voxel bounds
+    from diffuser.eval_utils import extract_mimicgen_task_name
+    mimicgen_task = getattr(args, "mimicgen_task", None)  # Allow config override
+    if mimicgen_task is None:
+        mimicgen_task = extract_mimicgen_task_name(calib_h5_path)
+    if mimicgen_task is not None:
+        print(f"[mimicgen eval] Using task-specific bounds for task: '{mimicgen_task}'")
+    else:
+        print(f"[mimicgen eval] WARNING: Could not determine task name, using default bounds")
+
     def make_env_fn():
         from diffuser.eval_utils import setup_mimicgen_env
         return setup_mimicgen_env(args, use_absolute_actions=use_absolute_actions)
@@ -320,6 +330,7 @@ for i in range(n_epochs):
                 goal_from_env_fn=getattr(args, "goal_from_env_fn", None),
                 goal_provider=goal_provider,  # NEW: dataset-based goal provider
                 random_init=getattr(args, "random_init_eval", False),  # NEW: random vs dataset init
+                task=mimicgen_task,  # Task name for task-specific voxel bounds
                 renderer_3d=renderer,
                 exe_steps=getattr(args, "exe_steps", 1),  # ACTION CHUNKING: how many actions to execute per plan
             )
