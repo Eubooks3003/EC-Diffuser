@@ -39,7 +39,8 @@ mode_to_args = {
     "mimicgen_pixel_stride": 1, 
     "use_absolute_actions": False,
     'horizon': 16,
-    'exe_steps': 8
+    'exe_steps': 8,
+    "random_init": False
   },
 }
 

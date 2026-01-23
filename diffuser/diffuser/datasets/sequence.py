@@ -293,20 +293,18 @@ class GoalDataset(SequenceDataset):
 
     def get_conditions(self, observations, gripper_state=None, bg_features=None):
         '''
-            condition on both the current observation and the last observation in the plan
+            condition on current observation only (goal conditioning disabled).
+            Goals are zeroed out since MimicGen env doesn't provide goal observations at inference.
             Conditions are concatenated: [gripper_state (optional), bg_features (optional), observations]
         '''
         parts_0 = []
-        parts_end = []
         if gripper_state is not None:
             parts_0.append(gripper_state[0])
-            parts_end.append(gripper_state[-1])
         if bg_features is not None:
             parts_0.append(bg_features[0])
-            parts_end.append(bg_features[-1])
         parts_0.append(observations[0])
-        parts_end.append(observations[-1])
+
+        # Only condition on t=0, no goal conditioning
         return {
             0: np.concatenate(parts_0, axis=-1).copy(),
-            self.horizon - 1: np.concatenate(parts_end, axis=-1).copy(),
         }
