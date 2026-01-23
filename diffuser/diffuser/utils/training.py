@@ -255,15 +255,6 @@ class Trainer(object):
         normed_observations = trajectories[:, :, obs_start_idx:]
         observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
 
-        # Debug: check bg_features status
-        print(f"[render_reference] Dataset info:")
-        print(f"  use_bg_obs: {getattr(self.dataset, 'use_bg_obs', 'N/A')}")
-        print(f"  has_bg_features: {getattr(self.dataset, 'has_bg_features', 'N/A')}")
-        print(f"  bg_dim: {bg_dim}")
-        print(f"  bg_features_seq is None: {bg_features_seq is None}")
-        if bg_features_seq is not None:
-            print(f"  bg_features_seq shape: {bg_features_seq.shape}, range=[{bg_features_seq.min():.4f}, {bg_features_seq.max():.4f}]")
-
         savepath = os.path.join(self.logdir, f'_sample-reference.ply')
         self.renderer.composite(
             savepath, observations,
@@ -335,11 +326,6 @@ class Trainer(object):
 
             ## [ n_samples x (horizon + 1) x observation_dim ]
             observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
-
-            # Debug: check bg_features status
-            print(f"[render_samples] bg_dim={bg_dim}, bg_features_seq is None: {bg_features_seq is None}")
-            if bg_features_seq is not None:
-                print(f"[render_samples] bg_features_seq shape: {bg_features_seq.shape}, range=[{bg_features_seq.min():.4f}, {bg_features_seq.max():.4f}]")
 
             savepath = os.path.join(self.logdir, f'sample-{self.step}-{i}.png')
             self.renderer.composite(
