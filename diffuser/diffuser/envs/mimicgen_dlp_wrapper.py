@@ -5,29 +5,6 @@ import h5py
 from datasets.voxelize_ds_wrapper import VoxelGridXYZ
 from dlp_utils import log_rgb_voxels
 
-# Task-specific bounds from preprocess_mimicgen_voxels.py
-# These define the voxelization workspace for each task
-TASK_SPECIFIC_BOUNDS = {
-    "hammer_cleanup": {"xmin": -0.4, "xmax": 0.2, "ymin": -0.4, "ymax": 0.4, "zmin": 0.7, "zmax": 1.4},
-    "nut_assembly": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.1, "zmax": 1.6},
-    "pick_place": {"xmin": -0.5, "xmax": 0.3, "ymin": -0.5, "ymax": 1.0, "zmin": 0.0, "zmax": 1.7},
-    "square": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.0, "zmax": 1.6},
-    "stack_three": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
-    "threading": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
-    "kitchen": {"xmin": -0.5, "xmax": 0.3, "ymin": -0.4, "ymax": 0.4, "zmin": 0.9, "zmax": 1.4},
-    "coffee": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
-    "coffee_preparation": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
-    "mug_cleanup": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.5, "zmin": 0.2, "zmax": 1.6},
-    "three_piece_assembly": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
-}
-
-
-def bounds_dict_to_tuple(bounds_dict):
-    """Convert a bounds dictionary to (pmin, pmax) tuples for VoxelGridXYZ."""
-    pmin = (bounds_dict["xmin"], bounds_dict["ymin"], bounds_dict["zmin"])
-    pmax = (bounds_dict["xmax"], bounds_dict["ymax"], bounds_dict["zmax"])
-    return (pmin, pmax)
-
 # ----------------------------
 # Gripper state extraction (matches ec_diffuser_mimicgen_preprocess.py)
 # ----------------------------
@@ -144,6 +121,20 @@ def parse_fixed_bounds_pm(bounds_str: str):
     xmin, xmax, ymin, ymax, zmin, zmax = map(float, bounds_str.split(","))
     pmin = (xmin, ymin, zmin)
     pmax = (xmax, ymax, zmax)
+    return (pmin, pmax)
+
+def bounds_dict_to_tuple(bounds_dict):
+    """
+    Convert a bounds dictionary to (pmin, pmax) tuple format.
+
+    Args:
+        bounds_dict: dict with keys xmin, xmax, ymin, ymax, zmin, zmax
+
+    Returns:
+        (pmin, pmax) tuple of tuples: ((xmin, ymin, zmin), (xmax, ymax, zmax))
+    """
+    pmin = (bounds_dict["xmin"], bounds_dict["ymin"], bounds_dict["zmin"])
+    pmax = (bounds_dict["xmax"], bounds_dict["ymax"], bounds_dict["zmax"])
     return (pmin, pmax)
 
 # ----------------------------
@@ -407,6 +398,21 @@ class DatasetGoalProvider:
             np.random.shuffle(self.indices)
 
 
+TASK_SPECIFIC_BOUNDS = {
+    "hammer_cleanup": {"xmin": -0.4, "xmax": 0.2,"ymin": -0.4, "ymax": 0.4,"zmin": 0.7, "zmax": 1.4},
+    "nut_assembly": {"xmin": -0.5, "xmax": 0.4,"ymin": -0.5, "ymax": 0.4,"zmin": 0.1, "zmax": 1.6},
+    "pick_place": {"xmin": -0.5, "xmax": 0.3,"ymin": -0.5, "ymax": 1.0,"zmin": 0.0, "zmax": 1.7},
+    "square": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4,"zmin": 0.0, "zmax": 1.6},
+    "stack_three": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4,"zmin": 0.2, "zmax": 1.6},
+    "threading": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4,"zmin": 0.2, "zmax": 1.6},
+    "kitchen": {"xmin": -0.5, "xmax": 0.3, "ymin": -0.4, "ymax": 0.4, "zmin": 0.9, "zmax": 1.4},
+    "coffee": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
+    "coffee_preparation": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
+    "mug_cleanup": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.5, "zmin": 0.2, "zmax": 1.6}
+    # "stack": {"xmin": ..., "xmax": ..., "ymin": ..., "ymax": ..., "zmin": ..., "zmax": ...},
+}
+
+
 # ----------------------------
 # MimicGenDLPWrapper (EXACT MATCH to preprocessing pipeline)
 # ----------------------------
@@ -444,15 +450,14 @@ class MimicGenDLPWrapper:
         # voxelization knobs
         grid_dhw=(64, 64, 64),
         voxel_mode="avg_rgb",
-        bounds_mode="fixed",  # use fixed task-specific bounds
-        fixed_bounds="-1,1,-1,1,-1,1",
-        global_bounds_pm=None,
-        task=None,  # task name for task-specific bounds (e.g., "coffee", "kitchen")
+        bounds_mode="per_item",  # DEPRECATED: now always uses task-specific bounds
+        fixed_bounds="-1,1,-1,1,-1,1",  # DEPRECATED: now always uses task-specific bounds
+        global_bounds_pm=None,  # DEPRECATED: now always uses task-specific bounds
 
         # calibration
         calib_h5_path=None,
         use_h5_calib=False,
-        crop_bounds={"xmin": -1.2, "xmax": 0.5, "ymin": -0.39, "ymax": 0.39, "zmin": -0.5, "zmax": 2.5},
+        crop_bounds={"xmin": -0.7, "xmax": 0.9, "ymin": -0.5, "ymax": 0.5, "zmin": -0.2, "zmax": 2.5},
 
         # goal
         get_goal_raw_obs_fn=None,
@@ -465,6 +470,9 @@ class MimicGenDLPWrapper:
         # voxel saving for offline analysis
         save_voxels_dir=None,
         save_points=False,     # also save raw point clouds
+
+        # task-specific bounds
+        task=None,  # Task name (e.g., "threading", "hammer_cleanup") - REQUIRED for task-specific bounds
     ):
         self.env = env
         self.dlp = dlp_model
@@ -509,27 +517,21 @@ class MimicGenDLPWrapper:
         if self.use_h5_calib and self.calib_h5_path is not None:
             self._load_h5_calib(self.calib_h5_path)
 
-        # --- bounds_pm ---
+        # --- task-specific bounds (ALWAYS used) ---
         self.task = task
-        if self.bounds_mode == "fixed":
-            # Use task-specific bounds if task is provided and exists in TASK_SPECIFIC_BOUNDS
-            if task is not None and task in TASK_SPECIFIC_BOUNDS:
-                self.bounds_pm = bounds_dict_to_tuple(TASK_SPECIFIC_BOUNDS[task])
-                print(f"[MimicGenDLPWrapper] Using task-specific bounds for '{task}': {self.bounds_pm}")
-            else:
-                self.bounds_pm = parse_fixed_bounds_pm(fixed_bounds)
-                if task is not None:
-                    print(f"[MimicGenDLPWrapper] Warning: task '{task}' not found in TASK_SPECIFIC_BOUNDS, using fixed_bounds")
-        elif self.bounds_mode == "global":
-            if global_bounds_pm is None:
-                raise RuntimeError("bounds_mode='global' requires global_bounds_pm=(pmin_tuple,pmax_tuple) computed offline.")
-            if not (isinstance(global_bounds_pm, (tuple, list)) and len(global_bounds_pm) == 2):
-                raise RuntimeError(f"global_bounds_pm must be (pmin,pmax), got {type(global_bounds_pm)}")
-            self.bounds_pm = (tuple(global_bounds_pm[0]), tuple(global_bounds_pm[1]))
-        elif self.bounds_mode == "per_item":
-            self.bounds_pm = None
-        else:
-            raise RuntimeError(f"Unknown bounds_mode={self.bounds_mode}")
+        if task is None:
+            raise RuntimeError(
+                "task parameter is REQUIRED for MimicGenDLPWrapper. "
+                "Pass task name (e.g., 'threading', 'hammer_cleanup') to use task-specific bounds from TASK_SPECIFIC_BOUNDS."
+            )
+        if task not in TASK_SPECIFIC_BOUNDS:
+            raise RuntimeError(
+                f"Unknown task '{task}'. Available tasks: {list(TASK_SPECIFIC_BOUNDS.keys())}"
+            )
+
+        # Convert TASK_SPECIFIC_BOUNDS dict to (pmin, pmax) tuple format
+        self.bounds_pm = bounds_dict_to_tuple(TASK_SPECIFIC_BOUNDS[task])
+        print(f"[MimicGenDLPWrapper] Using task-specific bounds for '{task}': {self.bounds_pm}")
 
         # precompute pixel grids cache
         self._precomputed = {}
@@ -586,30 +588,36 @@ class MimicGenDLPWrapper:
 
         for cam in self.cams:
             depth = np.asarray(raw_obs[f"{cam}_depth"])
+            # Handle various depth formats: (1, H, W), (H, W, 1), or (H, W)
             if depth.ndim == 3 and depth.shape[0] == 1:
-                depth = depth[0]
-            H, W = int(depth.shape[-2]), int(depth.shape[-1])
+                depth = depth[0]  # (1, H, W) -> (H, W)
+            elif depth.ndim == 3 and depth.shape[-1] == 1:
+                depth = depth[..., 0]  # (H, W, 1) -> (H, W)
+            depth = np.squeeze(depth)  # Remove any remaining singleton dims
+            H, W = int(depth.shape[0]), int(depth.shape[1])
 
             prev = self.calib.get(cam, None)
             if prev is not None and prev["H"] == H and prev["W"] == W:
                 continue
 
             # Use H5 calibration if available
-            if self._h5_calib is not None and cam in self._h5_calib:
-                h5_cam = self._h5_calib[cam]
-                K = h5_cam["K"]
-                # For H5 calib, we still use the standard transform
-                cam_id = sim.model.camera_name2id(cam)
-                pos = np.array(sim.data.cam_xpos[cam_id], dtype=np.float32)
-                R = np.array(sim.data.cam_xmat[cam_id], dtype=np.float32).reshape(3, 3)
-                self.calib[cam] = {"K": K, "R": R, "pos": pos, "near_m": near_m, "far_m": far_m, "H": H, "W": W}
-                continue
+            # if self._h5_calib is not None and cam in self._h5_calib:
+            #     h5_cam = self._h5_calib[cam]
+            #     K = h5_cam["K"]
+            #     # For H5 calib, we still use the standard transform
+            #     cam_id = sim.model.camera_name2id(cam)
+            #     pos = np.array(sim.data.cam_xpos[cam_id], dtype=np.float32)
+            #     R = np.array(sim.data.cam_xmat[cam_id], dtype=np.float32).reshape(3, 3)
+            #     self.calib[cam] = {"K": K, "R": R, "pos": pos, "near_m": near_m, "far_m": far_m, "H": H, "W": W}
+            #     continue
 
             # EXACT MATCH to mimicgen_ply_all_tasks.py
             # Intrinsics from fovy
             cam_id = sim.model.camera_name2id(cam)
             fovy = float(sim.model.cam_fovy[cam_id])
+            print("fovy: ", fovy)
             K = compute_K_from_fovy(fovy, W=W, H=H)
+            print("K: ", K)
 
             # Extrinsics: pos and R (NO transpose, NO axis flip - we do that in transform)
             pos = np.array(sim.data.cam_xpos[cam_id], dtype=np.float32)
@@ -693,6 +701,7 @@ class MimicGenDLPWrapper:
 
         # Convert depth using the same function as preprocessing
         z = depth_to_z(depth_raw, mode=self.depth_mode, near_m=near_m, far_m=far_m)
+        print(f"[DEBUG] {cam} depth_raw range: [{depth_raw.min():.4f}, {depth_raw.max():.4f}] -> z range: [{z.min():.4f},    {z.max():.4f}]")  
         H, W = z.shape
 
         # Pixel grid with stride (same as preprocessing)
@@ -756,6 +765,11 @@ class MimicGenDLPWrapper:
             if pts_cam.shape[0] == 0:
                 continue
 
+            # DEBUG: Print point cloud stats at each stage
+            print(f"\n[DEBUG PTS] === {cam} ===")
+            print(f"  pts_cam shape: {pts_cam.shape}")
+            print(f"  pts_cam range: x=[{pts_cam[:,0].min():.3f}, {pts_cam[:,0].max():.3f}] y=[{pts_cam[:,1].min():.3f}, {pts_cam[:,1].max():.3f}] z=[{pts_cam[:,2].min():.3f}, {pts_cam[:,2].max():.3f}]")
+
             v = idxs[:, 0]
             u = idxs[:, 1]
 
@@ -774,8 +788,17 @@ class MimicGenDLPWrapper:
             # Transform to world (EXACT MATCH to preprocessing)
             pts_world = self._cam_to_world(pts_cam, cam)
 
+            # DEBUG: Print world coords before crop
+            print(f"  pts_world (before crop): x=[{pts_world[:,0].min():.3f}, {pts_world[:,0].max():.3f}] y=[{pts_world[:,1].min():.3f}, {pts_world[:,1].max():.3f}] z=[{pts_world[:,2].min():.3f}, {pts_world[:,2].max():.3f}]")
+
+            n_before = pts_world.shape[0]
             # Crop (EXACT MATCH to preprocessing)
             pts_world, rgb_pts = self.crop_world(pts_world, rgb_pts)
+
+            # DEBUG: Print after crop
+            print(f"  pts_world (after crop): {n_before} -> {pts_world.shape[0]} pts")
+            if pts_world.shape[0] > 0:
+                print(f"    range: x=[{pts_world[:,0].min():.3f}, {pts_world[:,0].max():.3f}] y=[{pts_world[:,1].min():.3f}, {pts_world[:,1].max():.3f}] z=[{pts_world[:,2].min():.3f}, {pts_world[:,2].max():.3f}]")
 
             if pts_world.shape[0] == 0:
                 continue
@@ -802,6 +825,10 @@ class MimicGenDLPWrapper:
             sel = np.random.choice(xyz.shape[0], self.max_points_backproject, replace=False)
             xyz, rgb = xyz[sel], rgb[sel]
 
+        # DEBUG: Print fused point cloud stats
+        print(f"\n[DEBUG FUSED] Total points: {xyz.shape[0]}")
+        print(f"  xyz range: x=[{xyz[:,0].min():.4f}, {xyz[:,0].max():.4f}] y=[{xyz[:,1].min():.4f}, {xyz[:,1].max():.4f}] z=[{xyz[:,2].min():.4f}, {xyz[:,2].max():.4f}]")
+
         if self.include_rgb:
             return np.concatenate([xyz, rgb], axis=-1).astype(np.float32)
         return xyz.astype(np.float32)
@@ -812,8 +839,17 @@ class MimicGenDLPWrapper:
           - center_scale_unit_cube (if enabled)
           - downsample to max_points
         """
+        # DEBUG: Before normalization
+        xyz_before = pts[:, :3]
+        print(f"\n[DEBUG PREPROCESS] Before normalize: x=[{xyz_before[:,0].min():.4f}, {xyz_before[:,0].max():.4f}] y=[{xyz_before[:,1].min():.4f}, {xyz_before[:,1].max():.4f}] z=[{xyz_before[:,2].min():.4f}, {xyz_before[:,2].max():.4f}]")
+
         if self.normalize_to_unit_cube:
             pts = center_scale_unit_cube_np(pts)
+            # DEBUG: After normalization
+            xyz_after = pts[:, :3]
+            print(f"[DEBUG PREPROCESS] After normalize:  x=[{xyz_after[:,0].min():.4f}, {xyz_after[:,0].max():.4f}] y=[{xyz_after[:,1].min():.4f}, {xyz_after[:,1].max():.4f}] z=[{xyz_after[:,2].min():.4f}, {xyz_after[:,2].max():.4f}]")
+        else:
+            print(f"[DEBUG PREPROCESS] normalize_to_unit_cube=False, skipping normalization")
 
         pts = downsample_np(pts, self.max_points)
         return torch.from_numpy(pts).float()
@@ -838,8 +874,8 @@ class MimicGenDLPWrapper:
 
     def _voxelize_via_wrapper(self, pts_t: torch.Tensor) -> torch.Tensor:
         """
-        EXACT MATCH to voxelize_task() in preprocess_mimicgen_voxels.py:
-          - VoxelGridXYZ with bounds=None (per_item)
+        Voxelize points using task-specific fixed bounds from TASK_SPECIFIC_BOUNDS.
+        Uses VoxelGridXYZ with bounds=(pmin, pmax) from the task configuration.
         """
         D, H, W = map(int, self.grid_dhw)
 

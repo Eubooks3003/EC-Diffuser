@@ -497,7 +497,7 @@ class Trainer(object):
                 get_goal_raw_obs_fn=goal_from_env_fn,
                 goal_provider=goal_provider,  # NEW: dataset-based goal provider
                 random_init=random_init,      # NEW: random vs dataset init
-                normalize_to_unit_cube=True,
+                normalize_to_unit_cube=False,
                 task=task,                    # Task name for task-specific voxel bounds
             )
 

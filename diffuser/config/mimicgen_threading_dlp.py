@@ -32,6 +32,7 @@ mode_to_args = {
     'eval_freq': 1,
     'eval_backend': 'mimicgen',
     'n_steps_per_epoch': 100,
+    'save_freq': 10**9,  # Disable step-based saves; checkpoints now sync with eval_freq in train.py
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,

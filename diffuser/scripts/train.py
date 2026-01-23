@@ -315,6 +315,8 @@ for i in range(n_epochs):
 
     # eval AFTER each epoch; with eval_freq=1 it runs every epoch
     if do_eval and ((i + 1) % eval_freq == 0):
+        # Save checkpoint before eval (synced with eval_freq)
+        trainer.save(i)
         print(f"[eval] starting {eval_backend} eval at epoch={i} step={trainer.step}", flush=True)
 
         if eval_backend == "mimicgen":
