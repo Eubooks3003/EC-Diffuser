@@ -772,6 +772,14 @@ class Trainer(object):
                         # Unnormalize observations
                         pred_obs = self.dataset.normalizer.unnormalize(pred_obs_norm, "observations")  # (H, obs_dim)
 
+                        # Extract bg_features from trajectory if available
+                        pred_bg_features = None
+                        if use_bg_obs and bg_dim > 0:
+                            bg_start_idx = a_dim + gripper_dim
+                            bg_end_idx = bg_start_idx + bg_dim
+                            pred_bg_norm = traj[:, bg_start_idx:bg_end_idx].detach().cpu().numpy()  # (H, bg_dim)
+                            pred_bg_features = self.dataset.normalizer.unnormalize(pred_bg_norm, "bg_features")  # (H, bg_dim)
+
                         # ====== DIAGNOSTIC: Check for clipping and roundtrip loss ======
                         H = pred_obs.shape[0]
                         t0_normalized = pred_obs_norm[0]
@@ -801,13 +809,18 @@ class Trainer(object):
 
                         for t_idx in timesteps_to_log:
                             obs_at_t = pred_obs[t_idx]  # (obs_dim,)
+                            bg_at_t = pred_bg_features[t_idx] if pred_bg_features is not None else None
                             tag = f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/t_{t_idx:03d}_of_{H}"
                             try:
                                 renderer_3d.render(
                                     obs_at_t,
+                                    bg_features=bg_at_t,
                                     tag=tag,
                                     step=self.step,
-                                    base="imagined_states"
+                                    base="imagined_states",
+                                    log_fg=True,
+                                    log_bg=(bg_at_t is not None),
+                                    log_full=(bg_at_t is not None),
                                 )
                                 print(f"  Logged imagined state at horizon t={t_idx}/{H}")
                             except Exception as e:
@@ -815,11 +828,16 @@ class Trainer(object):
 
                         # Also log the current observation for comparison
                         try:
+                            current_bg = envw.last_bg_features if hasattr(envw, 'last_bg_features') else None
                             renderer_3d.render(
                                 obs_vec,
+                                bg_features=current_bg,
                                 tag=f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/cond_t0_current",
                                 step=self.step,
-                                base="imagined_states"
+                                base="imagined_states",
+                                log_fg=True,
+                                log_bg=(current_bg is not None),
+                                log_full=(current_bg is not None),
                             )
                             print(f"  Logged conditioning: current observation")
                         except Exception as e:
