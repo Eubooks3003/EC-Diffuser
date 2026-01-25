@@ -89,7 +89,7 @@ base = {
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
         'ema_decay': 0.995,
-        'save_freq': 20,
+        'save_freq': 10**9,
         'eval_freq': 10**9,
         'sample_freq': 1,
         'n_saves': 2,

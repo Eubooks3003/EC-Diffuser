@@ -39,7 +39,8 @@ mode_to_args = {
     "mimicgen_pixel_stride": 1, 
     "use_absolute_actions": False,
     'horizon': 16,
-    'exe_steps': 8
+    'exe_steps': 8,
+    "random_init": True
   },
 }
 
@@ -89,7 +90,7 @@ base = {
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
         'ema_decay': 0.995,
-        'save_freq': 20,
+        'save_freq': 10**9,
         'eval_freq': 10**9,
         'sample_freq': 1,
         'n_saves': 2,

@@ -431,22 +431,30 @@ def setup_mimicgen_env(args, use_absolute_actions=True):
     env_kwargs.setdefault("has_offscreen_renderer", True)
     env_kwargs.setdefault("use_camera_obs", True)
 
-    # 3b) Configure for absolute actions if requested
-    # When use_absolute_actions=True, the controller interprets actions as:
+    # 3b) Configure action mode (absolute vs delta)
+    # When use_absolute_actions=True (control_delta=False), the controller interprets actions as:
     #   [goal_x, goal_y, goal_z, rotvec_x, rotvec_y, rotvec_z, gripper]
-    # instead of delta commands
+    # When use_absolute_actions=False (control_delta=True), the controller interprets actions as:
+    #   [dx, dy, dz, droll, dpitch, dyaw, gripper]
+    controller_configs = env_kwargs.get("controller_configs", {})
+    if controller_configs is None:
+        controller_configs = {}
+
+    # Set control_delta based on action mode
+    control_delta_value = not use_absolute_actions  # True for delta, False for absolute
+
+    if isinstance(controller_configs, dict):
+        controller_configs["control_delta"] = control_delta_value
+    elif isinstance(controller_configs, list):
+        # Multiple robots - set for all
+        for cfg in controller_configs:
+            if isinstance(cfg, dict):
+                cfg["control_delta"] = control_delta_value
+    env_kwargs["controller_configs"] = controller_configs
+
     if use_absolute_actions:
-        controller_configs = env_kwargs.get("controller_configs", {})
-        if isinstance(controller_configs, dict):
-            controller_configs["control_delta"] = False
-        elif isinstance(controller_configs, list):
-            # Multiple robots - set for all
-            for cfg in controller_configs:
-                if isinstance(cfg, dict):
-                    cfg["control_delta"] = False
-        env_kwargs["controller_configs"] = controller_configs
         print("=" * 60)
-        print("[setup_mimicgen_env] ✓ Using ABSOLUTE actions (control_delta=False)")
+        print("[setup_mimicgen_env] Using ABSOLUTE actions (control_delta=False)")
         print("[setup_mimicgen_env]   Action format: [goal_x, goal_y, goal_z, rotvec_x, rotvec_y, rotvec_z, gripper]")
         print("[setup_mimicgen_env]   Policy outputs absolute pose targets, NOT deltas")
         print("=" * 60)

@@ -882,7 +882,11 @@ class Trainer(object):
                         frames.append(fr)
 
                 t += 1
-                if done:
+                # Check for episode termination (done) or success
+                episode_success = info.get("success", False) if isinstance(info, dict) else False
+                if done or episode_success:
+                    if episode_success:
+                        print(f"[EVAL] Episode succeeded at t={t}, stopping early")
                     break
 
             # ---- new: write video ----
