@@ -14,7 +14,7 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'coffee',
-    'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/coffee_d0/core/200_traj_with_gripper_and_bg.pkl',
+    'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/coffee_d0/core/200_traj_with_gripper.pkl',
     'calib_h5_path': '/home/ubuntu/ellina/data/mimicgen/coffee_d0/core/coffee_d0.hdf5',
     'dlp_ckpt': '/home/ubuntu/ellina/data/mimicgen/coffee_d0/core/dlp_ckpt/best.pt',
     'dlp_ctor': "voxel_models:DLP",
@@ -22,9 +22,10 @@ mode_to_args = {
     'features_dim': 12,
     'gripper_dim': 10,
     'use_gripper_obs': True,  # Enable gripper state as model input
+    'gripper_state_mask_ratio': 0.0,
     'bg_dim': 2,
     'use_bg_obs': True,  # Enable background features as model input
-    'max_particles': 16,
+    'max_particles': 40,
     'multiview': False,
     'device': 'cuda:0',
     'max_path_length': 249,
@@ -76,6 +77,7 @@ base = {
         'obs_only': False,
         'action_only': False,
         'action_z_scale': 1.0,  # Scale Z actions by 4x before normalization to amplify Z learning
+        'gripper_state_mask_ratio': 0.0,  # Ratio of samples where gripper state is masked (0.0=never, 1.0=always)
 
         # serialization
         'logbase': logbase,

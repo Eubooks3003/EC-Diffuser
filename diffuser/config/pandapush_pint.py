@@ -111,6 +111,7 @@ base = {
         'max_path_length': 30,
         'obs_only': False,
         'action_only': False,
+        'gripper_state_mask_ratio': 0.0,  # Ratio of samples where gripper state is masked (0.0=never, 1.0=always)
 
         ## serialization
         'logbase': logbase,

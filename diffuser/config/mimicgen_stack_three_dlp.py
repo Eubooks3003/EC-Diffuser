@@ -13,12 +13,12 @@ logbase = 'data'
 # With your tokens: --num_entity 64 --input_type dlp  =>  "64C_dlp"
 mode_to_args = {
   '16C_dlp': {
-    'dataset': 'square',
-    'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/square_d0/core/200_traj_with_gripper.pkl',
-    'calib_h5_path': '/home/ubuntu/ellina/data/mimicgen/square_d0/core/square_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/ellina/data/mimicgen/square_d0/core/dlp_ckpt/best.pt',
+    'dataset': 'stack_three',
+    'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/stack_three_d0/core/200_traj_with_gripper.pkl',
+    'calib_h5_path': '/home/ubuntu/ellina/data/mimicgen/stack_three_d0/core/stack_three_d0.hdf5',
+    'dlp_ckpt': '/home/ubuntu/ellina/data/mimicgen/stack_three_d0/core/dlp_ckpt/best.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': "/home/ubuntu/ellina/data/mimicgen/square_d0/core/dlp_ckpt/hparams.json",
+    'dlp_cfg': "/home/ubuntu/ellina/data/mimicgen/stack_three_d0/core/dlp_ckpt/hparams.json",
     'features_dim': 12,
     'gripper_dim': 10,
     'use_gripper_obs': True,  # Enable gripper state as model input
@@ -28,7 +28,7 @@ mode_to_args = {
     'max_particles': 40,
     'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 172,
+    'max_path_length': 310,
     'env_config_dir': 'env_config/n_cubes',
     'eval_freq': 20,
     'eval_backend': 'mimicgen',
@@ -44,6 +44,7 @@ mode_to_args = {
     "random_init": True
   },
 }
+
 
 base = {
     'diffusion': {
