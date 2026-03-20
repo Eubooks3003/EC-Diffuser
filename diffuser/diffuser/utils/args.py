@@ -1,7 +1,7 @@
 import diffuser.utils as utils
 
 class ArgsParser(utils.Parser):
-    wandb_entity: str = '<wandb_entity>'
+    wandb_entity: str = 'ellina-zhang0827'
     wandb_project: str = 'test_release_ecdiffuser'
     dataset: str = 'panda_push'
     dataset_loadbase: str = 'ecdiffuser-data'

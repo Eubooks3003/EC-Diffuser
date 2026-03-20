@@ -3,6 +3,12 @@ warnings.filterwarnings("ignore")
 
 import os
 import sys
+
+# numpy._core compatibility shim (pkl saved with newer numpy)
+import numpy.core as _core
+sys.modules['numpy._core'] = _core
+sys.modules['numpy._core.multiarray'] = _core.multiarray
+
 import wandb
 import torch
 
@@ -327,7 +333,7 @@ for i in range(n_epochs):
                 n_episodes=getattr(args, "mimicgen_eval_episodes", 5),
                 max_steps=getattr(args, "mimicgen_max_steps", 50),
                 bounds_xyz=getattr(args, "mimicgen_bounds_xyz", ((-2, 2), (-2, 2), (-0.2, 2.5))),
-                grid_dhw=getattr(args, "mimicgen_grid_dhw", (64, 64, 64)),
+                grid_dhw=getattr(args, "mimicgen_grid_dhw", (128, 128, 128)),
                 cams=getattr(args, "mimicgen_cams", ("agentview", "sideview")),
                 pixel_stride=getattr(args, "mimicgen_pixel_stride", 2),
                 goal_from_env_fn=getattr(args, "goal_from_env_fn", None),

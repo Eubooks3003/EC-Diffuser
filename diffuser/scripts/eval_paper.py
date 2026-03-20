@@ -153,7 +153,7 @@ def run_eval_rollouts(
     task,
     n_episodes=50,
     max_steps=500,
-    grid_dhw=(64, 64, 64),
+    grid_dhw=(128, 128, 128),
     cams=("agentview", "sideview"),
     pixel_stride=1,
     exe_steps=8,
@@ -317,10 +317,11 @@ def run_eval_rollouts(
                     print(f"[DEBUG] Final obs_norm shape: {obs_norm.shape}")
                     print(f"[DEBUG] Final goal_zeros shape: {goal_zeros.shape}")
 
-                # Build conditions (convert to torch tensors)
+                # Build conditions — only condition on t=0 (matches GoalDataset training).
+                # Zero goal at H-1 would force mean-state at every denoising step,
+                # distorting predictions for a model that was never trained with it.
                 cond = {
                     0: torch.from_numpy(obs_norm).float().to(device),
-                    trainer.dataset.horizon - 1: torch.from_numpy(goal_zeros).float().to(device),
                 }
 
                 # Sample trajectory from diffusion model
@@ -633,7 +634,7 @@ def main():
     # Get eval parameters from config
     max_steps = getattr(cfg, 'mimicgen_max_steps', 500)
     exe_steps = getattr(cfg, 'exe_steps', 8)
-    grid_dhw = getattr(cfg, 'mimicgen_grid_dhw', (64, 64, 64))
+    grid_dhw = getattr(cfg, 'mimicgen_grid_dhw', (128, 128, 128))
     cams = tuple(getattr(cfg, 'mimicgen_cams', ["agentview", "sideview"]))
     pixel_stride = getattr(cfg, 'mimicgen_pixel_stride', 1)
 

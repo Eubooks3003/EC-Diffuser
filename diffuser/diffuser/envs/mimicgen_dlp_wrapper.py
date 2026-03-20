@@ -447,8 +447,8 @@ class MimicGenDLPWrapper:
         # "linear": for offline HDF5 data where preprocessing auto-picked this mode
         depth_mode="robosuite",
 
-        # voxelization knobs
-        grid_dhw=(64, 64, 64),
+        # voxelization knobs — must match DLP training resolution
+        grid_dhw=(128, 128, 128),
         voxel_mode="avg_rgb",
         bounds_mode="per_item",  # DEPRECATED: now always uses task-specific bounds
         fixed_bounds="-1,1,-1,1,-1,1",  # DEPRECATED: now always uses task-specific bounds

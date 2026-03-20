@@ -483,23 +483,25 @@ class Trainer(object):
             print(f"[eval_mimicgen_rollouts] IMAGINED STATE LOGGING: requested but renderer_3d is None, skipping")
         print("=" * 60, flush=True)
 
+        # Create env and wrapper ONCE to avoid OpenGL context corruption
+        env = make_env_fn()
+        envw = MimicGenDLPWrapper(
+            env=env,
+            dlp_model=dlp_model,
+            device=device,
+            cams=cams,
+            grid_dhw=grid_dhw,
+            pixel_stride=pixel_stride,
+            calib_h5_path=calib_h5_path,
+            get_goal_raw_obs_fn=goal_from_env_fn,
+            goal_provider=goal_provider,  # NEW: dataset-based goal provider
+            random_init=random_init,      # NEW: random vs dataset init
+            normalize_to_unit_cube=False,
+            task=task,                    # Task name for task-specific voxel bounds
+        )
+
         for ep in range(n_episodes):
             print(f"\n[eval] Episode {ep+1}/{n_episodes}")
-            env = make_env_fn()
-            envw = MimicGenDLPWrapper(
-                env=env,
-                dlp_model=dlp_model,
-                device=device,
-                cams=cams,
-                grid_dhw=grid_dhw,
-                pixel_stride=pixel_stride,
-                calib_h5_path=calib_h5_path,
-                get_goal_raw_obs_fn=goal_from_env_fn,
-                goal_provider=goal_provider,  # NEW: dataset-based goal provider
-                random_init=random_init,      # NEW: random vs dataset init
-                normalize_to_unit_cube=False,
-                task=task,                    # Task name for task-specific voxel bounds
-            )
 
             obs_vec = envw.reset()
             # envw.print_params_like_h5_script(envw.last_raw_obs)   
@@ -531,8 +533,9 @@ class Trainer(object):
                         live_toks = envw.last_toks
                         print(f" Using last_toks from envw")
                     else:
-                        live_toks = obs_vec.reshape(16, 12)
-                        print(f" Reshaping")
+                        K, Dtok = preproc_toks.shape
+                        live_toks = obs_vec.reshape(K, Dtok)
+                        print(f" Reshaping to ({K}, {Dtok})")
 
                     print(f"\n[LIVE vs PREPROCESSED - SAME INITIAL STATE]")
                     print(f"  Preprocessed tokens: range=[{preproc_toks.min():.4f}, {preproc_toks.max():.4f}], mean={preproc_toks.mean():.4f}, std={preproc_toks.std():.4f}")
@@ -654,8 +657,10 @@ class Trainer(object):
 
                 # ====== TOKEN DISTRIBUTION DIAGNOSTIC ======
                 if hasattr(envw, 'goal_vec') and envw.goal_vec is not None:
-                    goal_toks = envw.goal_vec.reshape(16, 12)  # (K, Dtok)
-                    obs_toks = envw.last_toks if envw.last_toks is not None else obs_vec.reshape(24, 12)
+                    K_goal = self.dataset.fields.observations.shape[2]
+                    Dtok_goal = self.dataset.fields.observations.shape[3]
+                    goal_toks = envw.goal_vec.reshape(K_goal, Dtok_goal)  # (K, Dtok)
+                    obs_toks = envw.last_toks if envw.last_toks is not None else obs_vec.reshape(K_goal, Dtok_goal)
                     print(f"\n[TOKEN DISTRIBUTION DIAGNOSTIC]")
                     print(f"  Goal tokens (from dataset):  range=[{goal_toks.min():.4f}, {goal_toks.max():.4f}], mean={goal_toks.mean():.4f}, std={goal_toks.std():.4f}")
                     print(f"  Obs tokens (live encoded):   range=[{obs_toks.min():.4f}, {obs_toks.max():.4f}], mean={obs_toks.mean():.4f}, std={obs_toks.std():.4f}")
@@ -738,16 +743,17 @@ class Trainer(object):
                     # Concatenate all parts
                     cond_0 = torch.cat(cond_parts, dim=-1)[None, :]
 
-                    # Use zeros for goal condition (no goal conditioning)
-                    cond_goal = torch.zeros_like(cond_0)
-
+                    # No goal conditioning — only condition on initial observation.
+                    # GoalDataset trains with conditions={0: obs_0} only (no H-1 key),
+                    # so inference must match: adding a zero condition at H-1 would
+                    # force the last observation to the mean state at every denoising
+                    # step, distorting the predicted trajectory.
                     cond = {
                         0: cond_0,
-                        self.dataset.horizon - 1: cond_goal,
                     }
 
                     if t == 0:
-                        print(f"\n[EVAL] ep={ep}: Using zero goal conditioning")
+                        print(f"\n[EVAL] ep={ep}: No goal conditioning (matches training)")
                         print(f"  cond_0 shape: {cond_0.shape}")
 
                     # Sample new trajectory from diffusion model
@@ -901,10 +907,10 @@ class Trainer(object):
             returns.append(ep_ret)
             lengths.append(t + 1)
 
-            try:
-                env.close()
-            except Exception:
-                pass
+        try:
+            env.close()
+        except Exception:
+            pass
 
         out = {
             "sim/success_rate": float(np.mean(successes)) if len(successes) else 0.0,

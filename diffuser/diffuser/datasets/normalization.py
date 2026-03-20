@@ -398,7 +398,7 @@ class ParticleGaussianNormalizer(ParticleNormalizer):
 
     def normalize(self, x):
         x_unflat = x.reshape(-1, self.x_dim)
-        ret_unflat = (x_unflat - self.means) / self.stds
+        ret_unflat = (x_unflat - self.means) / (self.stds + 1e-6)
         return ret_unflat.reshape(x.shape)
 
     def unnormalize(self, x):
