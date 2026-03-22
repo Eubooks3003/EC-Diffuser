@@ -145,6 +145,16 @@ dataset = dataset_config()
 print("DATASTE TYPE: ", dataset.__class__.__name__)
 renderer = render_config()
 
+# Load DLP for renderer reference renders (independent of eval backend)
+dlp_cfg_path = getattr(args, "dlp_cfg", None)
+dlp_ckpt_path = getattr(args, "dlp_ckpt", None)
+if dlp_cfg_path and dlp_ckpt_path:
+    print(f"[renderer] loading DLP for reference renders: cfg={dlp_cfg_path} ckpt={dlp_ckpt_path}", flush=True)
+    _renderer_dlp, _ = load_dlp_lpwm(dlp_cfg_path, dlp_ckpt_path, args.device)
+    renderer.latent_rep_model = _renderer_dlp
+else:
+    print("[renderer] no DLP cfg/ckpt provided, reference renders will be skipped", flush=True)
+
 print("renderer: ", renderer)
 
 observation_dim = dataset.observation_dim
