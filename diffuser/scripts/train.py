@@ -4,11 +4,6 @@ warnings.filterwarnings("ignore")
 import os
 import sys
 
-# numpy._core compatibility shim (pkl saved with newer numpy)
-import numpy.core as _core
-sys.modules['numpy._core'] = _core
-sys.modules['numpy._core.multiarray'] = _core.multiarray
-
 import wandb
 import torch
 

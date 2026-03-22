@@ -1,6 +1,14 @@
 import numpy as np
 import pickle
 
+
+def _install_numpy_pickle_shim():
+    import sys
+    import numpy.core as _core
+    sys.modules["numpy._core"] = _core
+    sys.modules["numpy._core.multiarray"] = _core.multiarray
+
+
 def atleast_2d(x):
     while x.ndim < 2:
         x = np.expand_dims(x, axis=-1)
@@ -105,7 +113,9 @@ class ReplayBuffer:
         print(f'[ datasets/buffer ] Found {len(self.successful_episode_idxes)} successful episodes')
 
     def load_paths_from_pickle(self, path, single_view=False):
-        paths_dict = pickle.load(open(path, 'rb'))
+        _install_numpy_pickle_shim()
+        with open(path, "rb") as f:
+            paths_dict = pickle.load(f)
 
         # allow meta dicts etc
         meta = paths_dict.get('meta', None)
