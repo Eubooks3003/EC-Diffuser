@@ -117,7 +117,7 @@ import os
 import numpy as np
 import torch
 
-from eval.eval_vox import log_rgb_voxels
+# log_rgb_voxels already imported from dlp_utils at top of file
 
 
 def _as_torch_f32(x, device: torch.device) -> torch.Tensor:

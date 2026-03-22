@@ -20,12 +20,7 @@ class DatasetNormalizer:
             normalizer = eval(normalizer)
         if particle_normalizer is not None and type(particle_normalizer) == str:
             particle_normalizer = eval(particle_normalizer)
-            if 'goals' in dataset._dict:
-                goal_X = dataset['goals'][:, 0:1, :, :]
-                goal_X = goal_X.reshape(-1, *goal_X.shape[2:])
-                print("goals X shape: ", goal_X.shape)
-            else:
-                goal_X = None
+            goal_X = None  # goals no longer used for normalization
         if gripper_normalizer is not None and type(gripper_normalizer) == str:
             gripper_normalizer = eval(gripper_normalizer)
 

@@ -10,37 +10,38 @@ args_to_watch = [
 logbase = 'data'
 
 # IMPORTANT: key must match mode computed in setup.py: "{num_entity}C_{input_type}"
-# With your tokens: --num_entity 64 --input_type dlp  =>  "64C_dlp"
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'coffee_preparation',
-    'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/coffee_preparation_d0/core/200_traj_with_gripper.pkl',
-    'calib_h5_path': '/home/ubuntu/ellina/data/mimicgen/coffee_preparation_d0/core/coffee_preparation_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/ellina/data/mimicgen/coffee_preparation_d0/core/dlp_ckpt/best.pt',
+    'override_dataset_path': '/home/ellina/Desktop/data/preprocessed/coffee_preparation_d0/coffee_preparation_d0.pkl',
+    'calib_h5_path': '/home/ellina/Desktop/data/3D-DLP-mimicgen-data/core/coffee_preparation_d0.hdf5',
+    'dlp_ckpt': '/home/ellina/Desktop/data/preprocessed/coffee_preparation_d0/dlp_ckpt.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': "/home/ubuntu/ellina/data/mimicgen/coffee_preparation_d0/core/dlp_ckpt/hparams.json",
-    'features_dim': 12,
-    'gripper_dim': 10,
-    'use_gripper_obs': True,  # Enable gripper state as model input
-    'bg_dim': 2,
-    'use_bg_obs': True,  # Enable background features as model input
+    'dlp_cfg': '/home/ellina/Desktop/data/preprocessed/coffee_preparation_d0/dlp_config.json',
+    'features_dim': 12,       # Dtok: z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
+    'gripper_dim': 10,        # G: pos(3)+rot6d(6)+open(1)
+    'use_gripper_obs': True,
+    'gripper_state_mask_ratio': 0.0,
+    'bg_dim': 2,              # BG: learned_bg_feature_dim
+    'use_bg_obs': True,
     'max_particles': 40,
     'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 760,
-    'env_config_dir': 'env_config/n_cubes',
+    'max_path_length': 760,   # Tmax from pkl
+    'max_demos': 200,         # Limit demos for faster iteration (set to None for all)
     'eval_freq': 20,
     'eval_backend': 'mimicgen',
     'n_steps_per_epoch': 500,
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,
-    "mimicgen_max_steps":1000,
-    "mimicgen_pixel_stride": 1, 
+    "mimicgen_max_steps": 1000,
+    "mimicgen_pixel_stride": 1,
     "use_absolute_actions": False,
     'horizon': 32,
     'exe_steps': 8,
-    "random_init": True
+    "random_init": True,
+    "random_init_eval": True,
   },
 }
 
@@ -75,11 +76,12 @@ base = {
         'max_path_length': 10,
         'obs_only': False,
         'action_only': False,
-        'action_z_scale': 1.0,  # Scale Z actions by 4x before normalization to amplify Z learning
+        'action_z_scale': 1.0,
+        'gripper_state_mask_ratio': 0.0,
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_stack/',
+        'prefix': 'diffusion/mimicgen_coffee_preparation/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -115,7 +117,7 @@ base = {
     'plan': {
         # not used while eval_freq is huge
         'policy': 'sampling.GoalConditionedPolicy',
-        'max_episode_length': 50,
+        'max_episode_length': 125,
         'batch_size': 1,
         'preprocess_fns': [],
         'device': 'cuda:0',
@@ -124,7 +126,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_stack/',
+        'prefix': 'plans/mimicgen_coffee_preparation/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

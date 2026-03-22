@@ -50,10 +50,11 @@ import json
 import numpy as np
 import torch
 from datetime import datetime
+from tqdm import tqdm
 
 # Make lpwm-dev importable
 LPWM_DEV = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lpwm-dev")
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "lpwm-dev")
 )
 if os.path.isdir(LPWM_DEV) and LPWM_DEV not in sys.path:
     sys.path.append(LPWM_DEV)
@@ -62,6 +63,11 @@ if os.path.isdir(LPWM_DEV) and LPWM_DEV not in sys.path:
 DIFFUSER_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if DIFFUSER_ROOT not in sys.path:
     sys.path.insert(0, DIFFUSER_ROOT)
+
+# Add EC-Diffuser root to path (for dlp_utils)
+EC_DIFFUSER_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if EC_DIFFUSER_ROOT not in sys.path:
+    sys.path.insert(0, EC_DIFFUSER_ROOT)
 
 
 def build_dlp_from_cfg(cfg, device, DLPClass):
@@ -194,33 +200,31 @@ def run_eval_rollouts(
             print("[WARNING] imageio not installed, disabling video saving")
             save_videos = False
 
-    print("=" * 60)
-    print(f"[eval] Starting {n_episodes} episodes with seed={seed}")
-    print(f"[eval] max_steps={max_steps}, exe_steps={exe_steps}")
-    print(f"[eval] random_init=True (random environment initialization)")
-    if save_videos:
-        print(f"[eval] Saving videos for first {video_episodes} episodes to {video_dir}")
-    print("=" * 60)
+    print(f"[eval] seed={seed}, {n_episodes} eps, max_steps={max_steps}")
 
-    for ep in range(n_episodes):
-        if (ep + 1) % 10 == 0 or ep == 0:
-            print(f"  Episode {ep+1}/{n_episodes}...", flush=True)
+    # Create env and wrapper once, reuse across episodes
+    env = make_env_fn()
+    envw = MimicGenDLPWrapper(
+        env=env,
+        dlp_model=dlp_model,
+        device=device,
+        cams=cams,
+        grid_dhw=grid_dhw,
+        pixel_stride=pixel_stride,
+        calib_h5_path=calib_h5_path,
+        goal_provider=goal_provider,
+        random_init=True,  # Always use random init for paper eval
+        normalize_to_unit_cube=False,
+        task=task,
+    )
 
-        env = make_env_fn()
-        envw = MimicGenDLPWrapper(
-            env=env,
-            dlp_model=dlp_model,
-            device=device,
-            cams=cams,
-            grid_dhw=grid_dhw,
-            pixel_stride=pixel_stride,
-            calib_h5_path=calib_h5_path,
-            goal_provider=goal_provider,
-            random_init=True,  # Always use random init for paper eval
-            normalize_to_unit_cube=False,
-            task=task,
-        )
+    # Get dimensions from trainer dataset (constant across episodes)
+    a_dim = trainer.dataset.action_dim
+    gripper_dim = getattr(trainer.dataset, 'gripper_dim', 0)
+    bg_dim = getattr(trainer.dataset, 'bg_dim', 0)
 
+    pbar = tqdm(range(n_episodes), desc=f"Seed {seed}", unit="ep")
+    for ep in pbar:
         obs_vec = envw.reset()
         ep_ret = 0.0
         done = False
@@ -237,11 +241,6 @@ def run_eval_rollouts(
                 if k in raw_obs:
                     frames.append(_to_uint8(raw_obs[k]))
 
-        # Get dimensions from trainer dataset
-        a_dim = trainer.dataset.action_dim
-        gripper_dim = getattr(trainer.dataset, 'gripper_dim', 0)
-        bg_dim = getattr(trainer.dataset, 'bg_dim', 0)
-
         # Action chunking setup
         action_buffer = None
         action_idx = 0
@@ -251,23 +250,10 @@ def run_eval_rollouts(
             need_replan = (action_buffer is None) or (action_idx >= exe_steps)
 
             if need_replan:
-                # Debug shapes on first replan
-                if t == 0 and ep == 0:
-                    print(f"[DEBUG] obs_vec shape: {obs_vec.shape}")
-                    print(f"[DEBUG] a_dim={a_dim}, gripper_dim={gripper_dim}, bg_dim={bg_dim}")
-                    print(f"[DEBUG] observation_dim from dataset: {trainer.dataset.observation_dim}")
-                    if hasattr(envw, 'last_gripper_state'):
-                        print(f"[DEBUG] envw.last_gripper_state shape: {np.array(envw.last_gripper_state).shape}")
-                    if hasattr(envw, 'last_bg_features'):
-                        print(f"[DEBUG] envw.last_bg_features shape: {np.array(envw.last_bg_features).shape}")
-
                 # Normalize observation
                 obs_norm = trainer.dataset.normalizer.normalize(
                     obs_vec[None], "observations"
                 )[0]
-
-                if t == 0 and ep == 0:
-                    print(f"[DEBUG] obs_norm shape after normalize: {obs_norm.shape}")
 
                 # Build condition in correct order: [gripper, bg, obs]
                 # This matches training.py which does: cond_parts = [gripper, bg, obs]
@@ -312,11 +298,6 @@ def run_eval_rollouts(
                 obs_norm = np.concatenate(cond_parts)
                 goal_zeros = np.concatenate(goal_parts)
 
-                if t == 0 and ep == 0:
-                    print(f"[DEBUG] Condition order: [gripper({gripper_dim}), bg({bg_dim}), obs({trainer.dataset.observation_dim})]")
-                    print(f"[DEBUG] Final obs_norm shape: {obs_norm.shape}")
-                    print(f"[DEBUG] Final goal_zeros shape: {goal_zeros.shape}")
-
                 # Build conditions — only condition on t=0 (matches GoalDataset training).
                 # Zero goal at H-1 would force mean-state at every denoising step,
                 # distorting predictions for a model that was never trained with it.
@@ -333,19 +314,6 @@ def run_eval_rollouts(
             # Execute action
             a_norm = action_buffer[action_idx]
             a = trainer.dataset.normalizer.unnormalize(a_norm[None], "actions")[0]
-
-            # Debug: print action info for first few steps
-            if t < 5 and ep == 0:
-                print(f"[DEBUG] t={t}: a_norm={a_norm[:3]}... a_unnorm={a[:3]}... grip={a[-1] if len(a) > 6 else 'N/A'}")
-                if t == 0:
-                    norm = trainer.dataset.normalizer.normalizers.get('actions', None)
-                    if norm is not None:
-                        if hasattr(norm, 'mins') and hasattr(norm, 'maxs'):
-                            print(f"[DEBUG] Action normalizer mins: {norm.mins.flatten()[:4]}")
-                            print(f"[DEBUG] Action normalizer maxs: {norm.maxs.flatten()[:4]}")
-                        elif hasattr(norm, 'means') and hasattr(norm, 'stds'):
-                            print(f"[DEBUG] Action normalizer means: {norm.means.flatten()[:4]}")
-                            print(f"[DEBUG] Action normalizer stds: {norm.stds.flatten()[:4]}")
 
             obs_vec, r, done, info = envw.step(a)
 
@@ -370,6 +338,7 @@ def run_eval_rollouts(
         successes.append(success)
         returns.append(ep_ret)
         lengths.append(t)
+        pbar.set_postfix(sr=f"{np.mean(successes)*100:.0f}%", succ=sum(successes))
 
         # Save video for this episode
         if record_this_episode and frames and video_dir is not None:
@@ -378,15 +347,14 @@ def run_eval_rollouts(
             video_path = os.path.join(video_dir, f"seed{seed}_ep{ep:02d}_{status}.mp4")
             try:
                 imageio.mimsave(video_path, frames, fps=video_fps)
-                print(f"    Saved video: {video_path}")
-            except Exception as e:
-                print(f"    Failed to save video: {e}")
+            except Exception:
+                pass
 
-        # Close environment
-        try:
-            env.close()
-        except:
-            pass
+    # Close environment after all episodes
+    try:
+        env.close()
+    except:
+        pass
 
     success_rate = float(np.mean(successes))
     print(f"[eval] Seed {seed}: success_rate={success_rate:.4f} ({sum(successes)}/{n_episodes})")
@@ -485,18 +453,12 @@ def main():
     if dlp_cfg_path is None:
         raise RuntimeError("Config must have 'dlp_cfg'")
 
-    print(f"Dataset path: {dataset_path}")
-    print(f"Calib H5: {calib_h5_path}")
-    print(f"DLP checkpoint: {dlp_ckpt}")
-    print(f"DLP config: {dlp_cfg_path}")
-
     # Load DLP model
-    print("\nLoading DLP model...")
+    print("Loading DLP model...")
     dlp_model, dlp_cfg = load_dlp_lpwm(dlp_cfg_path, dlp_ckpt, cfg.device)
-    print("DLP model loaded.")
 
     # Load dataset
-    print("\nLoading dataset...")
+    print("Loading dataset...")
     cfg.dataset_path = dataset_path
     cfg.savepath = os.path.dirname(args.ckpt_path).replace("/ckpt", "")
 
@@ -520,12 +482,9 @@ def main():
         use_bg_obs=getattr(cfg, 'use_bg_obs', False),
     )
     dataset = dataset_config()
-    print(f"Dataset loaded: {dataset.__class__.__name__}")
-    print(f"  observation_dim={dataset.observation_dim}, action_dim={dataset.action_dim}")
-    print(f"  horizon={dataset.horizon}")
 
     # Build models
-    print("\nBuilding diffusion model...")
+    print("Building diffusion model...")
     observation_dim = dataset.observation_dim
     action_dim = dataset.action_dim
     gripper_dim = getattr(dataset, 'gripper_dim', 0)
@@ -580,8 +539,8 @@ def main():
             particle_dim=cfg.features_dim,
         )
         renderer = render_config()
-    except Exception as e:
-        print(f"[WARNING] Could not load renderer (not needed for eval): {e}")
+    except Exception:
+        pass
 
     model = model_config()
     diffusion = diffusion_config(model)
@@ -606,7 +565,6 @@ def main():
     trainer = trainer_config(diffusion, dataset, renderer)
 
     # Load checkpoint
-    print(f"\nLoading checkpoint: {args.ckpt_path}")
     ckpt_data = torch.load(args.ckpt_path, map_location=cfg.device)
     trainer.step = ckpt_data['step']
     trainer.model.load_state_dict(ckpt_data['model'])
@@ -614,18 +572,14 @@ def main():
     print(f"Loaded checkpoint at step {trainer.step}")
 
     # Setup goal provider
-    print("\nSetting up goal provider...")
     from diffuser.envs.mimicgen_dlp_wrapper import DatasetGoalProvider
     goal_provider = DatasetGoalProvider(dataset_path, shuffle=True)
-    print("Goal provider ready.")
 
     # Setup environment factory
-    print("\nSetting up environment...")
     from diffuser.eval_utils import extract_mimicgen_task_name
-    use_absolute_actions = getattr(cfg, 'use_absolute_actions', False)  # False = relative/delta actions
+    use_absolute_actions = getattr(cfg, 'use_absolute_actions', False)
     task = extract_mimicgen_task_name(calib_h5_path)
     print(f"Task: {task}")
-    print(f"Use absolute actions: {use_absolute_actions}")
 
     def make_env_fn():
         from diffuser.eval_utils import setup_mimicgen_env
@@ -638,13 +592,6 @@ def main():
     cams = tuple(getattr(cfg, 'mimicgen_cams', ["agentview", "sideview"]))
     pixel_stride = getattr(cfg, 'mimicgen_pixel_stride', 1)
 
-    print(f"\nEvaluation parameters:")
-    print(f"  max_steps: {max_steps}")
-    print(f"  exe_steps: {exe_steps}")
-    print(f"  grid_dhw: {grid_dhw}")
-    print(f"  cams: {cams}")
-    print(f"  pixel_stride: {pixel_stride}")
-
     # Setup video directory
     video_base_dir = None
     if args.save_videos:
@@ -653,14 +600,10 @@ def main():
             "videos"
         )
         os.makedirs(video_base_dir, exist_ok=True)
-        print(f"\nVideo output directory: {video_base_dir}")
 
     # Run evaluation for each seed
     all_results = []
     for seed in seeds:
-        print(f"\n{'='*60}")
-        print(f"Running evaluation with seed={seed}")
-        print(f"{'='*60}")
 
         video_dir = os.path.join(video_base_dir, f"seed_{seed}") if video_base_dir else None
 
@@ -697,18 +640,10 @@ def main():
         all_successes.extend(r["successes"])
     overall_success_rate = float(np.mean(all_successes))
 
-    print(f"\n{'='*60}")
-    print(f"FINAL RESULTS")
-    print(f"{'='*60}")
-    print(f"Seeds: {seeds}")
-    print(f"Rollouts per seed: {args.n_rollouts}")
-    print(f"Total rollouts: {len(all_successes)}")
-    print(f"\nPer-seed success rates:")
+    print(f"\nResults ({len(all_successes)} rollouts):")
     for r in all_results:
         print(f"  Seed {r['seed']}: {r['success_rate']*100:.1f}%")
-    print(f"\nMean success rate: {mean_success_rate*100:.1f}% +/- {std_success_rate*100:.1f}%")
-    print(f"Overall success rate: {overall_success_rate*100:.1f}%")
-    print(f"{'='*60}")
+    print(f"  Mean: {mean_success_rate*100:.1f}% +/- {std_success_rate*100:.1f}%")
 
     # Save results
     output_dir = args.output_dir

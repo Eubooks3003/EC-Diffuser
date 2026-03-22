@@ -38,11 +38,15 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.use_gripper_obs = use_gripper_obs  # Whether to include gripper state in observations
         self.use_bg_obs = use_bg_obs  # Whether to include background features in observations
 
+        max_demos = kwargs.pop('max_demos', None)
         fields = ReplayBuffer(max_n_episodes, max_path_length, termination_penalty)
         assert dataset_path, 'Dataset path must be provided'
         fields.load_paths_from_pickle(dataset_path, single_view=single_view and 'kitchen' not in dataset_path)
         if overfit:
             fields._count = 1
+        if max_demos is not None and max_demos < fields._count:
+            print(f'[ datasets/sequence ] Limiting to {max_demos}/{fields._count} demos')
+            fields._count = max_demos
         fields.finalize()
 
         # Apply Z scaling to actions before normalization
@@ -96,7 +100,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         if 'kitchen' in dataset_path:
             normalize_keys = ['observations', 'actions']
         else:
-            normalize_keys = ['observations', 'actions', 'goals']
+            normalize_keys = ['observations', 'actions']
         if self.use_gripper_obs and self.has_gripper_state:
             normalize_keys.append('gripper_state')
         if self.use_bg_obs and self.has_bg_features:
@@ -112,7 +116,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         print(f'[ datasets/sequence ] Dataset normalizer: {self.normalizer}')
         print(f'[ datasets/sequence ] action_dim={self.action_dim}, gripper_dim={self.gripper_dim}, bg_dim={self.bg_dim}, observation_dim={self.observation_dim}')
 
-    def normalize(self, keys=['observations', 'actions', 'goals']):
+    def normalize(self, keys=['observations', 'actions']):
         '''
             normalize fields that will be predicted by the diffusion model
         '''
@@ -201,12 +205,13 @@ class GoalDataset(SequenceDataset):
     def make_indices(self, path_lengths, horizon):
         '''
             makes indices for sampling from dataset;
-            each index maps to a datapoint
+            each index maps to a datapoint.
+            max_start = path_length - horizon so every window is fully within bounds.
         '''
         indices = []
         for i, path_length in enumerate(path_lengths):
-            max_start = path_length - 1
-            for start in range(max_start):
+            max_start = max(path_length - horizon, 0)
+            for start in range(max_start + 1):
                 end = start + horizon
                 indices.append((i, start, end))
         indices = np.array(indices)
@@ -216,64 +221,38 @@ class GoalDataset(SequenceDataset):
     def __getitem__(self, idx):
         path_ind, start, end = self.indices[idx]
         path_length = self.fields.path_lengths[path_ind]
-        # hindsight goals for unsuccessful episodes
-        if path_ind in self.successful_episode_idxes:
-            goal = self.fields.normed_goals[path_ind, path_length-1:path_length]
-        else:
-            goal = self.fields.normed_observations[path_ind, path_length-1:path_length]
 
-        # Calculate actual end and determine if padding is needed
-        path_length = self.fields.path_lengths[path_ind]
+        # Use actual consecutive frames — no goal substitution
         actual_end = min(end, path_length)
         padding_needed = end - actual_end
 
-        # Fetch observations and actions
-        if self.action_only:
-            observations = np.concatenate([self.fields.normed_observations[path_ind, start:start+1].repeat(actual_end-1-start, axis=0),
-                                           goal])
-        else:
-            observations = np.concatenate([self.fields.normed_observations[path_ind, start:actual_end-1],
-                                           goal])
-        actions = np.concatenate([self.fields.normed_actions[path_ind, start:actual_end-1],
-                                  self.normalizer.normalize(np.zeros((1, self.action_dim), dtype=self.fields.normed_actions.dtype), 'actions')])
+        # Fetch actual consecutive observations and actions
+        observations = self.fields.normed_observations[path_ind, start:actual_end]
+        actions = self.fields.normed_actions[path_ind, start:actual_end]
 
         # Get gripper state if available and requested
         if self.use_gripper_obs and self.has_gripper_state:
-            # Get gripper state for the goal (last timestep)
-            goal_gripper = self.fields.normed_gripper_state[path_ind, path_length-1:path_length]
-            gripper_state = np.concatenate([
-                self.fields.normed_gripper_state[path_ind, start:actual_end-1],
-                goal_gripper
-            ])
+            gripper_state = self.fields.normed_gripper_state[path_ind, start:actual_end]
         else:
             gripper_state = None
 
         # Get bg_features if available and requested
         if self.use_bg_obs and self.has_bg_features:
-            # Get bg_features for the goal (last timestep)
-            goal_bg = self.fields.normed_bg_features[path_ind, path_length-1:path_length]
-            bg_features = np.concatenate([
-                self.fields.normed_bg_features[path_ind, start:actual_end-1],
-                goal_bg
-            ])
+            bg_features = self.fields.normed_bg_features[path_ind, start:actual_end]
         else:
             bg_features = None
 
-        # Handle padding
+        # Handle padding (repeat last frame for windows that extend past episode end)
         if padding_needed > 0:
-            # Pad observations with the last observation repeated
-            last_obs = observations[-1]
+            last_obs = observations[-1:]
             observations = np.vstack([observations] + [last_obs] * padding_needed)
-            # Pad actions with zeros
-            last_action = actions[-1]
+            last_action = actions[-1:]
             actions = np.vstack([actions] + [last_action] * padding_needed)
-            # Pad gripper state if present
             if gripper_state is not None:
-                last_gripper = gripper_state[-1]
+                last_gripper = gripper_state[-1:]
                 gripper_state = np.vstack([gripper_state] + [last_gripper] * padding_needed)
-            # Pad bg_features if present
             if bg_features is not None:
-                last_bg = bg_features[-1]
+                last_bg = bg_features[-1:]
                 bg_features = np.vstack([bg_features] + [last_bg] * padding_needed)
 
         conditions = self.get_conditions(observations, gripper_state, bg_features)

@@ -34,6 +34,7 @@ mode_to_args = {
     'multiview': False,
     'device': 'cuda:0',
     'max_path_length': 249,   # Tmax from pkl
+    'max_demos': 200,         # Limit demos for faster iteration (set to None for all 1000)
     'eval_freq': 20,
     'eval_backend': 'mimicgen',
     'n_steps_per_epoch': 500,
@@ -46,6 +47,7 @@ mode_to_args = {
     'horizon': 16,
     'exe_steps': 8,
     "random_init": True,
+    "random_init_eval": True,
   },
 }
 
