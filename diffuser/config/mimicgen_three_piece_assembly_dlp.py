@@ -14,33 +14,35 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'three_piece_assembly',
-    'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/three_piece_assembly_d0/core/200_traj_with_gripper.pkl',
-    'calib_h5_path': '/home/ubuntu/ellina/data/mimicgen/three_piece_assembly_d0/core/three_piece_assembly_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/ellina/data/mimicgen/three_piece_assembly_d0/core/dlp_ckpt/best.pt',
+    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/three_piece_assembly_d0/three_piece_assembly_d0.pkl',
+    'calib_h5_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/core/three_piece_assembly_d0.hdf5',
+    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/three_piece_assembly_d0/dlp_ckpt.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': "/home/ubuntu/ellina/data/mimicgen/three_piece_assembly_d0/core/dlp_ckpt/hparams.json",
-    'features_dim': 12,
-    'gripper_dim': 10,
-    'use_gripper_obs': True,  # Enable gripper state as model input
-    'bg_dim': 2,
-    'use_bg_obs': True,  # Enable background features as model input
+    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/three_piece_assembly_d0/dlp_config.json',
+    'features_dim': 12,       # Dtok: z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
+    'gripper_dim': 10,        # G: pos(3)+rot6d(6)+open(1)
+    'use_gripper_obs': True,
+    'gripper_state_mask_ratio': 0.0,
+    'bg_dim': 2,              # BG: learned_bg_feature_dim
+    'use_bg_obs': True,
     'max_particles': 40,
     'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 375,
-    'env_config_dir': 'env_config/n_cubes',
-    'eval_freq': 20,
-    'eval_backend': 'mimicgen',
+    'max_path_length': 375,   # Tmax from pkl
+    'max_demos': 200,         # Limit demos for faster iteration
+    'eval_freq': 0,
+    'eval_backend': 'none',
     'n_steps_per_epoch': 500,
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,
-    "mimicgen_max_steps":500,
-    "mimicgen_pixel_stride": 1, 
+    "mimicgen_max_steps": 600,
+    "mimicgen_pixel_stride": 1,
     "use_absolute_actions": False,
-    'horizon': 24,
-    'exe_steps': 6,
-    "random_init": True
+    'horizon': 16,
+    'exe_steps': 8,
+    "random_init": True,
+    "random_init_eval": True,
   },
 }
 
@@ -75,11 +77,12 @@ base = {
         'max_path_length': 10,
         'obs_only': False,
         'action_only': False,
-        'action_z_scale': 1.0,  # Scale Z actions by 4x before normalization to amplify Z learning
+        'action_z_scale': 1.0,
+        'gripper_state_mask_ratio': 0.0,
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_stack/',
+        'prefix': 'diffusion/mimicgen_three_piece_assembly/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -90,7 +93,7 @@ base = {
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
         'ema_decay': 0.995,
-        'save_freq': 10**9,
+        'save_freq': 10_000,
         'eval_freq': 10**9,
         'sample_freq': 1,
         'n_saves': 2,
@@ -124,7 +127,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_stack/',
+        'prefix': 'plans/mimicgen_three_piece_assembly/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

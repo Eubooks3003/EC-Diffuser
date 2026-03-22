@@ -320,7 +320,13 @@ if do_eval and eval_backend == "mimicgen":
 
 n_epochs = int(args.n_train_steps // args.n_steps_per_epoch)
 
-for i in range(n_epochs):
+# Auto-resume from latest checkpoint if one exists
+start_epoch = 0
+if trainer.load_latest():
+    start_epoch = trainer.step // int(args.n_steps_per_epoch)
+    print(f"[resume] Resuming from step {trainer.step}, skipping to epoch {start_epoch}/{n_epochs}", flush=True)
+
+for i in range(start_epoch, n_epochs):
     print(f"Epoch {i} / {n_epochs} | {args.savepath}", flush=True)
     trainer.train(n_train_steps=args.n_steps_per_epoch)
 

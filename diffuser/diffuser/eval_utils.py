@@ -325,7 +325,7 @@ def extract_mimicgen_task_name(h5_path):
     Extract the task name from a MimicGen/robomimic HDF5 dataset.
 
     Maps env_name (e.g., "Threading_D0", "Hammer_Cleanup_D0") to the task key
-    used in TASK_SPECIFIC_BOUNDS (e.g., "threading", "hammer_cleanup").
+    used in TASK_VOXEL_BOUNDS (e.g., "threading", "hammer_cleanup").
 
     Returns:
         task_name: str or None if not found
@@ -353,7 +353,7 @@ def extract_mimicgen_task_name(h5_path):
         # Clean up double underscores and trailing underscores
         task = re.sub(r'_+', '_', task).rstrip('_')
 
-        # Known mappings (env_name patterns -> TASK_SPECIFIC_BOUNDS keys)
+        # Known mappings (env_name patterns -> TASK_VOXEL_BOUNDS keys)
         # Also includes common variations/aliases
         task_mappings = {
             "threading": "threading",

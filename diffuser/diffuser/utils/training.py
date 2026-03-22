@@ -178,7 +178,8 @@ class Trainer(object):
         data = {
             'step': self.step,
             'model': self.model.state_dict(),
-            'ema': self.ema_model.state_dict()
+            'ema': self.ema_model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
         }
         ckpt_dir = os.path.join(self.logdir, 'ckpt')
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -216,6 +217,34 @@ class Trainer(object):
         self.step = data['step']
         self.model.load_state_dict(data['model'])
         self.ema_model.load_state_dict(data['ema'])
+        if 'optimizer' in data:
+            self.optimizer.load_state_dict(data['optimizer'])
+
+    def load_latest(self):
+        '''
+            finds the latest checkpoint in logdir/ckpt and loads it.
+            returns True if a checkpoint was loaded, False otherwise.
+        '''
+        import glob as glob_mod
+        ckpt_dir = os.path.join(self.logdir, 'ckpt')
+        pattern = os.path.join(ckpt_dir, 'state_*_step*.pt')
+        matches = glob_mod.glob(pattern)
+        if not matches:
+            return False
+
+        def _get_step(path):
+            return int(os.path.basename(path).split('_step')[1].replace('.pt', ''))
+
+        latest = max(matches, key=_get_step)
+        data = torch.load(latest, map_location='cpu')
+        print(f'[ utils/training ] Resuming from {latest}', flush=True)
+
+        self.step = data['step']
+        self.model.load_state_dict(data['model'])
+        self.ema_model.load_state_dict(data['ema'])
+        if 'optimizer' in data:
+            self.optimizer.load_state_dict(data['optimizer'])
+        return True
 
     #-----------------------------------------------------------------------------#
     #--------------------------------- rendering ---------------------------------#

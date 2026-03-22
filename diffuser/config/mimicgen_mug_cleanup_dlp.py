@@ -17,11 +17,11 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'mug_cleanup',
-    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/mug_cleanup_d0/mug_cleanup_d0.pkl',
-    'calib_h5_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/core/mug_cleanup_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/mug_cleanup_d0/dlp_ckpt.pt',
+    'override_dataset_path': '/home/ellina/Desktop/data/preprocessed/mug_cleanup_d0/mug_cleanup_d0.pkl',
+    'calib_h5_path': '/home/ellina/Desktop/data/3D-DLP-mimicgen-data/core/mug_cleanup_d0.hdf5',
+    'dlp_ckpt': '/home/ellina/Desktop/data/preprocessed/mug_cleanup_d0/dlp_ckpt.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/mug_cleanup_d0/hparams.json',
+    'dlp_cfg': '/home/ellina/Desktop/data/preprocessed/mug_cleanup_d0/dlp_config.json',
     'features_dim': 12,       # Dtok: z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,        # G: pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': True,

@@ -398,18 +398,28 @@ class DatasetGoalProvider:
             np.random.shuffle(self.indices)
 
 
-TASK_SPECIFIC_BOUNDS = {
-    "hammer_cleanup": {"xmin": -0.4, "xmax": 0.2,"ymin": -0.4, "ymax": 0.4,"zmin": 0.7, "zmax": 1.4},
-    "nut_assembly": {"xmin": -0.5, "xmax": 0.4,"ymin": -0.5, "ymax": 0.4,"zmin": 0.1, "zmax": 1.6},
-    "pick_place": {"xmin": -0.5, "xmax": 0.3,"ymin": -0.5, "ymax": 1.0,"zmin": 0.0, "zmax": 1.7},
-    "square": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4,"zmin": 0.0, "zmax": 1.6},
-    "stack_three": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4,"zmin": 0.2, "zmax": 1.6},
-    "threading": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4,"zmin": 0.2, "zmax": 1.6},
-    "kitchen": {"xmin": -1.1, "xmax": 0.3, "ymin": -0.4, "ymax": 0.4, "zmin": 0.7, "zmax": 1.4},
+# Bounds that were ACTUALLY used during training data voxelization.
+# Due to a substring-matching bug in hdf5_states_to_voxels.py, multi-word task
+# names (CamelCase env names like "MugCleanup_D0" → "mugcleanup_d0") failed to
+# match underscore-separated keys (e.g. "mug_cleanup"), causing them to either:
+#   - match a shorter key ("coffee_preparation" matched "coffee")
+#   - fall through to per-item bounds (None)
+TASK_VOXEL_BOUNDS = {
+    # Single-word tasks: matched correctly, used intended task-specific bounds
     "coffee": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
-    "coffee_preparation": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
-    "mug_cleanup": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.5, "zmin": 0.2, "zmax": 1.6}
-    # "stack": {"xmin": ..., "xmax": ..., "ymin": ..., "ymax": ..., "zmin": ..., "zmax": ...},
+    "kitchen": {"xmin": -1.1, "xmax": 0.3, "ymin": -0.4, "ymax": 0.4, "zmin": 0.7, "zmax": 1.4},
+    "square": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.0, "zmax": 1.6},
+    "stack": {"xmin": -0.7, "xmax": 0.4, "ymin": -0.5, "ymax": 0.5, "zmin": -0.2, "zmax": 1.6},
+    "threading": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
+    # Multi-word tasks: matched wrong key due to substring bug
+    "coffee_preparation": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},  # matched "coffee"
+    "stack_three": {"xmin": -0.7, "xmax": 0.4, "ymin": -0.5, "ymax": 0.5, "zmin": -0.2, "zmax": 1.6},  # matched "stack"
+    # Multi-word tasks: no match, fell through to per-item bounds
+    "hammer_cleanup": None,
+    "mug_cleanup": None,
+    "nut_assembly": None,
+    "pick_place": None,
+    "three_piece_assembly": None,
 }
 
 
@@ -457,7 +467,7 @@ class MimicGenDLPWrapper:
         # calibration
         calib_h5_path=None,
         use_h5_calib=False,
-        crop_bounds={"xmin": -0.7, "xmax": 0.9, "ymin": -0.5, "ymax": 0.5, "zmin": -0.2, "zmax": 2.5},
+        crop_bounds={"xmin": -1.1, "xmax": 0.9, "ymin": -0.5, "ymax": 0.5, "zmin": -0.2, "zmax": 2.5},
 
         # goal
         get_goal_raw_obs_fn=None,
@@ -517,21 +527,25 @@ class MimicGenDLPWrapper:
         if self.use_h5_calib and self.calib_h5_path is not None:
             self._load_h5_calib(self.calib_h5_path)
 
-        # --- task-specific bounds (ALWAYS used) ---
+        # --- voxel bounds (must match what was used during training data generation) ---
         self.task = task
         if task is None:
             raise RuntimeError(
                 "task parameter is REQUIRED for MimicGenDLPWrapper. "
-                "Pass task name (e.g., 'threading', 'hammer_cleanup') to use task-specific bounds from TASK_SPECIFIC_BOUNDS."
+                "Pass task name (e.g., 'threading', 'mug_cleanup') to select correct voxel bounds."
             )
-        if task not in TASK_SPECIFIC_BOUNDS:
+        if task not in TASK_VOXEL_BOUNDS:
             raise RuntimeError(
-                f"Unknown task '{task}'. Available tasks: {list(TASK_SPECIFIC_BOUNDS.keys())}"
+                f"Unknown task '{task}'. Available tasks: {list(TASK_VOXEL_BOUNDS.keys())}"
             )
 
-        # Convert TASK_SPECIFIC_BOUNDS dict to (pmin, pmax) tuple format
-        self.bounds_pm = bounds_dict_to_tuple(TASK_SPECIFIC_BOUNDS[task])
-        print(f"[MimicGenDLPWrapper] Using task-specific bounds for '{task}': {self.bounds_pm}")
+        bounds_entry = TASK_VOXEL_BOUNDS[task]
+        if bounds_entry is not None:
+            self.bounds_pm = bounds_dict_to_tuple(bounds_entry)
+            print(f"[MimicGenDLPWrapper] Using fixed bounds for '{task}': {self.bounds_pm}")
+        else:
+            self.bounds_pm = None  # per-item: VoxelGridXYZ computes from each frame's data
+            print(f"[MimicGenDLPWrapper] Using per-item bounds for '{task}' (matching training)")
 
         # precompute pixel grids cache
         self._precomputed = {}
@@ -835,8 +849,8 @@ class MimicGenDLPWrapper:
 
     def _voxelize_via_wrapper(self, pts_t: torch.Tensor) -> torch.Tensor:
         """
-        Voxelize points using task-specific fixed bounds from TASK_SPECIFIC_BOUNDS.
-        Uses VoxelGridXYZ with bounds=(pmin, pmax) from the task configuration.
+        Voxelize points using bounds from TASK_VOXEL_BOUNDS.
+        Uses VoxelGridXYZ with bounds=(pmin, pmax) or None for per-item.
         """
         D, H, W = map(int, self.grid_dhw)
 
