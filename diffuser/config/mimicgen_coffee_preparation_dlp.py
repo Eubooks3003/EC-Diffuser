@@ -29,8 +29,8 @@ mode_to_args = {
     'device': 'cuda:0',
     'max_path_length': 760,   # Tmax from pkl
     'max_demos': 200,         # Limit demos for faster iteration (set to None for all)
-    'eval_freq': 20,
-    'eval_backend': 'mimicgen',
+    'eval_freq': 0,
+    'eval_backend': 'none',
     'n_steps_per_epoch': 500,
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
@@ -92,7 +92,7 @@ base = {
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
         'ema_decay': 0.995,
-        'save_freq': 10**9,
+        'save_freq': 10_000,
         'eval_freq': 10**9,
         'sample_freq': 1,
         'n_saves': 2,

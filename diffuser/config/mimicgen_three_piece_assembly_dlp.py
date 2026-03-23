@@ -14,11 +14,11 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'three_piece_assembly',
-    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/three_piece_assembly_d0/three_piece_assembly_d0.pkl',
-    'calib_h5_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/core/three_piece_assembly_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/three_piece_assembly_d0/dlp_ckpt.pt',
+    'override_dataset_path': '/home/ellina/Desktop/data/preprocessed/three_piece_assembly_d0/three_piece_assembly_d0.pkl',
+    'calib_h5_path': '/home/ellina/Desktop/data/3D-DLP-mimicgen-data/core/three_piece_assembly_d0.hdf5',
+    'dlp_ckpt': '/home/ellina/Desktop/data/preprocessed/three_piece_assembly_d0/dlp_ckpt.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/three_piece_assembly_d0/dlp_config.json',
+    'dlp_cfg': '/home/ellina/Desktop/data/preprocessed/three_piece_assembly_d0/dlp_config.json',
     'features_dim': 12,       # Dtok: z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,        # G: pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': True,
@@ -36,7 +36,7 @@ mode_to_args = {
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,
-    "mimicgen_max_steps": 600,
+    "mimicgen_max_steps": 1000,
     "mimicgen_pixel_stride": 1,
     "use_absolute_actions": False,
     'horizon': 16,
