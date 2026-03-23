@@ -27,7 +27,7 @@ mode_to_args = {
     'max_particles': 40,
     'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 483,   # Tmax from new preprocessed pkl
+    'max_path_length': 805,   # Tmax from new preprocessed pkl (E=1000, K=24, D=12)
     'max_demos': 200,
     'eval_freq': 0,
     'eval_backend': 'none',
