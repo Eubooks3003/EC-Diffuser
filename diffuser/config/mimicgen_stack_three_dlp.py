@@ -28,7 +28,7 @@ mode_to_args = {
     'max_particles': 40,
     'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 310,
+    'max_path_length': 313,
     'max_demos': 200,
     'eval_freq': 0,
     'eval_backend': 'none',
