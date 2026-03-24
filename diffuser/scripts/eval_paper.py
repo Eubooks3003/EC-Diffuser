@@ -592,12 +592,14 @@ def main():
     cams = tuple(getattr(cfg, 'mimicgen_cams', ["agentview", "sideview"]))
     pixel_stride = getattr(cfg, 'mimicgen_pixel_stride', 1)
 
-    # Setup video directory
+    # Setup video directory (include ckpt name so different steps don't overwrite)
     video_base_dir = None
+    ckpt_name = os.path.basename(args.ckpt_path).replace(".pt", "")
     if args.save_videos:
         video_base_dir = os.path.join(
             args.output_dir if args.output_dir else os.path.join(os.path.dirname(args.ckpt_path), "eval_results"),
-            "videos"
+            "videos",
+            ckpt_name,
         )
         os.makedirs(video_base_dir, exist_ok=True)
 
@@ -672,7 +674,6 @@ def main():
     }
 
     # Save JSON
-    ckpt_name = os.path.basename(args.ckpt_path).replace(".pt", "")
     output_file = os.path.join(output_dir, f"eval_{ckpt_name}_seeds{'_'.join(map(str, seeds))}.json")
     with open(output_file, "w") as f:
         json.dump(results, f, indent=2, default=lambda x: x if not isinstance(x, np.ndarray) else x.tolist())
