@@ -39,7 +39,7 @@ mode_to_args = {
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,
-    "mimicgen_max_steps": 600,
+    "mimicgen_max_steps": 1000,
     "mimicgen_pixel_stride": 1,
     "use_absolute_actions": False,
     'horizon': 16,

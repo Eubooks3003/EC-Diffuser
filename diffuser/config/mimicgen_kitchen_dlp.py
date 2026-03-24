@@ -13,11 +13,11 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'kitchen',
-    'override_dataset_path': '/home/ellina/Desktop/data/preprocessed/kitchen_d0/kitchen_d0.pkl',
-    'calib_h5_path': '/home/ellina/Desktop/data/3D-DLP-mimicgen-data/core/kitchen_d0.hdf5',
-    'dlp_ckpt': '/home/ellina/Desktop/data/preprocessed/kitchen_d0/dlp_ckpt.pt',
+    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/kitchen_d0/kitchen_d0.pkl',
+    'calib_h5_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/core/kitchen_d0.hdf5',
+    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/kitchen_d0/dlp_ckpt.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/preprocessed/kitchen_d0/dlp_config.json',
+    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/kitchen_d0/dlp_config.json',
     'features_dim': 12,       # Dtok: z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,        # G: pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': True,
@@ -29,8 +29,8 @@ mode_to_args = {
     'device': 'cuda:0',
     'max_path_length': 654,   # Tmax from pkl
     'max_demos': 200,         # Limit demos for faster iteration (set to None for all)
-    'eval_freq': 20,
-    'eval_backend': 'mimicgen',
+    'eval_freq': 0,
+    'eval_backend': 'none',
     'n_steps_per_epoch': 500,
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
@@ -92,7 +92,7 @@ base = {
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
         'ema_decay': 0.995,
-        'save_freq': 10**9,
+        'save_freq': 10_000,
         'eval_freq': 10**9,
         'sample_freq': 1,
         'n_saves': 2,
