@@ -300,7 +300,22 @@ def get_recon_from_dlps(particles, z_bg, latent_rep_model, device, ret_glimpse=F
     visual_features = particles[..., 5:last_dim-1]
     transp = particles[..., last_dim-1]
     with torch.no_grad():
-        decoder_out = latent_rep_model.decode_all(pixel_xy, visual_features, z_bg, transp, z_depth=depth, z_scale=scale_xy)
+        # lpwm-copy DLP.decode_all has signature:
+        #   (z, z_scale, z_features, obj_on, z_depth, z_bg_features, z_ctx, warmup)
+        # dlp2 ObjectDLP.decode_all has signature:
+        #   (z, z_features, z_bg, obj_on, z_depth, noisy, z_scale)
+        model_cls = type(latent_rep_model).__name__
+        model_mod = type(latent_rep_model).__module__ or ""
+        if model_cls == "DLP" and "dlp2" not in model_mod:
+            # lpwm-copy 2D DLP
+            decoder_out = latent_rep_model.decode_all(
+                pixel_xy, scale_xy, visual_features, transp, depth, z_bg, None, warmup=False
+            )
+        else:
+            # dlp2 ObjectDLP (original 2D DLP in EC-Diffuser)
+            decoder_out = latent_rep_model.decode_all(
+                pixel_xy, visual_features, z_bg, transp, z_depth=depth, z_scale=scale_xy
+            )
     recon = decoder_out['rec']
     recon = recon.squeeze(0).cpu().numpy().transpose(1, 2, 0)
     recon = (recon * 255).astype(np.uint8)
