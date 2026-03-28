@@ -362,6 +362,7 @@ def extract_mimicgen_task_name(h5_path):
             "nut_assembly": "nut_assembly",
             "pick_place": "pick_place",
             "square": "square",
+            "stack": "stack",
             "stack_three": "stack_three",
             "kitchen": "kitchen",
             "coffee": "coffee",
@@ -481,7 +482,7 @@ def setup_mimicgen_env(args, use_absolute_actions=True):
     from robomimic.utils import obs_utils as ObsUtils
 
     # --- force the cameras you want ---
-    cam_names = ["agentview", "sideview"]  # robosuite camera names
+    cam_names = list(getattr(args, "mimicgen_cams", ["agentview", "sideview"]))
     env_kwargs["camera_names"] = cam_names
 
     # --- force depth ON (you need this for pointcloud reconstruction) ---
@@ -531,8 +532,10 @@ def setup_mimicgen_env(args, use_absolute_actions=True):
         )
         o = env.reset()
         print([k for k in sorted(o.keys()) if "image" in k or "depth" in k])
-        print("agentview_depth:", o["agentview_depth"].shape, float(o["agentview_depth"].min()), float(o["agentview_depth"].max()))
-        print("sideview_depth:",  o["sideview_depth"].shape,  float(o["sideview_depth"].min()),  float(o["sideview_depth"].max()))
+        for cn in cam_names:
+            dk = f"{cn}_depth"
+            if dk in o:
+                print(f"{dk}:", o[dk].shape, float(o[dk].min()), float(o[dk].max()))
 
         return env
 

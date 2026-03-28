@@ -176,6 +176,8 @@ def main():
     parser.add_argument("--no_random_init", dest="random_init", action="store_false")
     parser.add_argument("--log_every_replan", type=int, default=1,
                         help="Log 3D obs every N replans (1=every replan)")
+    parser.add_argument("--save_video", type=str, default=None,
+                        help="Path to save rollout video (e.g., rollout.mp4)")
     args = parser.parse_args()
 
     # Init wandb
@@ -337,6 +339,18 @@ def main():
     action_idx = 0
     plan_idx = 0
 
+    video_frames = []
+
+    # Switch correction hack (kitchen only): proportional correction when loitering near switch
+    # Only armed after the first flip — the policy handles that on its own.
+    is_kitchen = (task is not None and "kitchen" in task)
+    SWITCH_POS = np.array([-0.1389, 0.0760, 0.9899])
+    LOITER_RADIUS = 0.05   # 5cm
+    LOITER_STEPS = 15
+    SWITCH_GAIN = 0.3
+    loiter_count = 0
+    CORRECTION_ARMED_AFTER = 500
+
     use_gripper_obs = getattr(dataset, 'use_gripper_obs', False)
     use_bg_obs = getattr(dataset, 'use_bg_obs', False)
     obs_start_idx = action_dim + gripper_dim + bg_dim
@@ -416,10 +430,31 @@ def main():
         # Execute action
         a_norm = action_buffer[action_idx]
         a = dataset.normalizer.unnormalize(a_norm[None], "actions")[0]
+
+        # Switch correction (kitchen only): detect loitering and nudge toward switch
+        dist_to_switch = -1.0
+        if is_kitchen:
+            eef_pos = envw.last_gripper_state[:3] if envw.last_gripper_state is not None else None
+            if eef_pos is not None:
+                dist_to_switch = np.linalg.norm(eef_pos - SWITCH_POS)
+                if t > CORRECTION_ARMED_AFTER:
+                    if dist_to_switch < LOITER_RADIUS:
+                        loiter_count += 1
+                    else:
+                        loiter_count = 0
+                    if loiter_count > LOITER_STEPS:
+                        direction = (SWITCH_POS - eef_pos)
+                        direction = direction / (np.linalg.norm(direction) + 1e-8)
+                        a[:3] = direction * 0.5
+                        print(f"  [CORRECTION] t={t} dist={dist_to_switch:.4f} loiter={loiter_count} eef={eef_pos}")
+                if t % 50 == 0 or dist_to_switch < LOITER_RADIUS:
+                    print(f"  t={t} dist_to_switch={dist_to_switch:.4f} loiter={loiter_count} eef={eef_pos}")
+
         action_log.append({
             "t": t, "plan_idx": plan_idx - 1, "action_idx": action_idx,
             "x": float(a[0]), "y": float(a[1]), "z": float(a[2]),
             "grip": float(a[6]) if len(a) > 6 else 0.0,
+            "loiter": loiter_count, "dist_switch": float(dist_to_switch),
         })
 
         # Log per-step action scalars (line charts in wandb)
@@ -434,12 +469,35 @@ def main():
         action_idx += 1
         t += 1
 
+        # Collect video frame
+        if args.save_video:
+            raw_obs = envw.env.get_observation()
+            for cam_key in ["agentview_image", "sideview_image"]:
+                if cam_key in raw_obs:
+                    frame = np.asarray(raw_obs[cam_key])
+                    if frame.ndim == 3 and frame.shape[0] in (1, 3, 4):
+                        frame = np.transpose(frame, (1, 2, 0))
+                    if frame.dtype != np.uint8:
+                        if frame.max() <= 1.0:
+                            frame = (frame * 255).clip(0, 255).astype(np.uint8)
+                        else:
+                            frame = frame.clip(0, 255).astype(np.uint8)
+                    video_frames.append(frame)
+                    break
+
         if info.get("success", False):
             print(f"SUCCESS at t={t}")
             done = True
 
     success = bool(info.get("success", False))
     print(f"\nEpisode done: t={t}, success={success}, replans={plan_idx}")
+
+    # Save video
+    if args.save_video and len(video_frames) > 0:
+        import imageio
+        os.makedirs(os.path.dirname(args.save_video) or '.', exist_ok=True)
+        imageio.mimsave(args.save_video, video_frames, fps=30)
+        print(f"Saved video ({len(video_frames)} frames) to: {args.save_video}")
 
     # Log final observation
     decode_and_log(envw, envw.last_toks, envw.last_bg_features,
