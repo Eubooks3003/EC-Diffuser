@@ -18,7 +18,7 @@ mode_to_args = {
     'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_rgbo/pick_place_d0/dlp_ckpt.pt',
     'dlp_ctor': "voxel_models:DLP",
     'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_rgbo/pick_place_d0/dlp_config.json',
-    'features_dim': 12,       # Dtok: z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
+    'features_dim': 16,       # Dtok: z(3)+scale(3)+depth(1)+obj_on(1)+feat(8)
     'gripper_dim': 10,        # G: pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': True,
     'gripper_state_mask_ratio': 0.0,
@@ -27,7 +27,7 @@ mode_to_args = {
     'max_particles': 40,
     'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 805,   # Tmax from new preprocessed pkl (E=1000, K=24, D=12)
+    'max_path_length': 798,   # Tmax from RGBO preprocessed pkl
     'max_demos': 200,
     'eval_freq': 0,
     'eval_backend': 'none',
