@@ -201,6 +201,7 @@ render_config = utils.Config(
     savepath=(args.savepath, "render_config.pkl"),
     env=None,
     particle_dim=args.features_dim,
+    single_view=(args.input_type == "dlp" and not args.multiview),
 )
 
 dataset = dataset_config()

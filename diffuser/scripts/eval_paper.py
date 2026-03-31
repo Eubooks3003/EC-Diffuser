@@ -52,13 +52,6 @@ import torch
 from datetime import datetime
 from tqdm import tqdm
 
-# Make lpwm-dev importable
-LPWM_DEV = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "lpwm-dev")
-)
-if os.path.isdir(LPWM_DEV) and LPWM_DEV not in sys.path:
-    sys.path.append(LPWM_DEV)
-
 # Add diffuser to path
 DIFFUSER_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if DIFFUSER_ROOT not in sys.path:
@@ -69,9 +62,20 @@ EC_DIFFUSER_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 if EC_DIFFUSER_ROOT not in sys.path:
     sys.path.insert(0, EC_DIFFUSER_ROOT)
 
+# Make lpwm-dev and lpwm-copy importable (siblings of EC-Diffuser)
+_SCRIPT_DIR = os.path.dirname(__file__)
+for _sibling in ("lpwm-dev", "lpwm-copy"):
+    _p = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", _sibling))
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.append(_p)
+    # Also check as sibling of EC-Diffuser directly
+    _p2 = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", _sibling))
+    if os.path.isdir(_p2) and _p2 not in sys.path:
+        sys.path.append(_p2)
 
-def build_dlp_from_cfg(cfg, device, DLPClass):
-    """Build DLP model from config (same as train.py)"""
+
+def build_dlp_3d_from_cfg(cfg, device, DLPClass):
+    """Build a 3D (voxel) DLP model from config."""
     model = DLPClass(
         cdim=cfg["ch"],
         image_size=cfg["voxel_grid_whd"][0],
@@ -119,16 +123,79 @@ def build_dlp_from_cfg(cfg, device, DLPClass):
     return model
 
 
-def load_dlp_lpwm(dlp_cfg_path: str, dlp_ckpt_path: str, device: str):
-    """Load DLP model from lpwm-dev (same as train.py)"""
+def build_dlp_2d_from_cfg(cfg, device, DLPClass):
+    """Build a 2D (image) DLP model from config."""
+    model = DLPClass(
+        cdim=cfg["ch"],
+        image_size=cfg["image_size"],
+        normalize_rgb=cfg.get("normalize_rgb", False),
+        n_kp_per_patch=cfg["n_kp_per_patch"],
+        patch_size=cfg["patch_size"],
+        anchor_s=cfg["anchor_s"],
+        n_kp_enc=cfg["n_kp_enc"],
+        n_kp_prior=cfg["n_kp_prior"],
+        pad_mode=cfg["pad_mode"],
+        dropout=cfg.get("dropout", 0.0),
+        features_dist=cfg.get("features_dist", "gauss"),
+        learned_feature_dim=cfg["learned_feature_dim"],
+        learned_bg_feature_dim=cfg.get("learned_bg_feature_dim", cfg["learned_feature_dim"]),
+        n_fg_categories=cfg.get("n_fg_categories", 8),
+        n_fg_classes=cfg.get("n_fg_classes", 4),
+        n_bg_categories=cfg.get("n_bg_categories", 4),
+        n_bg_classes=cfg.get("n_bg_classes", 4),
+        scale_std=cfg["scale_std"],
+        offset_std=cfg["offset_std"],
+        obj_on_alpha=cfg["obj_on_alpha"],
+        obj_on_beta=cfg["obj_on_beta"],
+        obj_res_from_fc=cfg["obj_res_from_fc"],
+        obj_ch_mult_prior=cfg.get("obj_ch_mult_prior", cfg["obj_ch_mult"]),
+        obj_ch_mult=cfg["obj_ch_mult"],
+        obj_base_ch=cfg["obj_base_ch"],
+        obj_final_cnn_ch=cfg["obj_final_cnn_ch"],
+        bg_res_from_fc=cfg["bg_res_from_fc"],
+        bg_ch_mult=cfg["bg_ch_mult"],
+        bg_base_ch=cfg["bg_base_ch"],
+        bg_final_cnn_ch=cfg["bg_final_cnn_ch"],
+        use_resblock=cfg["use_resblock"],
+        num_res_blocks=cfg["num_res_blocks"],
+        cnn_mid_blocks=cfg.get("cnn_mid_blocks", False),
+        mlp_hidden_dim=cfg.get("mlp_hidden_dim", 256),
+        pint_enc_layers=cfg["pint_enc_layers"],
+        pint_enc_heads=cfg["pint_enc_heads"],
+        timestep_horizon=1,
+    ).to(device)
+    model.eval()
+    return model
+
+
+def load_dlp_lpwm(dlp_cfg_path: str, dlp_ckpt_path: str, device: str,
+                   dlp_ctor: str = "voxel_models:DLP"):
+    """
+    Load a DLP model (3D or 2D) based on dlp_ctor.
+
+    dlp_ctor format: "module:ClassName"
+      - "voxel_models:DLP"  -> 3D DLP from lpwm-dev
+      - "models:DLP"        -> 2D DLP from lpwm-copy
+    """
     from utils.util_func import get_config
-    from utils.log_utils import load_checkpoint
-    from voxel_models import DLP as DLPClass
 
     dev = torch.device(device)
     cfg = get_config(dlp_cfg_path)
-    model = build_dlp_from_cfg(cfg, dev, DLPClass)
-    _ = load_checkpoint(dlp_ckpt_path, model, None, None, map_location=dev)
+
+    is_2d = "voxel" not in dlp_ctor.lower()
+
+    if is_2d:
+        from models import DLP as DLPClass
+        model = build_dlp_2d_from_cfg(cfg, dev, DLPClass)
+        model.load_state_dict(
+            torch.load(dlp_ckpt_path, map_location=dev, weights_only=False)
+        )
+    else:
+        from utils.log_utils import load_checkpoint
+        from voxel_models import DLP as DLPClass
+        model = build_dlp_3d_from_cfg(cfg, dev, DLPClass)
+        _ = load_checkpoint(dlp_ckpt_path, model, None, None, map_location=dev)
+
     model.eval()
     return model, cfg
 
@@ -147,6 +214,91 @@ def _to_uint8(img):
         else:
             img = np.clip(img, 0, 255).astype(np.uint8)
     return img
+
+
+def _color_map(n=64):
+    """Generate a distinct color map for keypoints (similar to lpwm-dev)."""
+    import colorsys
+    colors = []
+    for i in range(n):
+        hue = i / n
+        rgb = colorsys.hsv_to_rgb(hue, 0.9, 0.95)
+        colors.append([int(c * 255) for c in rgb])
+    return np.array(colors, dtype=np.uint8)
+
+
+def _overlay_keypoints_on_frame(frame, toks, cam_idx=0, n_kp_per_view=None,
+                                 kp_range=(-1, 1), radius=3, thickness=2):
+    """
+    Draw DLP keypoints on a camera frame.
+
+    DLP convention (matching lpwm-dev plot_keypoints_on_image):
+      z[:, 0] -> row (height axis)
+      z[:, 1] -> col (width axis)
+    cv2.circle takes (col, row) i.e. (x, y).
+
+    Args:
+        frame: (H, W, 3) uint8 image
+        toks: (K_total, Dtok) token array from envw.last_toks.
+              2D token layout: [z(2), z_scale(2), z_depth(1), obj_on(1), z_features(F)]
+              3D token layout: [z(3), z_scale(3), z_depth(1), obj_on(1), z_features(F)]
+              For 2D multiview: K_total = n_views * K_per_view, tokens concatenated.
+        cam_idx: which camera view (0, 1, ...) to extract keypoints for
+        n_kp_per_view: number of keypoints per view (set for 2D multiview).
+        kp_range: range of keypoint coordinates (default [-1, 1])
+        radius: circle radius
+        thickness: circle thickness (-1 for filled)
+    """
+    import cv2
+
+    if toks is None:
+        return frame
+
+    frame = frame.copy()
+    h, w = frame.shape[:2]
+
+    # Determine which tokens belong to this camera view
+    if n_kp_per_view is not None and n_kp_per_view > 0:
+        start = cam_idx * n_kp_per_view
+        end = start + n_kp_per_view
+        view_toks = toks[start:end]
+        is_2d = True
+    else:
+        view_toks = toks
+        is_2d = False
+
+    # z positions: first 2 for 2D, first 3 for 3D (only use first 2 for image overlay)
+    z = view_toks[:, :2]  # (K, 2) — z[:,0]=row, z[:,1]=col in kp_range
+
+    # obj_on index depends on layout:
+    #   2D: [z(2), scale(2), depth(1), obj_on(1), feat(F)] -> idx 5
+    #   3D: [z(3), scale(3), depth(1), obj_on(1), feat(F)] -> idx 7
+    obj_on_idx = 5 if is_2d else 7
+    dtok = view_toks.shape[-1]
+    if obj_on_idx < dtok:
+        obj_on = view_toks[:, obj_on_idx]
+    else:
+        obj_on = np.ones(len(view_toks))
+
+    # Convert from kp_range to pixel coordinates
+    # z[:,0] is row -> maps to image height
+    # z[:,1] is col -> maps to image width
+    lo, hi = kp_range
+    row_px = ((z[:, 0] - lo) / (hi - lo) * (h - 1))
+    col_px = ((z[:, 1] - lo) / (hi - lo) * (w - 1))
+
+    cmap = _color_map(len(view_toks))
+
+    for i in range(len(view_toks)):
+        alpha = float(np.clip(obj_on[i], 0, 1))
+        if alpha < 0.05:
+            continue  # skip inactive keypoints
+        cx = int(np.clip(round(col_px[i]), 0, w - 1))
+        cy = int(np.clip(round(row_px[i]), 0, h - 1))
+        color = tuple(int(c) for c in cmap[i])
+        cv2.circle(frame, (cx, cy), radius, color, thickness)
+
+    return frame
 
 
 @torch.no_grad()
@@ -168,10 +320,10 @@ def run_eval_rollouts(
     video_dir=None,
     video_episodes=5,
     video_fps=20,
-    video_cams=("agentview",),
 ):
     """
     Run evaluation rollouts (simplified version of eval_mimicgen_rollouts).
+    Saves one keypoint-overlay video per camera view per episode.
     Returns list of success booleans for each episode.
     """
     from diffuser.envs.mimicgen_dlp_wrapper import MimicGenDLPWrapper
@@ -229,17 +381,30 @@ def run_eval_rollouts(
         ep_ret = 0.0
         done = False
 
-        # Video frame collection
+        # Video frame collection — one list per camera, keypoints overlaid
         record_this_episode = save_videos and ep < video_episodes
-        frames = [] if record_this_episode else None
+        # Record ALL cams (not just video_cams) so we get every training view
+        rec_cams = list(cams)
+        frames_per_cam = {cam: [] for cam in rec_cams} if record_this_episode else None
+
+        # Determine n_kp_per_view for multiview 2D DLP
+        n_kp_per_view = None
+        if hasattr(envw, '_is_2d_dlp') and envw._is_2d_dlp() and len(cams) > 1:
+            if hasattr(envw, 'last_toks') and envw.last_toks is not None:
+                n_kp_per_view = envw.last_toks.shape[0] // len(cams)
 
         # Capture initial frame
         if record_this_episode and hasattr(envw, 'last_raw_obs'):
             raw_obs = envw.last_raw_obs
-            for cam in video_cams:
+            toks = envw.last_toks if hasattr(envw, 'last_toks') else None
+            for ci, cam in enumerate(rec_cams):
                 k = f"{cam}_image"
                 if k in raw_obs:
-                    frames.append(_to_uint8(raw_obs[k]))
+                    f_raw = _to_uint8(raw_obs[k])
+                    frames_per_cam[cam].append(_overlay_keypoints_on_frame(
+                        f_raw, toks, cam_idx=ci,
+                        n_kp_per_view=n_kp_per_view,
+                    ))
 
         # Action chunking setup
         action_buffer = None
@@ -302,7 +467,7 @@ def run_eval_rollouts(
                 # Zero goal at H-1 would force mean-state at every denoising step,
                 # distorting predictions for a model that was never trained with it.
                 cond = {
-                    0: torch.from_numpy(obs_norm).float().to(device),
+                    0: torch.from_numpy(obs_norm[None]).float().to(device),
                 }
 
                 # Sample trajectory from diffusion model
@@ -317,13 +482,26 @@ def run_eval_rollouts(
 
             obs_vec, r, done, info = envw.step(a)
 
+            # Debug: print info keys and success-related values (first episode only)
+            if ep == 0 and t <= 3:
+                succ_keys = {k: info[k] for k in info if 'success' in k.lower() or 'task' in k.lower() or 'done' in k.lower()}
+                print(f"  [dbg] t={t} done={done} r={r:.4f} info_keys={list(info.keys())} succ_related={succ_keys}")
+
             # Capture frame for video
             if record_this_episode and hasattr(envw, 'last_raw_obs'):
                 raw_obs = envw.last_raw_obs
-                for cam in video_cams:
+                toks = envw.last_toks if hasattr(envw, 'last_toks') else None
+                if n_kp_per_view is None and toks is not None:
+                    if hasattr(envw, '_is_2d_dlp') and envw._is_2d_dlp() and len(cams) > 1:
+                        n_kp_per_view = toks.shape[0] // len(cams)
+                for ci, cam in enumerate(rec_cams):
                     k = f"{cam}_image"
                     if k in raw_obs:
-                        frames.append(_to_uint8(raw_obs[k]))
+                        f_raw = _to_uint8(raw_obs[k])
+                        frames_per_cam[cam].append(_overlay_keypoints_on_frame(
+                            f_raw, toks, cam_idx=ci,
+                            n_kp_per_view=n_kp_per_view,
+                        ))
 
             action_idx += 1
             ep_ret += float(r)
@@ -340,15 +518,18 @@ def run_eval_rollouts(
         lengths.append(t)
         pbar.set_postfix(sr=f"{np.mean(successes)*100:.0f}%", succ=sum(successes))
 
-        # Save video for this episode
-        if record_this_episode and frames and video_dir is not None:
+        # Save one kp-overlay video per camera
+        if record_this_episode and video_dir is not None:
             import imageio
             status = "success" if success else "fail"
-            video_path = os.path.join(video_dir, f"seed{seed}_ep{ep:02d}_{status}.mp4")
-            try:
-                imageio.mimsave(video_path, frames, fps=video_fps)
-            except Exception:
-                pass
+            for cam in rec_cams:
+                cam_frames = frames_per_cam[cam]
+                if cam_frames:
+                    vpath = os.path.join(video_dir, f"seed{seed}_ep{ep:02d}_{status}_{cam}_kp.mp4")
+                    try:
+                        imageio.mimsave(vpath, cam_frames, fps=video_fps)
+                    except Exception:
+                        pass
 
     # Close environment after all episodes
     try:
@@ -454,8 +635,20 @@ def main():
         raise RuntimeError("Config must have 'dlp_cfg'")
 
     # Load DLP model
-    print("Loading DLP model...")
-    dlp_model, dlp_cfg = load_dlp_lpwm(dlp_cfg_path, dlp_ckpt, cfg.device)
+    dlp_ctor = getattr(cfg, 'dlp_ctor', 'voxel_models:DLP')
+    is_2d_dlp = "voxel" not in dlp_ctor.lower()
+    print(f"Loading DLP model (dlp_ctor={dlp_ctor}, is_2d={is_2d_dlp})...")
+    dlp_model, dlp_cfg = load_dlp_lpwm(dlp_cfg_path, dlp_ckpt, cfg.device, dlp_ctor=dlp_ctor)
+
+    # For 2D DLP: override camera resolution to match preprocessing (84x84).
+    # The 2D DLP was trained on 84x84 images (from preprocess_mimicgen_multiview.py).
+    # Rendering at a different resolution (e.g. 256x256) and downsampling to the DLP's
+    # image_size produces a different image distribution, causing OOD observations
+    # and degraded policy performance.
+    if is_2d_dlp:
+        cfg.mimicgen_camera_width = 84
+        cfg.mimicgen_camera_height = 84
+        print(f"[2D DLP] Overriding camera resolution to 84x84 (matching preprocessing)")
 
     # Load dataset
     print("Loading dataset...")
@@ -489,6 +682,17 @@ def main():
     action_dim = dataset.action_dim
     gripper_dim = getattr(dataset, 'gripper_dim', 0)
     bg_dim = getattr(dataset, 'bg_dim', 0)
+
+    # The "singleview" models were trained on both views' particle tokens
+    # (meta['K']=40 prevented buffer slicing). If the model expects more
+    # particles than a single camera provides, update cfg so the env is
+    # created with both cameras.
+    n_kp_per_cam = getattr(dlp_cfg, 'n_kp_enc', 20)
+    n_particles_expected = observation_dim // cfg.features_dim
+    if n_particles_expected > n_kp_per_cam and len(getattr(cfg, 'mimicgen_cams', [])) == 1:
+        print(f"[eval] Model expects {n_particles_expected} particles but 1 camera "
+              f"produces {n_kp_per_cam}. Overriding to use both cameras.")
+        cfg.mimicgen_cams = ["agentview", "sideview"]
 
     model_config = utils.Config(
         cfg.model,
@@ -627,7 +831,6 @@ def main():
             video_dir=video_dir,
             video_episodes=args.video_episodes,
             video_fps=args.video_fps,
-            video_cams=cams[:1],  # Use first camera for videos
         )
         all_results.append(result)
 

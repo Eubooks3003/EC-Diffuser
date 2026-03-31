@@ -151,6 +151,15 @@ class ReplayBuffer:
                         # (Your dataset is already single-view K=64.)
                         pass
 
+            # Single-view: slice bg_features to keep only the first view
+            if single_view and key == 'bg_features':
+                if isinstance(val, np.ndarray) and val.ndim == 3:
+                    # val: (E, T, bg_dim) where bg_dim = bg_per_view * num_views
+                    bg_total = val.shape[-1]
+                    if bg_total % 2 == 0:
+                        bg_per_view = bg_total // 2
+                        val = val[:, :, :bg_per_view]
+
             if key == 'path_lengths':
                 self._dict[key] = val.astype(np.int32)
             else:

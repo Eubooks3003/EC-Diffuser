@@ -67,20 +67,21 @@ class ParticleRenderer:
         self.require_bg = True
         self.single_view = single_view
     
-    def render(self, particles, front_bg, side_bg, ret_glimpse=False):
+    def render(self, particles, front_bg, side_bg, ret_glimpse=False, **kwargs):
         if self.env is None:
             latent_rep_model = self.latent_rep_model
             device='cuda'
         else:
             latent_rep_model = self.env.latent_rep_model
             device = self.env.device
+
         particles = particles.reshape(1, -1, self.particle_dim)
         if self.single_view:
             particles = particles[:, :particles.shape[1], :]
         else:
             front_particles = particles[:, :particles.shape[1]//2, :]
             side_particles = particles[:, particles.shape[1]//2:, :]
-        
+
         if ret_glimpse:
             front_image, glimpse_image = get_recon_from_dlps(front_particles, front_bg, latent_rep_model, device, ret_glimpse=ret_glimpse)
             final_image = np.concatenate([front_image, glimpse_image], axis=0)
@@ -93,17 +94,45 @@ class ParticleRenderer:
                 side_image = get_recon_from_dlps(side_particles, side_bg, latent_rep_model, device)
                 final_image = np.concatenate([front_image, side_image], axis=0)
         return final_image
-    
-    def renders(self, samples, front_bg, side_bg, **kwargs):
+
+    def renders(self, samples, front_bg, side_bg, bg_features_seq=None, **kwargs):
+        """Render a sequence of timesteps.
+
+        Args:
+            samples: (horizon, obs_dim) particle observations per timestep
+            front_bg: fallback front bg features (may be None)
+            side_bg: fallback side bg features (may be None)
+            bg_features_seq: (horizon, bg_dim) per-timestep bg features from trajectory
+        """
         sample_images = []
-        for sample in samples:
-            sample_images.append(self.render(sample, front_bg, side_bg, **kwargs))
+        bg_per_view = None
+        if bg_features_seq is not None and len(bg_features_seq.shape) >= 1:
+            if self.single_view:
+                bg_per_view = bg_features_seq.shape[-1]
+            else:
+                bg_per_view = bg_features_seq.shape[-1] // 2
+
+        for t, sample in enumerate(samples):
+            fb, sb = front_bg, side_bg
+            if bg_features_seq is not None and bg_per_view is not None:
+                fb = bg_features_seq[t, :bg_per_view]
+                sb = bg_features_seq[t, bg_per_view:] if not self.single_view else None
+            sample_images.append(self.render(sample, fb, sb, **kwargs))
         return np.concatenate(sample_images, axis=1)
 
-    def composite(self, savepath, paths, front_bg, side_bg, **kwargs):
+    def composite(self, savepath, paths, front_bg=None, side_bg=None,
+                  bg_features_seq=None, **kwargs):
+        """Render multiple trajectories.
+
+        Args:
+            paths: (batch, horizon, obs_dim) observations
+            bg_features_seq: (batch, horizon, bg_dim) bg features, or None
+        """
         images = []
-        for path in paths:
-            img = self.renders(to_np(path), front_bg, side_bg, **kwargs)
+        for i, path in enumerate(paths):
+            bg_seq_i = bg_features_seq[i] if bg_features_seq is not None else None
+            img = self.renders(to_np(path), front_bg, side_bg,
+                               bg_features_seq=bg_seq_i, **kwargs)
             images.append(img)
         images = np.concatenate(images, axis=0)
 

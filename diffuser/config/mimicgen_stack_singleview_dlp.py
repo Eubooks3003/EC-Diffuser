@@ -23,17 +23,17 @@ mode_to_args = {
     'gripper_dim': 10,
     'use_gripper_obs': True,
     'gripper_state_mask_ratio': 0.0,
-    'bg_dim': 8,              # BG: 4 per view × 2 views
+    'bg_dim': 4,              # BG: 4 per view × 1 view
     'use_bg_obs': True,
-    'max_particles': 40,
-    'multiview': True,
+    'max_particles': 20,
+    'multiview': False,
     'device': 'cuda:0',
     'max_path_length': 131,
     'max_demos': 200,
     'eval_freq': 0,
     'eval_backend': 'none',
     'n_steps_per_epoch': 500,
-    "mimicgen_cams": ["agentview", "sideview"],
+    "mimicgen_cams": ["agentview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,
     "mimicgen_max_steps": 500,
@@ -82,7 +82,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_stack/',
+        'prefix': 'diffusion/mimicgen_stack_singleview/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -127,7 +127,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_stack/',
+        'prefix': 'plans/mimicgen_stack_singleview/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

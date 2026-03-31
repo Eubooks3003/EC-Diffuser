@@ -13,34 +13,34 @@ logbase = 'data'
 # With your tokens: --num_entity 64 --input_type dlp  =>  "64C_dlp"
 mode_to_args = {
   '16C_dlp': {
-    'dataset': 'stack',
-    'override_dataset_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_d0/stack_d0.pkl',
-    'calib_h5_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/core/stack_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_d0/dlp_ckpt.pt',
+    'dataset': 'stack_three',
+    'override_dataset_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_three_d0/stack_three_d0.pkl',
+    'calib_h5_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/core/stack_three_d0.hdf5',
+    'dlp_ckpt': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_three_d0/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_d0/dlp_config.json',
+    'dlp_cfg': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_three_d0/dlp_config.json',
     'features_dim': 10,       # Dtok: z(2)+scale(2)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,
     'use_gripper_obs': True,
     'gripper_state_mask_ratio': 0.0,
-    'bg_dim': 8,              # BG: 4 per view × 2 views
+    'bg_dim': 4,              # BG: 4 per view × 1 view
     'use_bg_obs': True,
-    'max_particles': 40,
-    'multiview': True,
+    'max_particles': 20,
+    'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 131,
+    'max_path_length': 310,
     'max_demos': 200,
     'eval_freq': 0,
     'eval_backend': 'none',
     'n_steps_per_epoch': 500,
-    "mimicgen_cams": ["agentview", "sideview"],
+    "mimicgen_cams": ["agentview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,
-    "mimicgen_max_steps": 500,
-    "mimicgen_pixel_stride": 1,
+    "mimicgen_max_steps":600,
+    "mimicgen_pixel_stride": 1, 
     "use_absolute_actions": False,
-    'horizon': 16,
-    'exe_steps': 8,
+    'horizon': 24,
+    'exe_steps': 6,
     "random_init": True,
     "random_init_eval": True,
   },
@@ -82,13 +82,13 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_stack/',
+        'prefix': 'diffusion/mimicgen_stack_three_singleview/',
         'exp_name': watch(args_to_watch),
 
         # training
         'n_steps_per_epoch': 200,
         'loss_type': 'l1',
-        'n_train_steps': 2e6,    
+        'n_train_steps': 2e6,
         'batch_size': 16,
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
@@ -127,7 +127,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_stack/',
+        'prefix': 'plans/mimicgen_stack_three_singleview/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

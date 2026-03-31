@@ -14,23 +14,25 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'hammer_cleanup',
-    'override_dataset_path': '/home/ubuntu/ellina/data/mimicgen/hammer_cleanup_d0/core/200_traj_with_gripper_and_bg.pkl',
-    'calib_h5_path': '/home/ubuntu/ellina/data/mimicgen/hammer_cleanup_d0/core/hammer_cleanup_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/ellina/data/mimicgen/hammer_cleanup_d0/core/dlp_ckpt/best.pt',
-    'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': "/home/ubuntu/ellina/data/mimicgen/hammer_cleanup_d0/core/dlp_ckpt/hparams.json",
-    'features_dim': 12,
+    'override_dataset_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/hammer_cleanup_d0/hammer_cleanup_d0.pkl',
+    'calib_h5_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/core/hammer_cleanup_d0.hdf5',
+    'dlp_ckpt': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/hammer_cleanup_d0/dlp_ckpt.pt',
+    'dlp_ctor': "models:DLP",
+    'dlp_cfg': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/hammer_cleanup_d0/dlp_config.json',
+    'features_dim': 10,       # Dtok: z(2)+scale(2)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,
-    'use_gripper_obs': True,  # Enable gripper state as model input
-    'bg_dim': 2,
-    'use_bg_obs': True,  # Enable background features as model input
-    'max_particles': 16,
-    'multiview': False,
+    'use_gripper_obs': True,
+    'gripper_state_mask_ratio': 0.0,
+    'bg_dim': 8,              # BG: 4 per view × 2 views
+    'use_bg_obs': True,
+    'max_particles': 40,
+    'multiview': True,
+    'max_demos': 200,
     'device': 'cuda:0',
     'max_path_length': 323,
     'env_config_dir': 'env_config/n_cubes',
-    'eval_freq': 20,
-    'eval_backend': 'mimicgen',
+    'eval_freq': 0,
+    'eval_backend': 'none',
     'n_steps_per_epoch': 500,
     "mimicgen_cams": ["agentview", "sideview"],
     "mimicgen_camera_width": 256,
@@ -79,7 +81,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_stack/',
+        'prefix': 'diffusion/mimicgen_hammer_cleanup/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -90,7 +92,7 @@ base = {
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
         'ema_decay': 0.995,
-        'save_freq': 10**9,
+        'save_freq': 10_000,
         'eval_freq': 10**9,
         'sample_freq': 1,
         'n_saves': 2,
@@ -99,7 +101,7 @@ base = {
         'bucket': None,
         'device': 'cuda:0',
         'seed': 0,
-        'renderer': 'utils.ParticleRenderer3D',
+        'renderer': 'utils.ParticleRenderer',
         'predict_epsilon': False,
         'env_config_dir': 'env_config/n_cubes',
 
@@ -124,7 +126,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_stack/',
+        'prefix': 'plans/mimicgen_hammer_cleanup/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

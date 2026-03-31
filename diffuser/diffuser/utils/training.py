@@ -10,7 +10,10 @@ from .timer import Timer
 from .cloud import sync_logs
 import wandb
 from tqdm import tqdm
-from dlp_utils import log_rgb_voxels
+try:
+    from dlp_utils import log_rgb_voxels
+except ImportError:
+    log_rgb_voxels = None
 
 def cycle(dl):
     while True:
@@ -284,7 +287,7 @@ class Trainer(object):
         normed_observations = trajectories[:, :, obs_start_idx:]
         observations = self.dataset.normalizer.unnormalize(normed_observations, 'observations')
 
-        savepath = os.path.join(self.logdir, f'_sample-reference.ply')
+        savepath = os.path.join(self.logdir, f'_sample-reference.png')
         self.renderer.composite(
             savepath, observations,
             front_bg=front_bg, side_bg=side_bg,
@@ -535,177 +538,6 @@ class Trainer(object):
             obs_vec = envw.reset()
             # envw.print_params_like_h5_script(envw.last_raw_obs)   
 
-            if render_debug and renderer_3d is not None:
-                # _render_tokens_debug(tag=f"ep_{ep:02d}/reset_obs", obs_vec_flat=obs_vec, horizon_step=0)
-
-                vox = envw.last_vox  # np [C,D,H,W]
-                print("GT VOX: ", vox.shape )
-                    # avg_rgb
-                log_rgb_voxels(
-                    name=f"eval_debug/ep_{ep:02d}/gt_vox_rgb",
-                    rgb_vol=vox,          # [3,D,H,W]
-                    alpha_vol=None,
-                    KPx=None,
-                    step=int(200),
-                    mode="splat",
-                    topk=60000,
-                    alpha_thresh=0.05,
-                    pad=2.0,
-                    show_axes=True,
-                )
-
-                # ====== LIVE vs PREPROCESSED COMPARISON (same initial state!) ======
-                if goal_provider is not None and hasattr(goal_provider, 'get_first_frame_tokens'):
-                    preproc_toks = goal_provider.get_first_frame_tokens()  # (K, Dtok) from pkl
-                    # live_toks = envw.last_toks if envw.last_toks is not None else obs_vec.reshape(16, 12)
-                    if envw.last_toks is not None:
-                        live_toks = envw.last_toks
-                        print(f" Using last_toks from envw")
-                    else:
-                        K, Dtok = preproc_toks.shape
-                        live_toks = obs_vec.reshape(K, Dtok)
-                        print(f" Reshaping to ({K}, {Dtok})")
-
-                    print(f"\n[LIVE vs PREPROCESSED - SAME INITIAL STATE]")
-                    print(f"  Preprocessed tokens: range=[{preproc_toks.min():.4f}, {preproc_toks.max():.4f}], mean={preproc_toks.mean():.4f}, std={preproc_toks.std():.4f}")
-                    print(f"  Live tokens:         range=[{live_toks.min():.4f}, {live_toks.max():.4f}], mean={live_toks.mean():.4f}, std={live_toks.std():.4f}")
-
-                    diff = np.abs(preproc_toks - live_toks)
-                    print(f"  DIFF: max={diff.max():.4f}, mean={diff.mean():.4f}, std={diff.std():.4f}")
-
-                    if diff.max() > 0.1:
-                        print(f"  *** SIGNIFICANT MISMATCH DETECTED ***")
-                        # Per-dimension breakdown
-                        dim_names = ["z_x", "z_y", "z_z", "scale_x", "scale_y", "scale_z", "depth", "obj_on", "feat_0", "feat_1", "feat_2", "feat_3"]
-                        print(f"  Per-dimension diff (all 12 dims):")
-                        for d in range(min(len(dim_names), preproc_toks.shape[1])):
-                            p_col = preproc_toks[:, d]
-                            l_col = live_toks[:, d]
-                            col_diff = np.abs(p_col - l_col)
-                            print(f"    {dim_names[d]:8s}: preproc=[{p_col.min():7.3f}, {p_col.max():7.3f}] live=[{l_col.min():7.3f}, {l_col.max():7.3f}] diff_max={col_diff.max():.4f}")
-                    else:
-                        print(f"  ✓ Tokens match well!")
-
-                    # ====== VISUAL COMPARISON: Decode both token sets to voxels ======
-                    if renderer_3d is not None and hasattr(renderer_3d, 'render_volume'):
-                        try:
-                            import torch
-                            # Get bg_features for full reconstruction visualization
-                            bg_features = envw.last_bg_features if hasattr(envw, 'last_bg_features') else None
-
-                            # Decode preprocessed tokens to voxels (with bg_features for full reconstruction)
-                            preproc_dec = renderer_3d.render_volume(preproc_toks, bg_features=bg_features)
-                            preproc_fg = preproc_dec['fg_only']
-                            preproc_rec = preproc_dec['rec_rgb']
-                            preproc_bg = preproc_dec.get('bg_only')
-                            log_rgb_voxels(
-                                name=f"eval_debug/ep_{ep:02d}/preproc_decoded_fg",
-                                rgb_vol=preproc_fg.cpu().numpy(),
-                                alpha_vol=None, KPx=None,
-                                step=int(200 + ep),
-                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                            )
-                            log_rgb_voxels(
-                                name=f"eval_debug/ep_{ep:02d}/preproc_decoded_rec",
-                                rgb_vol=preproc_rec.cpu().numpy(),
-                                alpha_vol=None, KPx=None,
-                                step=int(200 + ep),
-                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                            )
-                            # Log background-only if available
-                            if preproc_bg is not None:
-                                log_rgb_voxels(
-                                    name=f"eval_debug/ep_{ep:02d}/preproc_decoded_bg",
-                                    rgb_vol=preproc_bg.cpu().numpy(),
-                                    alpha_vol=None, KPx=None,
-                                    step=int(200 + ep),
-                                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                                )
-
-                            # Decode live tokens to voxels (with bg_features for full reconstruction)
-                            live_dec = renderer_3d.render_volume(live_toks, bg_features=bg_features)
-                            live_fg = live_dec['fg_only']
-                            live_rec = live_dec['rec_rgb']
-                            live_bg = live_dec.get('bg_only')
-                            log_rgb_voxels(
-                                name=f"eval_debug/ep_{ep:02d}/live_decoded_fg",
-                                rgb_vol=live_fg.cpu().numpy(),
-                                alpha_vol=None, KPx=None,
-                                step=int(200 + ep),
-                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                            )
-                            log_rgb_voxels(
-                                name=f"eval_debug/ep_{ep:02d}/live_decoded_rec",
-                                rgb_vol=live_rec.cpu().numpy(),
-                                alpha_vol=None, KPx=None,
-                                step=int(200 + ep),
-                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                            )
-                            # Log background-only if available
-                            if live_bg is not None:
-                                log_rgb_voxels(
-                                    name=f"eval_debug/ep_{ep:02d}/live_decoded_bg",
-                                    rgb_vol=live_bg.cpu().numpy(),
-                                    alpha_vol=None, KPx=None,
-                                    step=int(200 + ep),
-                                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                                )
-
-                            decoded_vox = envw.decoded_vox
-                            log_rgb_voxels(
-                                name=f"eval_debug/ep_{ep:02d}/decoded_vox",
-                                rgb_vol=decoded_vox.cpu().numpy(),
-                                alpha_vol=None, KPx=None,
-                                step=int(200 + ep),
-                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                            )
-
-                            vox = envw.vox
-                            log_rgb_voxels(
-                                name=f"eval_debug/ep_{ep:02d}/vox_from_encode",
-                                rgb_vol=vox.cpu().numpy(),
-                                alpha_vol=None, KPx=None,
-                                step=int(200 + ep),
-                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                            )
-
-                            # Also log the raw GT voxels from simulator for comparison
-                            # (already logged above as gt_vox_rgb, but log again here for side-by-side)
-                            log_rgb_voxels(
-                                name=f"eval_debug/ep_{ep:02d}/gt_vox_from_sim",
-                                rgb_vol=vox,
-                                alpha_vol=None, KPx=None,
-                                step=int(200 + ep),
-                                mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                            )
-                            print(f"  [VISUAL DEBUG] Logged decoded voxels for preproc and live tokens")
-                        except Exception as e:
-                            print(f"  [VISUAL DEBUG] Failed to render token comparison: {e}")
-                    # ====== END VISUAL COMPARISON ======
-                # ====== END LIVE vs PREPROCESSED ======
-
-                # ====== TOKEN DISTRIBUTION DIAGNOSTIC ======
-                if hasattr(envw, 'goal_vec') and envw.goal_vec is not None:
-                    K_goal = self.dataset.fields.observations.shape[2]
-                    Dtok_goal = self.dataset.fields.observations.shape[3]
-                    goal_toks = envw.goal_vec.reshape(K_goal, Dtok_goal)  # (K, Dtok)
-                    obs_toks = envw.last_toks if envw.last_toks is not None else obs_vec.reshape(K_goal, Dtok_goal)
-                    print(f"\n[TOKEN DISTRIBUTION DIAGNOSTIC]")
-                    print(f"  Goal tokens (from dataset):  range=[{goal_toks.min():.4f}, {goal_toks.max():.4f}], mean={goal_toks.mean():.4f}, std={goal_toks.std():.4f}")
-                    print(f"  Obs tokens (live encoded):   range=[{obs_toks.min():.4f}, {obs_toks.max():.4f}], mean={obs_toks.mean():.4f}, std={obs_toks.std():.4f}")
-
-                    # Check per-dimension statistics
-                    print(f"  Per-dimension comparison (first 4 dims):")
-                    for d in range(min(4, goal_toks.shape[1])):
-                        g_col = goal_toks[:, d]
-                        o_col = obs_toks[:, d]
-                        print(f"    dim {d}: goal=[{g_col.min():.3f}, {g_col.max():.3f}] obs=[{o_col.min():.3f}, {o_col.max():.3f}]")
-                # ====== END TOKEN DIAGNOSTIC ======
-
-                # if you want to also see the goal:
-                # if getattr(envw, "goal_vec", None) is not None:
-                #     _render_tokens_debug(tag=f"ep_{ep:02d}/reset_goal", obs_vec_flat=envw.goal_vec, horizon_step=0)
-
             ep_ret = 0.0
             plan_idx = 0  # track how many times we've replanned this episode
             frames = []
@@ -797,87 +629,7 @@ class Trainer(object):
                     if t < 10:  # Show full planned trajectory for first few plans
                         print(f"  Planned Z trajectory (normalized): {[f'{action_buffer[i, 2]:.3f}' for i in range(min(5, action_buffer.shape[0]))]}")
 
-                    # ====== LOG IMAGINED STATES ======
-                    # Decode and visualize the diffuser's predicted future observations
-                    if log_imagined_states and renderer_3d is not None and ep == log_imagined_episode and plan_idx == log_imagined_plan_idx:
-                        print(f"\n[IMAGINED STATES] Logging decoded predictions for ep={ep}, plan={plan_idx}")
-                        # Extract predicted observations (skip action_dim + gripper_dim + bg_dim)
-                        obs_start_idx = a_dim + gripper_dim + bg_dim
-                        pred_obs_norm = traj[:, obs_start_idx:].detach().cpu().numpy()  # (H, obs_dim)
-                        # Unnormalize observations
-                        pred_obs = self.dataset.normalizer.unnormalize(pred_obs_norm, "observations")  # (H, obs_dim)
-
-                        # Extract bg_features from trajectory if available
-                        pred_bg_features = None
-                        if use_bg_obs and bg_dim > 0:
-                            bg_start_idx = a_dim + gripper_dim
-                            bg_end_idx = bg_start_idx + bg_dim
-                            pred_bg_norm = traj[:, bg_start_idx:bg_end_idx].detach().cpu().numpy()  # (H, bg_dim)
-                            pred_bg_features = self.dataset.normalizer.unnormalize(pred_bg_norm, "bg_features")  # (H, bg_dim)
-
-                        # ====== DIAGNOSTIC: Check for clipping and roundtrip loss ======
-                        H = pred_obs.shape[0]
-                        t0_normalized = pred_obs_norm[0]
-                        print(f"  [DIAG] t=0 normalized range: [{t0_normalized.min():.4f}, {t0_normalized.max():.4f}]")
-                        print(f"  [DIAG] t=0 would be clipped: {t0_normalized.max() > 1.0001 or t0_normalized.min() < -1.0001}")
-
-                        # Check a later timestep for comparison
-                        mid_t = min(12, H - 1)
-                        if mid_t > 0:
-                            tmid_normalized = pred_obs_norm[mid_t]
-                            print(f"  [DIAG] t={mid_t} normalized range: [{tmid_normalized.min():.4f}, {tmid_normalized.max():.4f}]")
-                            print(f"  [DIAG] t={mid_t} would be clipped: {tmid_normalized.max() > 1.0001 or tmid_normalized.min() < -1.0001}")
-
-                        # Compare pred_obs[0] with original observation
-                        diff_t0 = np.abs(pred_obs[0] - obs_vec)
-                        print(f"  [DIAG] pred_obs[0] vs obs_vec diff: max={diff_t0.max():.6f}, mean={diff_t0.mean():.6f}")
-                        if diff_t0.max() > 0.01:
-                            print(f"  [DIAG] WARNING: Significant roundtrip loss detected at t=0!")
-                            # Find which dimensions have the largest differences
-                            top_diff_idx = np.argsort(diff_t0)[-5:][::-1]
-                            print(f"  [DIAG] Top 5 differing dims: {top_diff_idx}, diffs: {diff_t0[top_diff_idx]}")
-                        # ====== END DIAGNOSTIC ======
-
-                        # Log a subset of timesteps (start, middle, end)
-                        timesteps_to_log = [0, H // 4, H // 2, 3 * H // 4, H - 1]
-                        timesteps_to_log = sorted(set(t_idx for t_idx in timesteps_to_log if 0 <= t_idx < H))
-
-                        for t_idx in timesteps_to_log:
-                            obs_at_t = pred_obs[t_idx]  # (obs_dim,)
-                            bg_at_t = pred_bg_features[t_idx] if pred_bg_features is not None else None
-                            tag = f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/t_{t_idx:03d}_of_{H}"
-                            try:
-                                renderer_3d.render(
-                                    obs_at_t,
-                                    bg_features=bg_at_t,
-                                    tag=tag,
-                                    step=self.step,
-                                    base="imagined_states",
-                                    log_fg=True,
-                                    log_bg=(bg_at_t is not None),
-                                    log_full=(bg_at_t is not None),
-                                )
-                                print(f"  Logged imagined state at horizon t={t_idx}/{H}")
-                            except Exception as e:
-                                print(f"  Failed to log imagined state t={t_idx}: {e}")
-
-                        # Also log the current observation for comparison
-                        try:
-                            current_bg = envw.last_bg_features if hasattr(envw, 'last_bg_features') else None
-                            renderer_3d.render(
-                                obs_vec,
-                                bg_features=current_bg,
-                                tag=f"imagined/ep_{ep:02d}_plan_{plan_idx:02d}/cond_t0_current",
-                                step=self.step,
-                                base="imagined_states",
-                                log_fg=True,
-                                log_bg=(current_bg is not None),
-                                log_full=(current_bg is not None),
-                            )
-                            print(f"  Logged conditioning: current observation")
-                        except Exception as e:
-                            print(f"  Failed to log current obs condition: {e}")
-                        print()
+                    # (3D imagined state logging removed — not applicable for 2D DLP)
 
                     plan_idx += 1  # increment plan counter
 

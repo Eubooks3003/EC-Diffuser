@@ -2,8 +2,15 @@ import numpy as np
 import torch
 import h5py
 
-from datasets.voxelize_ds_wrapper import VoxelGridXYZ
-from dlp_utils import log_rgb_voxels
+try:
+    from datasets.voxelize_ds_wrapper import VoxelGridXYZ
+except ImportError:
+    VoxelGridXYZ = None
+
+try:
+    from dlp_utils import log_rgb_voxels
+except ImportError:
+    log_rgb_voxels = None
 
 # ----------------------------
 # Gripper state extraction (matches ec_diffuser_mimicgen_preprocess.py)
@@ -876,8 +883,79 @@ class MimicGenDLPWrapper:
         vox = vg.to_dense()
         return vox
 
+    def _is_2d_dlp(self):
+        """Check if the DLP model is a 2D (image) DLP vs 3D (voxel) DLP."""
+        model_cls = type(self.dlp).__name__
+        model_mod = type(self.dlp).__module__ or ""
+        # 2D DLP: models.DLP from lpwm-copy/lpwm-dev (not voxel_models)
+        return model_cls == "DLP" and "voxel" not in model_mod
+
+    @torch.no_grad()
+    def _encode_tokens_2d(self, raw_obs):
+        """Encode observations using 2D DLP on camera images (multiview)."""
+        image_size = getattr(self.dlp, 'image_size', 128)
+
+        all_toks = []
+        all_bg = []
+        for cam in self.cams:
+            img_key = f"{cam}_image"
+            if img_key not in raw_obs:
+                raise RuntimeError(f"Camera key '{img_key}' not in raw_obs. Keys: {list(raw_obs.keys())}")
+
+            img = np.asarray(raw_obs[img_key], dtype=np.float32)
+            # Handle (H, W, C) uint8 or float
+            if img.max() > 1.5:
+                img = img / 255.0
+            if img.ndim == 3 and img.shape[-1] == 3:
+                img = img.transpose(2, 0, 1)  # HWC -> CHW
+            img_t = torch.from_numpy(img).unsqueeze(0).float().to(self.device)  # (1, 3, H, W)
+
+            # Resize if needed
+            if img_t.shape[-1] != image_size or img_t.shape[-2] != image_size:
+                img_t = torch.nn.functional.interpolate(
+                    img_t, size=(image_size, image_size),
+                    mode="bilinear", align_corners=False
+                )
+
+            enc = self.dlp.encode_all(img_t, deterministic=True)
+
+            # Pack: [z(2), z_scale(2), z_depth(1), obj_on(1), z_features(F)]
+            z = enc["z"][:, 0]
+            z_scale = enc["z_scale"][:, 0]
+            z_depth = enc["z_depth"][:, 0]
+            z_feat = enc["z_features"][:, 0]
+            z_bg = enc["z_bg_features"][:, 0]
+            obj_on = enc.get("z_obj_on", enc.get("obj_on"))[:, 0]
+            if obj_on.ndim == 2:
+                obj_on = obj_on.unsqueeze(-1)
+            if z_bg.ndim == 3:
+                z_bg = z_bg.squeeze(1)
+
+            toks = torch.cat([z, z_scale, z_depth, obj_on, z_feat], dim=-1)
+            all_toks.append(toks)
+            all_bg.append(z_bg)
+
+        # Concatenate views: (1, V*K, Dtok) and (1, V*bg_dim)
+        toks_cat = torch.cat(all_toks, dim=1)
+        bg_cat = torch.cat(all_bg, dim=1)
+
+        toks_np = toks_cat[0].cpu().numpy().astype(np.float32)
+        flat = toks_np.reshape(-1).astype(np.float32)
+
+        self.last_toks = toks_np
+        self.last_vox = None
+        self.decoded_vox = None
+        self.vox = None
+        self.last_bg_features = bg_cat[0].cpu().numpy().astype(np.float32)
+
+        return flat, toks_np, None
+
     @torch.no_grad()
     def encode_tokens(self, raw_obs):
+        # Route to 2D or 3D encoding based on model type
+        if self._is_2d_dlp():
+            return self._encode_tokens_2d(raw_obs)
+
         self._ensure_env_calib(raw_obs)
         pts = self._fuse_xyzrgb_world(raw_obs)
 
@@ -1179,7 +1257,26 @@ class MimicGenDLPWrapper:
         # Extract gripper state from live observation
         self.last_gripper_state = extract_gripper_state_from_obs(raw_obs)
 
+        # Check success: first try info dict, then fall back to env.is_success()
+        # (robosuite returns info={} from step but exposes success via is_success())
         success = self._get_success_from_info(info)
+        if success is None:
+            env = self.env
+            # Walk through possible wrappers to find is_success
+            for attr in ("is_success", "env.is_success", "env.env.is_success",
+                         "base_env.is_success"):
+                obj = env
+                try:
+                    for part in attr.split("."):
+                        obj = getattr(obj, part)
+                    result = obj()
+                    if isinstance(result, dict):
+                        success = bool(result.get("task", any(result.values())))
+                    else:
+                        success = bool(result)
+                    break
+                except (AttributeError, TypeError):
+                    continue
         if success is not None:
             info = dict(info)
             info["success"] = success

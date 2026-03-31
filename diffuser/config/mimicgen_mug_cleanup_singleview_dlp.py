@@ -9,34 +9,37 @@ args_to_watch = [
 
 logbase = 'data'
 
+# Data verified from pkl:
+#   E=1000, Tmax=377, K=24, Dtok=12, A=7, G=10, BG=2
+#   action_mode=relative, path_lengths=[289,377]
+
 # IMPORTANT: key must match mode computed in setup.py: "{num_entity}C_{input_type}"
-# With your tokens: --num_entity 64 --input_type dlp  =>  "64C_dlp"
 mode_to_args = {
   '16C_dlp': {
-    'dataset': 'stack',
-    'override_dataset_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_d0/stack_d0.pkl',
-    'calib_h5_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/core/stack_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_d0/dlp_ckpt.pt',
+    'dataset': 'mug_cleanup',
+    'override_dataset_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/mug_cleanup_d0/mug_cleanup_d0.pkl',
+    'calib_h5_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/core/mug_cleanup_d0.hdf5',
+    'dlp_ckpt': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/mug_cleanup_d0/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_d0/dlp_config.json',
+    'dlp_cfg': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/mug_cleanup_d0/dlp_config.json',
     'features_dim': 10,       # Dtok: z(2)+scale(2)+depth(1)+obj_on(1)+feat(4)
-    'gripper_dim': 10,
+    'gripper_dim': 10,        # G: pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': True,
     'gripper_state_mask_ratio': 0.0,
-    'bg_dim': 8,              # BG: 4 per view × 2 views
+    'bg_dim': 4,              # BG: 4 per view × 1 view
     'use_bg_obs': True,
-    'max_particles': 40,
-    'multiview': True,
+    'max_particles': 20,
+    'multiview': False,
     'device': 'cuda:0',
-    'max_path_length': 131,
-    'max_demos': 200,
+    'max_path_length': 377,   # Tmax from pkl
+    'max_demos': 200,         # Limit demos for faster iteration (set to None for all 1000)
     'eval_freq': 0,
-    'eval_backend': 'none',
+    'eval_backend': 'none',  # disabled for GH200 (no robosuite renderer)
     'n_steps_per_epoch': 500,
-    "mimicgen_cams": ["agentview", "sideview"],
+    "mimicgen_cams": ["agentview"],
     "mimicgen_camera_width": 256,
     "mimicgen_camera_height": 256,
-    "mimicgen_max_steps": 500,
+    "mimicgen_max_steps": 1000,
     "mimicgen_pixel_stride": 1,
     "use_absolute_actions": False,
     'horizon': 16,
@@ -82,7 +85,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_stack/',
+        'prefix': 'diffusion/mimicgen_mug_cleanup_singleview/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -93,7 +96,7 @@ base = {
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
         'ema_decay': 0.995,
-        'save_freq': 10_000,
+        'save_freq': 10_000,  # save every 10k steps (no eval loop to trigger saves)
         'eval_freq': 10**9,
         'sample_freq': 1,
         'n_saves': 2,
@@ -118,7 +121,7 @@ base = {
     'plan': {
         # not used while eval_freq is huge
         'policy': 'sampling.GoalConditionedPolicy',
-        'max_episode_length': 50,
+        'max_episode_length': 75,
         'batch_size': 1,
         'preprocess_fns': [],
         'device': 'cuda:0',
@@ -127,7 +130,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_stack/',
+        'prefix': 'plans/mimicgen_mug_cleanup_singleview/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

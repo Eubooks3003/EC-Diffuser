@@ -14,21 +14,21 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'stack_three',
-    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/stack_three_d0/stack_three_d0.pkl',
-    'calib_h5_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/core/stack_three_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/stack_three_d0/dlp_ckpt.pt',
-    'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed/stack_three_d0/dlp_config.json',
-    'features_dim': 12,
+    'override_dataset_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_three_d0/stack_three_d0.pkl',
+    'calib_h5_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/core/stack_three_d0.hdf5',
+    'dlp_ckpt': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_three_d0/dlp_ckpt.pt',
+    'dlp_ctor': "models:DLP",
+    'dlp_cfg': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/stack_three_d0/dlp_config.json',
+    'features_dim': 10,       # Dtok: z(2)+scale(2)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,
     'use_gripper_obs': True,
     'gripper_state_mask_ratio': 0.0,
-    'bg_dim': 2,              # BG: learned_bg_feature_dim
+    'bg_dim': 8,              # BG: 4 per view × 2 views
     'use_bg_obs': True,
     'max_particles': 40,
-    'multiview': False,
+    'multiview': True,
     'device': 'cuda:0',
-    'max_path_length': 313,
+    'max_path_length': 310,
     'max_demos': 200,
     'eval_freq': 0,
     'eval_backend': 'none',
@@ -82,13 +82,13 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_stack/',
+        'prefix': 'diffusion/mimicgen_stack_three/',
         'exp_name': watch(args_to_watch),
 
         # training
         'n_steps_per_epoch': 200,
         'loss_type': 'l1',
-        'n_train_steps': 2e6,    
+        'n_train_steps': 2e6,
         'batch_size': 16,
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
@@ -102,7 +102,7 @@ base = {
         'bucket': None,
         'device': 'cuda:0',
         'seed': 0,
-        'renderer': 'utils.ParticleRenderer3D',
+        'renderer': 'utils.ParticleRenderer',
         'predict_epsilon': False,
         'env_config_dir': 'env_config/n_cubes',
 
@@ -127,7 +127,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_stack/',
+        'prefix': 'plans/mimicgen_stack_three/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,
