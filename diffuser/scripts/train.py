@@ -81,15 +81,68 @@ def build_dlp_from_cfg(cfg, device, DLPClass):
     return model
 
 
-def load_dlp_lpwm(dlp_cfg_path: str, dlp_ckpt_path: str, device: str):
+def build_dlp_2d_from_cfg(cfg, device, DLPClass):
+    # mirrors the 2D preprocessing constructor (ec_diffuser_multiview_preprocess.py)
+    model = DLPClass(
+        cdim=cfg["ch"],
+        image_size=cfg["image_size"],
+        normalize_rgb=cfg.get("normalize_rgb", False),
+        n_kp_per_patch=cfg["n_kp_per_patch"],
+        patch_size=cfg["patch_size"],
+        anchor_s=cfg["anchor_s"],
+        n_kp_enc=cfg["n_kp_enc"],
+        n_kp_prior=cfg["n_kp_prior"],
+        pad_mode=cfg["pad_mode"],
+        dropout=cfg.get("dropout", 0.0),
+        features_dist=cfg.get("features_dist", "gauss"),
+        learned_feature_dim=cfg["learned_feature_dim"],
+        learned_bg_feature_dim=cfg.get("learned_bg_feature_dim", cfg["learned_feature_dim"]),
+        n_fg_categories=cfg.get("n_fg_categories", 8),
+        n_fg_classes=cfg.get("n_fg_classes", 4),
+        n_bg_categories=cfg.get("n_bg_categories", 4),
+        n_bg_classes=cfg.get("n_bg_classes", 4),
+        scale_std=cfg["scale_std"],
+        offset_std=cfg["offset_std"],
+        obj_on_alpha=cfg["obj_on_alpha"],
+        obj_on_beta=cfg["obj_on_beta"],
+        obj_res_from_fc=cfg["obj_res_from_fc"],
+        obj_ch_mult_prior=cfg.get("obj_ch_mult_prior", cfg["obj_ch_mult"]),
+        obj_ch_mult=cfg["obj_ch_mult"],
+        obj_base_ch=cfg["obj_base_ch"],
+        obj_final_cnn_ch=cfg["obj_final_cnn_ch"],
+        bg_res_from_fc=cfg["bg_res_from_fc"],
+        bg_ch_mult=cfg["bg_ch_mult"],
+        bg_base_ch=cfg["bg_base_ch"],
+        bg_final_cnn_ch=cfg["bg_final_cnn_ch"],
+        use_resblock=cfg["use_resblock"],
+        num_res_blocks=cfg["num_res_blocks"],
+        cnn_mid_blocks=cfg.get("cnn_mid_blocks", False),
+        mlp_hidden_dim=cfg.get("mlp_hidden_dim", 256),
+        pint_enc_layers=cfg["pint_enc_layers"],
+        pint_enc_heads=cfg["pint_enc_heads"],
+        timestep_horizon=1,
+    ).to(device)
+    model.eval()
+    return model
+
+
+def load_dlp_lpwm(dlp_cfg_path: str, dlp_ckpt_path: str, device: str,
+                  dlp_ctor: str = "voxel_models:DLP"):
     # from lpwm-dev
     from utils.util_func import get_config
     from utils.log_utils import load_checkpoint
-    from voxel_models import DLP as DLPClass
+    import importlib
+
+    module_name, class_name = dlp_ctor.split(":")
+    DLPClass = getattr(importlib.import_module(module_name), class_name)
 
     dev = torch.device(device)
     cfg = get_config(dlp_cfg_path)
-    model = build_dlp_from_cfg(cfg, dev, DLPClass)
+    if module_name == "voxel_models":
+        model = build_dlp_from_cfg(cfg, dev, DLPClass)
+    else:
+        # 2D DLP from lpwm-dev/models.py
+        model = build_dlp_2d_from_cfg(cfg, dev, DLPClass)
     _ = load_checkpoint(dlp_ckpt_path, model, None, None, map_location=dev)
     model.eval()
     return model, cfg
@@ -149,8 +202,9 @@ renderer = render_config()
 dlp_cfg_path = getattr(args, "dlp_cfg", None)
 dlp_ckpt_path = getattr(args, "dlp_ckpt", None)
 if dlp_cfg_path and dlp_ckpt_path:
-    print(f"[renderer] loading DLP for reference renders: cfg={dlp_cfg_path} ckpt={dlp_ckpt_path}", flush=True)
-    _renderer_dlp, _ = load_dlp_lpwm(dlp_cfg_path, dlp_ckpt_path, args.device)
+    dlp_ctor = getattr(args, "dlp_ctor", "voxel_models:DLP")
+    print(f"[renderer] loading DLP for reference renders: ctor={dlp_ctor} cfg={dlp_cfg_path} ckpt={dlp_ckpt_path}", flush=True)
+    _renderer_dlp, _ = load_dlp_lpwm(dlp_cfg_path, dlp_ckpt_path, args.device, dlp_ctor=dlp_ctor)
     renderer.latent_rep_model = _renderer_dlp
 else:
     print("[renderer] no DLP cfg/ckpt provided, reference renders will be skipped", flush=True)

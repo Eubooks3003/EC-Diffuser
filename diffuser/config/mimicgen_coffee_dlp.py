@@ -22,7 +22,7 @@ mode_to_args = {
     'override_dataset_path': '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_multiview_tokens/coffee_d0/coffee_d0.pkl',
     'calib_h5_path': '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/core/coffee_d0.hdf5',
     'dlp_ckpt': '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_multiview_tokens/coffee_d0/dlp_ckpt.pt',
-    'dlp_ctor': "voxel_models:DLP",
+    'dlp_ctor': "models:DLP",  # 2D DLP from lpwm-dev/models.py
     'dlp_cfg': '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_multiview_tokens/coffee_d0/dlp_config.json',
     'features_dim': 10,       # Dtok from pkl meta (2D DLP multiview tokens)
     'gripper_dim': 10,        # G: pos(3)+rot6d(6)+open(1)
