@@ -2,34 +2,23 @@
 AdaLNPINTDenoiser
 -----------------
 
-This module implements a denoising network based on an Adaptive Layer-Normalized
-Particle Interaction Transformer (AdaLNParticleTransformer). It is designed for processing
-particle-based state inputs with corresponding actions and a time-conditioning signal.
-The network projects raw features into a latent space, applies a transformer to model
-interactions among particles (and actions), and finally decodes the representations back
-to the original feature dimensions.
+Denoising transformer over (action, proprioception, particles) trajectories.
 
-Gripper Token Support:
-    When gripper_dim > 0, the model treats the gripper state as an additional token
-    in the transformer sequence. This allows the model to learn gripper-object
-    interactions through attention.
+When gripper_dim > 0, action and proprioception are each split into three
+semantically distinct tokens — position, rotation, gripper open/close — giving
+six robot tokens in the transformer sequence alongside the particle tokens:
 
-    Gripper state format: [position(3), rotation_6d(6), gripper_open(1)] = 10 dims
+    tokens = [a_pos, a_rot, a_grip, p_pos, p_rot, p_grip, particle_1..K]
 
-    Input format when gripper_dim > 0:
-        x: [batch_size, T, action_dim + gripper_dim + (n_particles * features_dim)]
+Default component sizes (single-arm Panda OSC_POSE, gripper_state format
+[pos(3), rot6d(6), open(1)]):
+    action_dim=7:  act_pos_dim=3, act_rot_dim=3, act_grip_dim=1
+    gripper_dim=10: prop_pos_dim=3, prop_rot_dim=6, prop_grip_dim=1
 
-Usage Example:
-    model = AdaLNPINTDenoiser(
-        features_dim=10, action_dim=3, hidden_dim=256, projection_dim=256,
-        n_head=8, n_layer=6, block_size=50, dropout=0.1,
-        predict_delta=False, positional_bias=True, max_particles=4,
-        learned_sinusoidal_cond=False, random_fourier_features=False,
-        learned_sinusoidal_dim=16, multiview=False, gripper_dim=10
-    )
-    # x: [batch_size, time_steps, action_dim + gripper_dim + particle_feature_dim]
-    # t: [batch_size] (e.g., time indices)
-    out = model(x, cond=None, time=t)
+The flat input/output tensor layout is unchanged:
+    x: [batch_size, T, action_dim + gripper_dim + bg_dim + (n_particles * features_dim)]
+
+When gripper_dim == 0 the legacy single-action-token path is used unchanged.
 """
 
 import torch
@@ -71,7 +60,9 @@ class AdaLNPINTDenoiser(nn.Module):
                  n_head=8, n_layer=6, block_size=50, dropout=0.1,
                  predict_delta=False, positional_bias=True, max_particles=4,
                  learned_sinusoidal_cond=False, random_fourier_features=False,
-                 learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, bg_dim=0, **kwargs):
+                 learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, bg_dim=0,
+                 act_pos_dim=3, act_rot_dim=3, act_grip_dim=1,
+                 prop_pos_dim=3, prop_rot_dim=6, prop_grip_dim=1, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
@@ -82,6 +73,21 @@ class AdaLNPINTDenoiser(nn.Module):
         self.projection_dim = projection_dim
         self.max_particles = max_particles
         self.multiview = multiview
+
+        self.act_pos_dim = act_pos_dim
+        self.act_rot_dim = act_rot_dim
+        self.act_grip_dim = act_grip_dim
+        self.prop_pos_dim = prop_pos_dim
+        self.prop_rot_dim = prop_rot_dim
+        self.prop_grip_dim = prop_grip_dim
+        self.split_robot_tokens = gripper_dim > 0
+        if self.split_robot_tokens:
+            assert act_pos_dim + act_rot_dim + act_grip_dim == action_dim, (
+                f"action sub-dims {act_pos_dim}+{act_rot_dim}+{act_grip_dim} "
+                f"must sum to action_dim={action_dim}")
+            assert prop_pos_dim + prop_rot_dim + prop_grip_dim == gripper_dim, (
+                f"proprio sub-dims {prop_pos_dim}+{prop_rot_dim}+{prop_grip_dim} "
+                f"must sum to gripper_dim={gripper_dim}")
         # block_size is the time horizon
 
         # Define an intermediate time embedding dimension.
@@ -111,22 +117,32 @@ class AdaLNPINTDenoiser(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, self.projection_dim)
         )
-        # Action feature projection network.
-        self.action_projection = nn.Sequential(
-            nn.Linear(action_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, self.projection_dim)
-        )
 
-        # Gripper state projection network (if gripper_dim > 0).
-        if self.gripper_dim > 0:
-            self.gripper_projection = nn.Sequential(
-                nn.Linear(self.gripper_dim, hidden_dim),
+        def _make_proj(in_dim):
+            return nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, self.projection_dim)
+                nn.Linear(hidden_dim, self.projection_dim),
             )
-            # Learnable gripper encoding to distinguish from particles.
-            self.gripper_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+
+        if self.split_robot_tokens:
+            # Six robot tokens: action(pos/rot/grip) + proprio(pos/rot/grip).
+            self.a_pos_projection = _make_proj(act_pos_dim)
+            self.a_rot_projection = _make_proj(act_rot_dim)
+            self.a_grip_projection = _make_proj(act_grip_dim)
+            self.p_pos_projection = _make_proj(prop_pos_dim)
+            self.p_rot_projection = _make_proj(prop_rot_dim)
+            self.p_grip_projection = _make_proj(prop_grip_dim)
+
+            self.a_pos_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            self.a_rot_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            self.a_grip_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            self.p_pos_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            self.p_rot_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            self.p_grip_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+        else:
+            # Legacy single action token (no proprio).
+            self.action_projection = _make_proj(action_dim)
 
         # Instantiate the AdaLN Particle Transformer.
         self.particle_transformer = AdaLNParticleTransformer(
@@ -137,88 +153,63 @@ class AdaLNPINTDenoiser(nn.Module):
             activation='gelu', max_particles=max_particles
         )
 
-        # Decoder networks for particle and action outputs.
+        # Decoder networks for particle outputs.
         self.particle_decoder = nn.Sequential(
             nn.Linear(self.projection_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, self.features_dim)
         )
-        self.action_decoder = nn.Sequential(
-            nn.Linear(self.projection_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, self.action_dim)
-        )
-        # Gripper decoder (if gripper_dim > 0).
-        if self.gripper_dim > 0:
-            self.gripper_decoder = nn.Sequential(
+
+        def _make_dec(out_dim):
+            return nn.Sequential(
                 nn.Linear(self.projection_dim, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, self.gripper_dim)
+                nn.Linear(hidden_dim, out_dim),
             )
+
+        if self.split_robot_tokens:
+            self.a_pos_decoder = _make_dec(act_pos_dim)
+            self.a_rot_decoder = _make_dec(act_rot_dim)
+            self.a_grip_decoder = _make_dec(act_grip_dim)
+            self.p_pos_decoder = _make_dec(prop_pos_dim)
+            self.p_rot_decoder = _make_dec(prop_rot_dim)
+            self.p_grip_decoder = _make_dec(prop_grip_dim)
+        else:
+            self.action_decoder = _make_dec(action_dim)
+            self.action_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+
         # Particle encoding: either shared or view-specific for multi-view inputs.
         if self.multiview:
             self.view1_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
             self.view2_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
         else:
             self.particle_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
-        
-        # Learnable action encoding.
-        self.action_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
 
     def forward(self, x, cond, time, return_attention=False):
         """
-        Forward pass for the denoiser.
+        Input/output flat layout (both paths):
+            [action(action_dim), gripper(gripper_dim), bg(bg_dim), particles(K*features_dim)]
 
-        Args:
-            x (torch.Tensor): Input tensor of shape:
-                - If gripper_dim == 0: [batch_size, T, action_dim + particle_feature_dim]
-                - If gripper_dim > 0:  [batch_size, T, action_dim + gripper_dim + particle_feature_dim]
-                The layout is: [actions, gripper_state (optional), particles]
-            cond: (Unused) Additional conditioning (reserved for future use).
-            time (torch.Tensor): Tensor of time indices with shape [batch_size]. These are embedded via time_mlp.
-            return_attention (bool): If True, returns the attention weights along with the output.
-
-        Returns:
-            torch.Tensor or tuple:
-                - If return_attention is False: output tensor of shape [batch_size, T, output_dim],
-                  where output_dim = action_dim + gripper_dim + (n_particles * features_dim).
-                - If return_attention is True: (output, attention_dict)
+        When gripper_dim > 0, action and gripper are each split into three
+        sub-components (pos, rot, grip) and enter the transformer as six
+        separate tokens followed by the K particle tokens. The output is
+        reassembled into the original flat layout.
         """
         # ---------------------------------------------------------------------
-        # Reshape input: separate actions, gripper state, and particle features.
-        # x: [bs, T, action_dim + gripper_dim + particle_feature_dim]
+        # Flat input layout: [action(action_dim), gripper(gripper_dim), bg(bg_dim), particles]
         bs, T, f = x.size()
-        actions = x[:, :, :self.action_dim]  # [bs, T, action_dim]
 
-        if self.gripper_dim > 0:
-            gripper_state = x[:, :, self.action_dim:self.action_dim + self.gripper_dim]  # [bs, T, gripper_dim]
-        else:
-            gripper_state = None
-
-        # Extract bg_features if present (will be passed through unchanged)
+        # Slice the bg and particle regions (common to both paths).
+        bg_start = self.action_dim + self.gripper_dim
+        particle_start_idx = bg_start + self.bg_dim
         if self.bg_dim > 0:
-            bg_start = self.action_dim + self.gripper_dim
-            bg_features = x[:, :, bg_start:bg_start + self.bg_dim]  # [bs, T, bg_dim]
+            bg_features = x[:, :, bg_start:particle_start_idx]
         else:
             bg_features = None
-
-        # particle_start_idx accounts for actions, gripper_state, and bg_features
-        particle_start_idx = self.action_dim + self.gripper_dim + self.bg_dim
-
-        # Reshape remaining features into particles of shape [bs, T, n_particles, features_dim].
         x_particles = x[:, :, particle_start_idx:].view(bs, T, -1, self.features_dim)
 
-        # ---------------------------------------------------------------------
-        # Project actions and particles.
-        action_particle = self.action_projection(actions)  # [bs, T, projection_dim]
-        action_particle = action_particle + self.action_encoding.repeat(bs, T, 1)
-        state_particles = self.particle_projection(x_particles)  # [bs, T, n_particles, projection_dim]
-
-        # Project gripper state if present.
-        if self.gripper_dim > 0 and gripper_state is not None:
-            gripper_emb = self.gripper_projection(gripper_state)  # [bs, T, projection_dim]
-            gripper_emb = gripper_emb + self.gripper_encoding.repeat(bs, T, 1)
-
+        # Project particles (with optional per-view encoding).
+        state_particles = self.particle_projection(x_particles)
         if self.multiview:
             n_particles = state_particles.size(2) // 2
             particles_view1 = state_particles[:, :, :n_particles, :] + self.view1_encoding.repeat(bs, T, n_particles, 1)
@@ -227,63 +218,92 @@ class AdaLNPINTDenoiser(nn.Module):
         else:
             new_state_particles = state_particles + self.particle_encoding.repeat(bs, T, state_particles.size(2), 1)
 
-        # ---------------------------------------------------------------------
-        # Prepare transformer input.
-        # Token sequence: [action_token, gripper_token (optional), particle_token_1, ..., particle_token_N]
-        # Resulting shape: [bs, T, n_tokens, projection_dim]
-        if self.gripper_dim > 0 and gripper_state is not None:
-            # n_tokens = 1 (action) + 1 (gripper) + n_particles
-            x_cat = torch.cat([
-                action_particle.unsqueeze(2),
-                gripper_emb.unsqueeze(2),
-                new_state_particles
-            ], dim=2)
-            gripper_token_idx = 1  # Index of gripper token in the sequence
-            particle_start_token_idx = 2
-        else:
-            # n_tokens = 1 (action) + n_particles
-            x_cat = torch.cat([action_particle.unsqueeze(2), new_state_particles], dim=2)
-            gripper_token_idx = None
-            particle_start_token_idx = 1
-
-        # Time embedding: project time indices and add to all tokens.
         t_embed = self.time_mlp(time)  # [bs, projection_dim]
-        x_proj = x_cat + t_embed[:, None, None, :]  # Broadcast addition.
 
-        # Permute to match transformer input shape: [bs, n_tokens, T, projection_dim]
+        if self.split_robot_tokens:
+            # Slice action into (pos, rot, grip) and gripper_state into (pos, rot, grip).
+            ap0 = 0
+            ap1 = ap0 + self.act_pos_dim
+            ar1 = ap1 + self.act_rot_dim
+            ag1 = ar1 + self.act_grip_dim  # == action_dim
+
+            pp0 = self.action_dim
+            pp1 = pp0 + self.prop_pos_dim
+            pr1 = pp1 + self.prop_rot_dim
+            pg1 = pr1 + self.prop_grip_dim  # == action_dim + gripper_dim
+
+            a_pos = x[:, :, ap0:ap1]
+            a_rot = x[:, :, ap1:ar1]
+            a_grip = x[:, :, ar1:ag1]
+            p_pos = x[:, :, pp0:pp1]
+            p_rot = x[:, :, pp1:pr1]
+            p_grip = x[:, :, pr1:pg1]
+
+            a_pos_tok = self.a_pos_projection(a_pos) + self.a_pos_encoding.repeat(bs, T, 1)
+            a_rot_tok = self.a_rot_projection(a_rot) + self.a_rot_encoding.repeat(bs, T, 1)
+            a_grip_tok = self.a_grip_projection(a_grip) + self.a_grip_encoding.repeat(bs, T, 1)
+            p_pos_tok = self.p_pos_projection(p_pos) + self.p_pos_encoding.repeat(bs, T, 1)
+            p_rot_tok = self.p_rot_projection(p_rot) + self.p_rot_encoding.repeat(bs, T, 1)
+            p_grip_tok = self.p_grip_projection(p_grip) + self.p_grip_encoding.repeat(bs, T, 1)
+
+            # Transformer sequence: six robot tokens then particle tokens.
+            x_cat = torch.cat([
+                a_pos_tok.unsqueeze(2),
+                a_rot_tok.unsqueeze(2),
+                a_grip_tok.unsqueeze(2),
+                p_pos_tok.unsqueeze(2),
+                p_rot_tok.unsqueeze(2),
+                p_grip_tok.unsqueeze(2),
+                new_state_particles,
+            ], dim=2)
+            particle_start_token_idx = 6
+            anchor = a_pos_tok  # used by the transformer's AdaLN anchor path
+        else:
+            actions = x[:, :, :self.action_dim]
+            action_particle = self.action_projection(actions) + self.action_encoding.repeat(bs, T, 1)
+            x_cat = torch.cat([action_particle.unsqueeze(2), new_state_particles], dim=2)
+            particle_start_token_idx = 1
+            anchor = action_particle
+
+        # Add time embedding to every token and permute to [bs, n_tokens, T, projection_dim].
+        x_proj = x_cat + t_embed[:, None, None, :]
         x_proj = x_proj.permute(0, 2, 1, 3)
 
         # ---------------------------------------------------------------------
         # Apply the particle transformer.
         if return_attention:
-            particles_trans, attention_dict = self.particle_transformer(x_proj, action_particle, t_embed,
-                                                                         return_attention=return_attention)
+            particles_trans, attention_dict = self.particle_transformer(
+                x_proj, anchor, t_embed, return_attention=return_attention)
         else:
-            particles_trans = self.particle_transformer(x_proj, action_particle, t_embed)
-        # Permute back to [bs, T, n_tokens, projection_dim].
-        particles_trans = particles_trans.permute(0, 2, 1, 3)
+            particles_trans = self.particle_transformer(x_proj, anchor, t_embed)
+        particles_trans = particles_trans.permute(0, 2, 1, 3)  # [bs, T, n_tokens, projection_dim]
 
         # ---------------------------------------------------------------------
-        # Decode transformer output.
-        action_decoder_out = self.action_decoder(particles_trans[:, :, 0, :])  # [bs, T, action_dim]
+        # Decode.
+        particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
+        particle_decoder_out = particle_decoder_out.view(bs, T, -1)
 
-        if self.gripper_dim > 0 and gripper_token_idx is not None:
-            gripper_decoder_out = self.gripper_decoder(particles_trans[:, :, gripper_token_idx, :])  # [bs, T, gripper_dim]
-            particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
-            particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
-            # Concatenate action, gripper, bg_features (passthrough), and particle outputs.
+        if self.split_robot_tokens:
+            a_pos_out = self.a_pos_decoder(particles_trans[:, :, 0, :])
+            a_rot_out = self.a_rot_decoder(particles_trans[:, :, 1, :])
+            a_grip_out = self.a_grip_decoder(particles_trans[:, :, 2, :])
+            p_pos_out = self.p_pos_decoder(particles_trans[:, :, 3, :])
+            p_rot_out = self.p_rot_decoder(particles_trans[:, :, 4, :])
+            p_grip_out = self.p_grip_decoder(particles_trans[:, :, 5, :])
+
+            parts = [a_pos_out, a_rot_out, a_grip_out,
+                     p_pos_out, p_rot_out, p_grip_out]
             if self.bg_dim > 0 and bg_features is not None:
-                x_out = torch.cat([action_decoder_out, gripper_decoder_out, bg_features, particle_decoder_out], dim=-1)
-            else:
-                x_out = torch.cat([action_decoder_out, gripper_decoder_out, particle_decoder_out], dim=-1)
+                parts.append(bg_features)
+            parts.append(particle_decoder_out)
+            x_out = torch.cat(parts, dim=-1)
         else:
-            particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
-            particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
-            # Concatenate action, bg_features (passthrough), and particle outputs.
+            action_decoder_out = self.action_decoder(particles_trans[:, :, 0, :])
+            parts = [action_decoder_out]
             if self.bg_dim > 0 and bg_features is not None:
-                x_out = torch.cat([action_decoder_out, bg_features, particle_decoder_out], dim=-1)
-            else:
-                x_out = torch.cat([action_decoder_out, particle_decoder_out], dim=-1)
+                parts.append(bg_features)
+            parts.append(particle_decoder_out)
+            x_out = torch.cat(parts, dim=-1)
 
         if return_attention:
             return x_out, attention_dict
@@ -317,22 +337,22 @@ if __name__ == '__main__':
     print("Output shape:", model_out.shape)
     assert model_out.shape == x.shape, "Output shape should match input shape"
 
-    # Test with gripper token
+    # Test split-token path (action=7D OSC_POSE, gripper=10D proprio)
     print("\n" + "=" * 60)
-    print("Test 2: With gripper token (gripper_dim=10)")
+    print("Test 2: Split robot tokens (action_dim=7, gripper_dim=10)")
     print("=" * 60)
-    gripper_dim = 10  # pos(3) + rot_6d(6) + open(1)
+    action_dim_split = 7   # Δpos(3) + Δaxis_angle(3) + grip_cmd(1)
+    gripper_dim = 10       # eef_pos(3) + rot6d(6) + grip_open(1)
     model_with_gripper = AdaLNPINTDenoiser(
-        features_dim=10, action_dim=3, hidden_dim=256, projection_dim=256,
+        features_dim=10, action_dim=action_dim_split, hidden_dim=256, projection_dim=256,
         n_head=8, n_layer=6, block_size=timessteps, dropout=0.1,
         predict_delta=False, positional_bias=False, max_particles=None,
         learned_sinusoidal_cond=False, random_fourier_features=False, learned_sinusoidal_dim=16,
         gripper_dim=gripper_dim
     )
+    actions_split = torch.randn(batch_size, timessteps, action_dim_split)
     gripper_state = torch.randn(batch_size, timessteps, gripper_dim)
-
-    # Concatenate actions, gripper state, and particle features.
-    x_with_gripper = torch.cat([actions, gripper_state, in_particles], dim=-1)
+    x_with_gripper = torch.cat([actions_split, gripper_state, in_particles], dim=-1)
     model_out_with_gripper = model_with_gripper(x_with_gripper, cond=None, time=t, return_attention=False)
     print("Input shape:", x_with_gripper.shape)
     print("Output shape:", model_out_with_gripper.shape)
