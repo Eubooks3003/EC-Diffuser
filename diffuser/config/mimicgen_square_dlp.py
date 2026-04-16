@@ -14,18 +14,18 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'square',
-    'override_dataset_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/square_d0/square_d0.pkl',
-    'calib_h5_path': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/core/square_d0.hdf5',
-    'dlp_ckpt': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/square_d0/dlp_ckpt.pt',
+    'override_dataset_path': '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_multiview_tokens/square_d0/square_d0.pkl',
+    'calib_h5_path': '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/core/square_d0.hdf5',
+    'dlp_ckpt': '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_multiview_tokens/square_d0/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ubuntu/tal_temp/mimicgen_rgb_multiview/preprocessed_multiview_tokens/square_d0/dlp_config.json',
-    'features_dim': 10,       # Dtok: z(2)+scale(2)+depth(1)+obj_on(1)+feat(4)
+    'dlp_cfg': '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_multiview_tokens/square_d0/dlp_config.json',
+    'features_dim': 10,       # Dtok from pkl meta (2D DLP multiview tokens)
     'gripper_dim': 10,
     'use_gripper_obs': True,
     'gripper_state_mask_ratio': 0.0,
-    'bg_dim': 8,              # BG: 4 per view × 2 views
+    'bg_dim': 8,              # BG: 4 per view x 2 views
     'use_bg_obs': True,
-    'max_particles': 40,
+    'max_particles': 48,      # covers K=40 (20 per view x 2 views)
     'multiview': True,
     'device': 'cuda:0',
     'max_path_length': 172,
