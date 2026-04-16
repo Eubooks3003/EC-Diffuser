@@ -861,7 +861,12 @@ class MimicGenDLPWrapper:
 
         xyz = pts_t[:, :3]
         colors = None
-        if self.voxel_mode == "avg_rgb":
+        # rgb_occ / rgbo modes need avg_rgb voxelization + appended occupancy channel
+        effective_mode = self.voxel_mode
+        if self.voxel_mode in ("rgb_occ", "rgbo"):
+            effective_mode = "avg_rgb"
+
+        if effective_mode == "avg_rgb":
             if pts_t.shape[1] != 6:
                 raise RuntimeError("voxel_mode='avg_rgb' requires include_rgb=True and points [N,6].")
             colors = pts_t[:, 3:6]
@@ -871,9 +876,15 @@ class MimicGenDLPWrapper:
             colors=colors,
             grid_whd=(W, H, D),
             bounds=self.bounds_pm,
-            mode=self.voxel_mode,
+            mode=effective_mode,
         )
-        vox = vg.to_dense()
+        vox = vg.to_dense()  # [3, D, H, W] for avg_rgb
+
+        # Append occupancy channel for rgb_occ/rgbo (matches rgb_to_rgbo_inplace.py)
+        if self.voxel_mode in ("rgb_occ", "rgbo"):
+            occ = (vox.abs().sum(dim=0, keepdim=True) > 0).float()
+            vox = torch.cat([vox, occ], dim=0)  # [4, D, H, W]
+
         return vox
 
     @torch.no_grad()
@@ -891,26 +902,24 @@ class MimicGenDLPWrapper:
 
         vox_b = vox.unsqueeze(0)
         out = self.dlp(vox_b, deterministic=True, warmup=False, with_loss=False)
-        z = out["z"]
-        z_scale = out["z_scale"]
-        z_depth = out["z_depth"]
-        z_obj_on = out["obj_on"]
-        z_features = out["z_features"]
         z_bg = out["z_bg_features"]
 
-        dec_out = self.dlp.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg, z_ctx=None)
         toks = pack_tokens_k24_preproc_format(out)
         toks_np = toks[0].detach().cpu().numpy().astype(np.float32)
         flat = toks_np.reshape(-1).astype(np.float32)
 
         # Store for comparison
         self.last_toks = toks_np
-        self.decoded_vox = dec_out["dec_objects_trans"][0]  # [3, D, H, W] torch tensor
+        self.decoded_vox = None
         self.last_vox = vox.detach().cpu().numpy()
-        self.vox = vox
+        self.vox = None  # don't hold GPU tensor
 
         # Store background features: z_bg is [B, 1, bg_dim], extract [bg_dim]
         self.last_bg_features = z_bg[0, 0].detach().cpu().numpy().astype(np.float32)
+
+        # Free DLP intermediates before diffusion model runs
+        del out, vox_b, vox
+        torch.cuda.empty_cache()
 
         return flat, toks_np, self.last_vox
 

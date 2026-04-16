@@ -169,6 +169,7 @@ def run_eval_rollouts(
     video_episodes=5,
     video_fps=20,
     video_cams=("agentview",),
+    voxel_mode="avg_rgb",
 ):
     """
     Run evaluation rollouts (simplified version of eval_mimicgen_rollouts).
@@ -216,6 +217,7 @@ def run_eval_rollouts(
         random_init=True,  # Always use random init for paper eval
         normalize_to_unit_cube=False,
         task=task,
+        voxel_mode=voxel_mode,
     )
 
     # Get dimensions from trainer dataset (constant across episodes)
@@ -655,6 +657,7 @@ def main():
     max_steps = getattr(cfg, 'mimicgen_max_steps', 500)
     exe_steps = getattr(cfg, 'exe_steps', 8)
     grid_dhw = getattr(cfg, 'mimicgen_grid_dhw', (128, 128, 128))
+    voxel_mode = dlp_cfg.get("voxel_mode", "avg_rgb")
     cams = tuple(getattr(cfg, 'mimicgen_cams', ["agentview", "sideview"]))
     pixel_stride = getattr(cfg, 'mimicgen_pixel_stride', 1)
 
@@ -694,6 +697,7 @@ def main():
             video_episodes=args.video_episodes,
             video_fps=args.video_fps,
             video_cams=cams[:1],  # Use first camera for videos
+            voxel_mode=voxel_mode,
         )
         all_results.append(result)
 
