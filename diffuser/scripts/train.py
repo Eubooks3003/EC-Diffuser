@@ -130,7 +130,6 @@ def load_dlp_lpwm(dlp_cfg_path: str, dlp_ckpt_path: str, device: str,
                   dlp_ctor: str = "voxel_models:DLP"):
     # from lpwm-dev
     from utils.util_func import get_config
-    from utils.log_utils import load_checkpoint
     import importlib
 
     module_name, class_name = dlp_ctor.split(":")
@@ -143,7 +142,7 @@ def load_dlp_lpwm(dlp_cfg_path: str, dlp_ckpt_path: str, device: str,
     else:
         # 2D DLP from lpwm-dev/models.py
         model = build_dlp_2d_from_cfg(cfg, dev, DLPClass)
-    _ = load_checkpoint(dlp_ckpt_path, model, None, None, map_location=dev)
+    model.load_state_dict(torch.load(dlp_ckpt_path, map_location=dev, weights_only=False))
     model.eval()
     return model, cfg
 
