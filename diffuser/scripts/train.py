@@ -189,6 +189,7 @@ model_config = utils.Config(
     device=args.device,
     gripper_dim=gripper_dim,
     bg_dim=bg_dim,
+    lang_dim=getattr(args, 'lang_dim', 0),
 )
 
 diffusion_config = utils.Config(

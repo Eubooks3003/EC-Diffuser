@@ -153,6 +153,11 @@ class ReplayBuffer:
 
             if key == 'path_lengths':
                 self._dict[key] = val.astype(np.int32)
+            elif key == 'language':
+                # list[list[str]] per episode -- keep as Python object, don't cast
+                self._dict[key] = list(val)
+            elif key == 'variation_number':
+                self._dict[key] = np.asarray(val, dtype=np.int32)
             else:
                 self._dict[key] = val.astype(np.float32)
 

@@ -12,6 +12,117 @@ from diffuser.models import sample_fn_return_attn, default_sample_fn
 Trajectories = namedtuple('Trajectories', 'actions observations values')
 
 
+class LanguageConditionedPolicy:
+    """
+    Policy for language-conditioned diffusion. Owns a frozen CLIP text encoder
+    (lives on CPU by default), encodes the instruction once at set_instruction()
+    and stashes the token tensor. Every __call__ reuses that tensor on the
+    diffusion device.
+    """
+    def __init__(self, diffusion_model, normalizer, preprocess_fns,
+                 clip_model_name: str = "openai/clip-vit-base-patch32",
+                 lang_pooled: bool = False,
+                 max_lang_tokens: int = 32,
+                 **sample_kwargs):
+        from diffuser.models.lang import CLIPTextEncoder
+
+        self.diffusion_model = diffusion_model
+        self.normalizer = normalizer
+        self.action_dim = diffusion_model.action_dim
+        self.gripper_dim = getattr(diffusion_model.model, "gripper_dim", 0)
+        self.preprocess_fn = get_policy_preprocess_fn(preprocess_fns)
+        self.sample_kwargs = sample_kwargs
+
+        self.lang_pooled = lang_pooled
+        self.max_lang_tokens = int(max_lang_tokens)
+        self._encoder = CLIPTextEncoder(
+            model_name=clip_model_name, device="cpu", return_pooled=lang_pooled,
+        )
+        self._lang_tokens = None
+
+    @property
+    def device(self):
+        return next(self.diffusion_model.parameters()).device
+
+    def set_instruction(self, text: str):
+        """Encode once. Call at env reset; reuse for every denoising step after."""
+        if self.lang_pooled:
+            emb = self._encoder.encode([text])        # (1, clip_dim)
+            self._lang_tokens = emb.unsqueeze(1).float()  # (1, 1, clip_dim)
+        else:
+            tokens, mask = self._encoder.encode([text])   # (1, 77, D), (1, 77)
+            valid = int(mask.sum().item())
+            valid = max(1, min(valid, self.max_lang_tokens))
+            out = torch.zeros((1, self.max_lang_tokens, tokens.shape[-1]), dtype=torch.float32)
+            out[0, :valid] = tokens[0, :valid].float()
+            self._lang_tokens = out                       # (1, max_lang_tokens, clip_dim)
+
+    def __call__(self, conditions, batch_size=1, verbose=True, return_attention=False,
+                 gripper_state=None):
+        if self._lang_tokens is None:
+            raise RuntimeError("LanguageConditionedPolicy: call set_instruction(str) before __call__")
+
+        # Mirror GoalConditionedPolicy condition formatting (see below for the
+        # duplicated logic -- kept inline to avoid deep refactor).
+        conditions = {k: self.preprocess_fn(v) for k, v in conditions.items()}
+        x0 = conditions[0]
+        K = getattr(self.diffusion_model.model, "max_particles", None)
+        D = getattr(self.diffusion_model.model, "features_dim", None)
+
+        if x0.ndim == 3:
+            multi_input = True
+        elif x0.ndim == 2 and (K is not None) and (D is not None) and x0.shape == (K, D):
+            multi_input = False
+        elif x0.ndim == 2:
+            multi_input = True
+        else:
+            multi_input = False
+
+        # Reuse the existing formatter on a GoalConditionedPolicy stub.
+        conditions = GoalConditionedPolicy._format_conditions(
+            self, conditions, batch_size, multi_input=multi_input, gripper_state=gripper_state
+        )
+
+        # Broadcast lang to match batch, move to device.
+        lang = self._lang_tokens.to(self.device)  # (1, L, D)
+        if lang.shape[0] != batch_size:
+            lang = lang.expand(batch_size, -1, -1).contiguous()
+
+        if return_attention:
+            samples, att_dict = self.diffusion_model(
+                conditions, verbose=verbose, sort_by_value=False,
+                return_attention=return_attention, lang=lang, **self.sample_kwargs)
+            att_dict = {k: utils.to_np(v) for k, v in att_dict.items()}
+        else:
+            samples = self.diffusion_model(
+                conditions, verbose=verbose, sort_by_value=False,
+                return_attention=return_attention, lang=lang, **self.sample_kwargs)
+        trajectories = utils.to_np(samples.trajectories)
+
+        obs_start_idx = self.action_dim + self.gripper_dim
+        normed_observations = trajectories[:, :, obs_start_idx:]
+        observations = self.normalizer.unnormalize(normed_observations, 'observations')
+
+        actions = trajectories[:, :, :self.action_dim]
+        actions = self.normalizer.unnormalize(actions, 'actions')
+
+        if self.gripper_dim > 0:
+            normed_gripper = trajectories[:, :, self.action_dim:self.action_dim + self.gripper_dim]
+            gripper_out = self.normalizer.unnormalize(normed_gripper, 'gripper_state')
+        else:
+            gripper_out = None
+
+        if not multi_input:
+            action = actions[0, 0]
+        else:
+            action = actions[:, 0]
+
+        trajectories = Trajectories(actions, observations, samples.values)
+        if return_attention:
+            return action, trajectories, att_dict
+        return action, trajectories
+
+
 class GoalConditionedPolicy:
     def __init__(self, diffusion_model, normalizer, preprocess_fns, **sample_kwargs):
         self.diffusion_model = diffusion_model

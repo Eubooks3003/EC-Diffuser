@@ -17,8 +17,8 @@ Sample = namedtuple('Sample', 'trajectories values chains')
 
 
 @torch.no_grad()
-def default_sample_fn(model, x, cond, t):
-    model_mean, _, model_log_variance = model.p_mean_variance(x=x, cond=cond, t=t)
+def default_sample_fn(model, x, cond, t, lang=None):
+    model_mean, _, model_log_variance = model.p_mean_variance(x=x, cond=cond, t=t, lang=lang)
     model_std = torch.exp(0.5 * model_log_variance)
 
     # no noise when t == 0
@@ -29,8 +29,8 @@ def default_sample_fn(model, x, cond, t):
     return model_mean + model_std * noise, values
 
 @torch.no_grad()
-def sample_fn_return_attn(model, x, cond, t):
-    model_mean, _, model_log_variance, att_dict = model.p_mean_variance_return_attn(x=x, cond=cond, t=t)
+def sample_fn_return_attn(model, x, cond, t, lang=None):
+    model_mean, _, model_log_variance, att_dict = model.p_mean_variance_return_attn(x=x, cond=cond, t=t, lang=lang)
     model_std = torch.exp(0.5 * model_log_variance)
 
     # no noise when t == 0
@@ -169,8 +169,8 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, cond, t):
-        x_recon = self.predict_start_from_noise(x, t=t, noise=self.model(x, cond, t))
+    def p_mean_variance(self, x, cond, t, lang=None):
+        x_recon = self.predict_start_from_noise(x, t=t, noise=self.model(x, cond, t, lang=lang))
 
         if self.clip_denoised:
             x_recon.clamp_(-1., 1.)
@@ -179,8 +179,8 @@ class GaussianDiffusion(nn.Module):
                 x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
 
-    def p_mean_variance_return_attn(self, x, cond, t):
-        noise, att_dict = self.model(x, cond, t, return_attention=True)
+    def p_mean_variance_return_attn(self, x, cond, t, lang=None):
+        noise, att_dict = self.model(x, cond, t, return_attention=True, lang=lang)
         x_recon = self.predict_start_from_noise(x, t=t, noise=noise)
 
         if self.clip_denoised:
@@ -191,7 +191,7 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, att_dict
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, cond, verbose=True, return_chain=False, sample_fn=default_sample_fn, return_attention=False, sort_by_value=True, **sample_kwargs):
+    def p_sample_loop(self, shape, cond, verbose=True, return_chain=False, sample_fn=default_sample_fn, return_attention=False, sort_by_value=True, lang=None, **sample_kwargs):
         device = self.betas.device
 
         batch_size = shape[0]
@@ -207,9 +207,9 @@ class GaussianDiffusion(nn.Module):
         for i in reversed(range(0, self.n_timesteps)):
             t = make_timesteps(batch_size, i, device)
             if return_attention:
-                x, values, att_dict = sample_fn(self, x, cond, t, **sample_kwargs)
+                x, values, att_dict = sample_fn(self, x, cond, t, lang=lang, **sample_kwargs)
             else:
-                x, values = sample_fn(self, x, cond, t, **sample_kwargs)
+                x, values = sample_fn(self, x, cond, t, lang=lang, **sample_kwargs)
             x = apply_conditioning(x, cond, self.action_dim)
 
             progress.update({'t': i, 'vmin': values.min().item(), 'vmax': values.max().item()})
@@ -223,7 +223,7 @@ class GaussianDiffusion(nn.Module):
         return Sample(x, values, chain)
 
     @torch.no_grad()
-    def conditional_sample(self, cond, horizon=None, sort_by_value=True, return_attention=False, **sample_kwargs):
+    def conditional_sample(self, cond, horizon=None, sort_by_value=True, return_attention=False, lang=None, **sample_kwargs):
         '''
             conditions : [ (time, state), ... ]
         '''
@@ -231,7 +231,7 @@ class GaussianDiffusion(nn.Module):
         batch_size = len(cond[0])
         horizon = horizon or self.horizon
         shape = (batch_size, horizon, self.transition_dim)
-        return self.p_sample_loop(shape, cond, sort_by_value=sort_by_value, return_attention=return_attention, **sample_kwargs)
+        return self.p_sample_loop(shape, cond, sort_by_value=sort_by_value, return_attention=return_attention, lang=lang, **sample_kwargs)
 
     #------------------------------------------ training ------------------------------------------#
 
@@ -245,13 +245,13 @@ class GaussianDiffusion(nn.Module):
 
         return sample
 
-    def p_losses(self, x_start, cond, t):
+    def p_losses(self, x_start, cond, t, lang=None):
         noise = torch.randn_like(x_start)
 
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise) 
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         x_noisy = apply_conditioning(x_noisy, cond, self.action_dim) # a, 0, 1
 
-        x_recon = self.model(x_noisy, cond, t)  # a' 0' 1'
+        x_recon = self.model(x_noisy, cond, t, lang=lang)  # a' 0' 1'
 
         x_recon = apply_conditioning(x_recon, cond, self.action_dim)
 
@@ -272,10 +272,10 @@ class GaussianDiffusion(nn.Module):
 
         return loss, info
 
-    def loss(self, x, *args):
+    def loss(self, x, cond, lang=None):
         batch_size = len(x)
         t = torch.randint(0, self.n_timesteps, (batch_size,), device=x.device).long()
-        return self.p_losses(x, *args, t)
+        return self.p_losses(x, cond, t, lang=lang)
 
     def forward(self, cond, *args, **kwargs):
         return self.conditional_sample(cond, *args, **kwargs)

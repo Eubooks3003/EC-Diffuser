@@ -71,13 +71,15 @@ class AdaLNPINTDenoiser(nn.Module):
                  n_head=8, n_layer=6, block_size=50, dropout=0.1,
                  predict_delta=False, positional_bias=True, max_particles=4,
                  learned_sinusoidal_cond=False, random_fourier_features=False,
-                 learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, bg_dim=0, **kwargs):
+                 learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, bg_dim=0,
+                 lang_dim=0, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
         self.action_dim = action_dim
         self.gripper_dim = gripper_dim
         self.bg_dim = bg_dim
+        self.lang_dim = lang_dim  # CLIP hidden size (e.g. 512); 0 disables language conditioning
         self.predict_delta = predict_delta
         self.projection_dim = projection_dim
         self.max_particles = max_particles
@@ -128,6 +130,16 @@ class AdaLNPINTDenoiser(nn.Module):
             # Learnable gripper encoding to distinguish from particles.
             self.gripper_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
 
+        # Language token projection (if lang_dim > 0). CLIP embedding dim -> projection_dim.
+        if self.lang_dim > 0:
+            self.lang_projection = nn.Sequential(
+                nn.Linear(self.lang_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.projection_dim),
+            )
+            # Learnable language-token type encoding (distinguishes language from particles/action).
+            self.lang_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+
         # Instantiate the AdaLN Particle Transformer.
         self.particle_transformer = AdaLNParticleTransformer(
             self.projection_dim, n_head, n_layer, block_size, self.projection_dim,
@@ -165,7 +177,7 @@ class AdaLNPINTDenoiser(nn.Module):
         # Learnable action encoding.
         self.action_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
 
-    def forward(self, x, cond, time, return_attention=False):
+    def forward(self, x, cond, time, return_attention=False, lang=None):
         """
         Forward pass for the denoiser.
 
@@ -177,6 +189,9 @@ class AdaLNPINTDenoiser(nn.Module):
             cond: (Unused) Additional conditioning (reserved for future use).
             time (torch.Tensor): Tensor of time indices with shape [batch_size]. These are embedded via time_mlp.
             return_attention (bool): If True, returns the attention weights along with the output.
+            lang (torch.Tensor, optional): CLIP-encoded instruction tokens of shape
+                [batch_size, L_lang, lang_dim]. Treated as additional (non-denoised) tokens
+                concatenated at the front of each timestep's token sequence.
 
         Returns:
             torch.Tensor or tuple:
@@ -246,6 +261,21 @@ class AdaLNPINTDenoiser(nn.Module):
             gripper_token_idx = None
             particle_start_token_idx = 1
 
+        # ---------------------------------------------------------------------
+        # Language conditioning: prepend projected CLIP tokens to the per-timestep
+        # token sequence (broadcast across T, since the instruction is time-invariant).
+        # Language tokens are non-denoised context and are sliced out before decoding.
+        n_lang = 0
+        if self.lang_dim > 0 and lang is not None:
+            # lang: [bs, L_lang, lang_dim]
+            lang_proj = self.lang_projection(lang)                  # [bs, L_lang, projection_dim]
+            lang_proj = lang_proj + self.lang_encoding              # broadcast over batch/length
+            lang_proj = lang_proj.unsqueeze(1).expand(-1, T, -1, -1)  # [bs, T, L_lang, projection_dim]
+            x_cat = torch.cat([lang_proj, x_cat], dim=2)
+            n_lang = lang_proj.shape[2]
+            gripper_token_idx = (gripper_token_idx + n_lang) if gripper_token_idx is not None else None
+            particle_start_token_idx = particle_start_token_idx + n_lang
+
         # Time embedding: project time indices and add to all tokens.
         t_embed = self.time_mlp(time)  # [bs, projection_dim]
         x_proj = x_cat + t_embed[:, None, None, :]  # Broadcast addition.
@@ -265,7 +295,9 @@ class AdaLNPINTDenoiser(nn.Module):
 
         # ---------------------------------------------------------------------
         # Decode transformer output.
-        action_decoder_out = self.action_decoder(particles_trans[:, :, 0, :])  # [bs, T, action_dim]
+        # Action token sits right after any language tokens; language tokens are dropped.
+        action_token_idx = n_lang
+        action_decoder_out = self.action_decoder(particles_trans[:, :, action_token_idx, :])  # [bs, T, action_dim]
 
         if self.gripper_dim > 0 and gripper_token_idx is not None:
             gripper_decoder_out = self.gripper_decoder(particles_trans[:, :, gripper_token_idx, :])  # [bs, T, gripper_dim]
