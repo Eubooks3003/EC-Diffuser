@@ -164,7 +164,11 @@ class WeightedLoss(nn.Module):
         loss = self._loss(pred, targ)
         weighted_loss = (loss * self.weights).mean()
         a0_loss = (loss[:, 0, :self.action_dim] / self.weights[0, :self.action_dim]).mean()
-        return weighted_loss, {'a0_loss': a0_loss}
+        # Also expose the last-horizon action loss — this one requires genuine prediction
+        # (not just identity-on-proprio), so it's a better signal of policy learning progress.
+        H = loss.shape[1]
+        aH_loss = (loss[:, H - 1, :self.action_dim] / self.weights[0, :self.action_dim]).mean()
+        return weighted_loss, {'a0_loss': a0_loss, 'aH_loss': aH_loss}
 
 class ValueLoss(nn.Module):
     def __init__(self, *args):

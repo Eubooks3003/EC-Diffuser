@@ -9,16 +9,16 @@ args_to_watch = [
 
 logbase = 'data'
 
-# RLBench 2D-DLP language-conditioned config for task: put_item_in_drawer
+# RLBench 2D-DLP language-conditioned config for task: close_jar
 # Mode key matches setup.py: "{num_entity}C_{input_type}". Use --num_entity 16 --input_type dlp.
 mode_to_args = {
   '16C_dlp': {
-    'dataset': 'put_item_in_drawer',
-    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_put_item_in_drawer/rlbench_put_item_in_drawer.pkl',
+    'dataset': 'close_jar',
+    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_close_jar/rlbench_close_jar.pkl',
     'calib_h5_path': None,  # RLBench does not use a robomimic calib HDF5
-    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_put_item_in_drawer/dlp_ckpt.pt',
+    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_close_jar/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_put_item_in_drawer/dlp_config.json',
+    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_close_jar/dlp_config.json',
     'features_dim': 10,       # Dtok from pkl meta (2D DLP multiview tokens: z2+scale2+depth1+obj_on1+feat4)
     'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': True,
@@ -28,9 +28,9 @@ mode_to_args = {
     'max_particles': 80,      # 4 views x n_kp_enc=20 = 80
     'multiview': True,
     'device': 'cuda:0',
-    'max_path_length': 600,   # Tmax from RLBench demos
+    'max_path_length': 400,   # Tmax from RLBench demos
     'max_demos': 100,
-    'eval_freq': 5,
+    'eval_freq': 60,
     'eval_backend': 'rlbench',
     'n_steps_per_epoch': 500,
     # --- RLBench-specific ---
@@ -41,14 +41,17 @@ mode_to_args = {
     'max_lang_tokens': 32,
     'clip_model_name': 'openai/clip-vit-base-patch32',
     'lang_device': 'cpu',
-    'rlbench_cams': ['front', 'overhead', 'left_shoulder', 'right_shoulder'],
+    'rlbench_cams': ['front'],
     'rlbench_image_size': 128,
     'rlbench_headless': True,
     'rlbench_max_steps': 400,
     # -------------------------
     "use_absolute_actions": True,
     'horizon': 5,
-    'exe_steps': 1,
+    'exe_steps': 5,
+    # Rotation-identity experiment: rot6d dims (3..8) are left unnormalized,
+    # only pos (0..2) and gripper (9) get Gaussian-normalized. Matches lpwm-occ.
+    'action_normalizer': 'RotIdentityGaussianNormalizer',
     "random_init": True,
     "random_init_eval": True,
   },
@@ -90,7 +93,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/rlbench_put_item_in_drawer/',
+        'prefix': 'diffusion/rlbench_close_jar_rotidentity/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -131,7 +134,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/rlbench_put_item_in_drawer/',
+        'prefix': 'plans/rlbench_close_jar_rotidentity/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

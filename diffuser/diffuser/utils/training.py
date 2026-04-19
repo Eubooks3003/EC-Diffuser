@@ -257,6 +257,8 @@ class Trainer(object):
         '''
             renders training points
         '''
+        if batch_size <= 0:
+            return  # reference rendering disabled
 
         ## get a temporary dataloader to load a single batch
         dataloader_tmp = cycle(torch.utils.data.DataLoader(
@@ -699,5 +701,195 @@ class Trainer(object):
             "sim/avg_len": float(np.mean(lengths)) if len(lengths) else 0.0,
         }
         return out
-    
+
+    @torch.no_grad()
+    def eval_rlbench_rollouts(
+        self,
+        make_env_fn,
+        make_policy_fn,
+        n_episodes: int = 5,
+        max_steps: int = 400,
+        task_name: str = None,
+    ):
+        """
+        Live RLBench rollouts with the trained language-conditioned 2D-DLP policy.
+
+        Mirrors the per-component-normalize-then-concat pattern used by the
+        working mimicgen eval, rather than routing through the Policy wrapper
+        (which doesn't know about bg_features in its _format_conditions path).
+
+        - make_env_fn:    () -> RLBenchDLPEnv
+        - make_policy_fn: () -> LanguageConditionedPolicy  (used ONLY for its
+                          set_instruction() + CLIP encoder; the actual sampling
+                          is done via self.ema_model directly below).
+        """
+        import torch as _torch
+        device = next(self.ema_model.parameters()).device
+
+        env = make_env_fn()
+        policy = make_policy_fn()
+
+        a_dim = int(self.ema_model.action_dim)
+        gripper_dim = int(getattr(self.ema_model.model, "gripper_dim", 0))
+        bg_dim = int(getattr(self.ema_model.model, "bg_dim", 0))
+        K = int(getattr(self.ema_model.model, "max_particles", 0))
+        D = int(getattr(self.ema_model.model, "features_dim", 0))
+
+        def norm_obs(tok):
+            # tok: (K, D) np -> (1, K*D) torch
+            normed = self.dataset.normalizer.normalize(tok, "observations")
+            return _torch.from_numpy(normed).float().reshape(1, -1)
+
+        def norm_bg(bg_vec):
+            if bg_dim == 0:
+                return None
+            normed = self.dataset.normalizer.normalize(bg_vec.reshape(1, -1), "bg_features")
+            return _torch.from_numpy(normed).float()
+
+        def norm_gripper(gs_vec):
+            if gripper_dim == 0:
+                return None
+            normed = self.dataset.normalizer.normalize(gs_vec.reshape(1, -1), "gripper_state")
+            return _torch.from_numpy(normed).float()
+
+        successes = []
+        lengths = []
+        per_variation = {}
+
+        print("=" * 60)
+        print(f"[eval_rlbench] task={task_name} n_episodes={n_episodes} max_steps={max_steps}")
+        print(f"[eval_rlbench] a_dim={a_dim} gripper_dim={gripper_dim} bg_dim={bg_dim} K={K} D={D}")
+        print("=" * 60, flush=True)
+
+        for ep in range(n_episodes):
+            try:
+                obs_dict = env.reset()
+            except Exception as e:
+                print(f"[eval_rlbench] ep={ep} reset failed: {type(e).__name__}: {e}", flush=True)
+                successes.append(0.0); lengths.append(0); continue
+
+            policy.set_instruction(obs_dict["language"])
+            # Broadcast lang tokens to batch=1, move to device.
+            lang = policy._lang_tokens.to(device)
+            if lang.shape[0] != 1:
+                lang = lang[:1]
+
+            last_reward = 0.0
+            last_error = None
+            done = False
+            t = 0
+            _printed_token_stats = False
+            while not done and t < max_steps:
+                tokens = np.asarray(obs_dict["obs"], dtype=np.float32)
+                if tokens.ndim == 1:
+                    tokens = tokens.reshape(K, D)
+                if os.environ.get("ECDIFF_ABLATE_TOKENS") == "1":
+                    # Replace tokens with Gaussian noise matching training-data stats
+                    # (~N(0, 1.5^2) based on inspection). If rollout behavior is
+                    # ~indistinguishable from the real run, the policy is not using
+                    # the particle tokens.
+                    tokens = np.random.randn(*tokens.shape).astype(np.float32) * 1.5
+                if not _printed_token_stats:
+                    print(f"[eval_rlbench] live token stats ep={ep} t={t}: "
+                          f"z=[{tokens[:,0].min():+.3f},{tokens[:,0].max():+.3f}] "
+                          f"depth=[{tokens[:,4].min():+.3f},{tokens[:,4].max():+.3f}] "
+                          f"feat_mean={tokens[:,6:].mean():+.3f} feat_std={tokens[:,6:].std():.3f}",
+                          flush=True)
+                    _printed_token_stats = True
+                bg_np = np.asarray(obs_dict["bg_features"], dtype=np.float32)
+                gs_np = np.asarray(obs_dict["gripper_state"], dtype=np.float32)
+
+                parts = []
+                if gripper_dim > 0:
+                    parts.append(norm_gripper(gs_np))
+                if bg_dim > 0:
+                    parts.append(norm_bg(bg_np))
+                parts.append(norm_obs(tokens))
+                cond_0 = _torch.cat(parts, dim=-1).to(device)   # (1, gripper+bg+K*D)
+                cond = {0: cond_0}
+
+                sample = self.ema_model(cond, lang=lang, verbose=False)
+                traj = sample.trajectories[0]                   # (H, a_dim + gripper + bg + K*D)
+                a_norm = traj[0, :a_dim].detach().cpu().numpy().astype(np.float32)
+                action = self.dataset.normalizer.unnormalize(a_norm[None], "actions")[0]
+
+                next_obs, reward, done, info = env.step(action)
+                last_reward = float(reward)
+                last_error = info.get("error")
+                if last_error:
+                    # Print the offending action so we can diagnose InvalidActionError /
+                    # IKError / ConfigurationPathError. action = [pos(3), rot6d(6), grip(1)].
+                    pos = action[:3]
+                    print(f"[eval_rlbench]   t={t} {last_error}: "
+                          f"pos=({pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:+.3f}) "
+                          f"rot6d_norms=({np.linalg.norm(action[3:6]):.3f},{np.linalg.norm(action[6:9]):.3f}) "
+                          f"grip={action[9]:+.3f}",
+                          flush=True)
+                if next_obs is not None:
+                    obs_dict = next_obs
+                t += 1
+
+            success = 1.0 if last_reward >= 0.5 else 0.0
+            successes.append(success)
+            lengths.append(t)
+            vnum = obs_dict.get("variation_number")
+            if vnum is not None:
+                per_variation.setdefault(int(vnum), []).append(success)
+            end_reason = (
+                "success" if success > 0
+                else f"error:{last_error}" if last_error
+                else ("timeout" if t >= max_steps else "task_terminal")
+            )
+            print(f"[eval_rlbench] ep={ep} steps={t} success={int(success)} "
+                  f"end={end_reason} lang={obs_dict.get('language')!r}", flush=True)
+
+            # Dump recorded front-cam frames (plain + kp overlay) to mp4
+            try:
+                import imageio.v2 as _imageio
+                frames, front_toks = env.pop_recorded_frames()
+                if frames:
+                    video_dir = os.path.join(self.logdir, "eval_videos", f"step_{self.step}")
+                    os.makedirs(video_dir, exist_ok=True)
+                    tag = "success" if success > 0 else "fail"
+
+                    # Plain front view.
+                    plain_path = os.path.join(video_dir, f"ep{ep:02d}_{tag}.mp4")
+                    _imageio.mimsave(plain_path, frames, fps=20, macro_block_size=1)
+                    print(f"[eval_rlbench] saved video: {plain_path}", flush=True)
+
+                    # KP overlay: draw the front-view particle z-positions per frame.
+                    if front_toks and len(front_toks) == len(frames):
+                        try:
+                            from utils.util_func import plot_keypoints_on_image
+                            import torch as _torch
+                            kp_frames = []
+                            for f, tok in zip(frames, front_toks):
+                                kp_xy = _torch.from_numpy(tok[:, :2])   # (K_front, 2) in [-1,1]
+                                img_chw = _torch.from_numpy(f).permute(2, 0, 1).float() / 255.0
+                                kp_img = plot_keypoints_on_image(
+                                    kp_xy, img_chw,
+                                    radius=2, thickness=1,
+                                    kp_range=(-1, 1), plot_numbers=False,
+                                )
+                                kp_frames.append(np.asarray(kp_img, dtype=np.uint8))
+                            kp_path = os.path.join(video_dir, f"ep{ep:02d}_{tag}_kp.mp4")
+                            _imageio.mimsave(kp_path, kp_frames, fps=20, macro_block_size=1)
+                            print(f"[eval_rlbench] saved video: {kp_path}", flush=True)
+                        except Exception as e:
+                            print(f"[eval_rlbench] kp overlay skipped: {type(e).__name__}: {e}",
+                                  flush=True)
+            except Exception as e:
+                print(f"[eval_rlbench] video save failed: {type(e).__name__}: {e}", flush=True)
+
+        env.shutdown()
+
+        out = {
+            "sim/success_rate": float(np.mean(successes)) if successes else 0.0,
+            "sim/avg_len": float(np.mean(lengths)) if lengths else 0.0,
+            "sim/n_episodes": int(len(successes)),
+        }
+        for vnum, vals in per_variation.items():
+            out[f"sim/var{vnum}/success_rate"] = float(np.mean(vals))
+        return out
+
 

@@ -27,7 +27,9 @@ class SequenceDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path='', dataset_name='panda_push', horizon=64, obs_only=False,
         normalizer='LimitsNormalizer', particle_normalizer='ParticleGaussianNormalizer', preprocess_fns=[], max_path_length=1000,
         max_n_episodes=5000, termination_penalty=0, use_padding=True, overfit=False, action_only=False, single_view=False,
-        action_z_scale=1.0, use_gripper_obs=False, use_bg_obs=False, **kwargs):
+        action_z_scale=1.0, use_gripper_obs=False, use_bg_obs=False,
+        use_views=None, num_source_views=None,
+        action_normalizer=None, **kwargs):
         self.preprocess_fn = get_preprocess_fn(preprocess_fns, dataset_name)
         self.dataset_path = dataset_path
         self.horizon = horizon
@@ -49,6 +51,41 @@ class SequenceDataset(torch.utils.data.Dataset):
             print(f'[ datasets/sequence ] Limiting to {max_demos}/{fields._count} demos')
             fields._count = max_demos
         fields.finalize()
+
+        # Optional view subsetting: the pkl stores tokens stacked in view order
+        # (view0 particles | view1 particles | ...). If the caller wants to train
+        # on a subset of views (e.g. only 'front' from a 4-view pkl), slice the
+        # observations and bg_features in-place here.
+        if use_views is not None and 'observations' in fields._dict:
+            obs = fields._dict['observations']       # (E, T, K_total, Dtok)
+            K_total = obs.shape[2]
+            Nv = int(num_source_views) if num_source_views else None
+            if Nv is None or K_total % Nv != 0:
+                # Infer from K_total if not provided and Nv divides evenly
+                raise ValueError(
+                    f"use_views requires num_source_views (pkl total views) to be set. "
+                    f"K_total={K_total}, got num_source_views={num_source_views}"
+                )
+            K_per_view = K_total // Nv
+            view_idx = list(use_views)
+            particle_indices = np.concatenate([
+                np.arange(v * K_per_view, (v + 1) * K_per_view) for v in view_idx
+            ])
+            fields._dict['observations'] = obs[:, :, particle_indices, :].copy()
+            print(f'[ datasets/sequence ] use_views={view_idx}: sliced observations '
+                  f'{obs.shape} -> {fields._dict["observations"].shape}')
+            # Slice bg_features similarly (stored as (E, T, Nv*bg_per_view))
+            if 'bg_features' in fields._dict:
+                bg = fields._dict['bg_features']
+                bg_total = bg.shape[-1]
+                if bg_total % Nv == 0:
+                    bg_per_view = bg_total // Nv
+                    bg_indices = np.concatenate([
+                        np.arange(v * bg_per_view, (v + 1) * bg_per_view) for v in view_idx
+                    ])
+                    fields._dict['bg_features'] = bg[:, :, bg_indices].copy()
+                    print(f'[ datasets/sequence ] use_views={view_idx}: sliced bg_features '
+                          f'{bg.shape} -> {fields._dict["bg_features"].shape}')
 
         # Apply Z scaling to actions before normalization
         if self.action_z_scale != 1.0:
@@ -82,7 +119,7 @@ class SequenceDataset(torch.utils.data.Dataset):
                 print(f'[ datasets/sequence ] Background features available but not used (use_bg_obs=False)')
 
         self.successful_episode_idxes = fields.successful_episode_idxes
-        self.normalizer = DatasetNormalizer(fields, normalizer, particle_normalizer=particle_normalizer, path_lengths=fields['path_lengths'])
+        self.normalizer = DatasetNormalizer(fields, normalizer, particle_normalizer=particle_normalizer, path_lengths=fields['path_lengths'], action_normalizer=action_normalizer)
 
         # Sanity check: verify normalize -> unnormalize round-trip
         self.normalizer.sanity_check_roundtrip(

@@ -11,7 +11,7 @@ POINTMASS_KEYS = ['observations', 'actions', 'next_observations', 'deltas']
 class DatasetNormalizer:
 
     def __init__(self, dataset, normalizer, particle_normalizer=None, path_lengths=None,
-                 gripper_normalizer=None):
+                 gripper_normalizer=None, action_normalizer=None):
         self.observation_dim = dataset['observations'].shape[-1]
         self.action_dim = dataset['actions'].shape[-1]
         self.gripper_dim = dataset['gripper_state'].shape[-1] if 'gripper_state' in dataset._dict else 0
@@ -23,13 +23,14 @@ class DatasetNormalizer:
             goal_X = None  # goals no longer used for normalization
         if gripper_normalizer is not None and type(gripper_normalizer) == str:
             gripper_normalizer = eval(gripper_normalizer)
+        if action_normalizer is not None and type(action_normalizer) == str:
+            action_normalizer = eval(action_normalizer)
 
         dataset = flatten(dataset, path_lengths)
         self.normalizers = {}
         for key, val in dataset.items():
             try:
                 if key == 'observations' and particle_normalizer is not None:
-                    ### concatenate goals to observations for normalizing
                     if goal_X is not None:
                         obs_goal = np.concatenate([val, goal_X], axis=0)
                     else:
@@ -38,12 +39,14 @@ class DatasetNormalizer:
                 elif key == 'goals' and particle_normalizer is not None:
                     continue
                 elif key == 'gripper_state':
-                    # Use gripper_normalizer if provided, else use standard normalizer
                     if gripper_normalizer is not None:
                         self.normalizers[key] = gripper_normalizer(val)
                     else:
                         self.normalizers[key] = GaussianNormalizer(val)
                     print(f'[ utils/normalization ] Gripper state normalizer: {self.normalizers[key]}')
+                elif key == 'actions' and action_normalizer is not None:
+                    self.normalizers[key] = action_normalizer(val)
+                    print(f'[ utils/normalization ] Action normalizer: {self.normalizers[key]}')
                 else:
                     self.normalizers[key] = normalizer(val)
             except Exception as e:
@@ -299,6 +302,54 @@ class GaussianNormalizer(Normalizer):
 
     def unnormalize(self, x):
         return x * (self.z * self.stds) + self.means
+
+
+class RotIdentityGaussianNormalizer(Normalizer):
+    '''
+    Gaussian normalizer that SKIPS specified dimension ranges (leaves them
+    as identity / pass-through). Intended for 10D RLBench actions:
+        [pos(3), rot6d(6), gripper(1)]
+    where rot6d dims (3..8) should NOT be Gaussian-normalized because they
+    are naturally bounded in [-1, 1] and normalization distorts their
+    orthonormality guarantees after unnormalize + Gram-Schmidt.
+
+    skip_dims: slice or list of dim indices to leave unchanged.
+    Default: dims 3..8 (rot6d portion of a 10D rot6d action).
+    '''
+
+    def __init__(self, *args, z=1.0, skip_dims=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.means = self.X.mean(axis=0)
+        self.stds = self.X.std(axis=0)
+        self.z = z
+        if skip_dims is None:
+            skip_dims = list(range(3, 9))  # rot6d for 10D rot6d actions
+        self.skip_dims = np.asarray(list(skip_dims), dtype=np.int64)
+        # Build identity mask: 1 = normalize, 0 = skip
+        self._mask = np.ones_like(self.means, dtype=np.float32)
+        if len(self.skip_dims) > 0:
+            self._mask[self.skip_dims] = 0.0
+        # Effective stats: use identity (1, 0) for skipped dims so normalize/unnormalize
+        # are no-ops on those dims without branching.
+        self._effective_std = np.where(self._mask > 0, self.stds, 1.0).astype(np.float32)
+        self._effective_mean = np.where(self._mask > 0, self.means, 0.0).astype(np.float32)
+
+    def __repr__(self):
+        norm_dims = [i for i, m in enumerate(self._mask) if m > 0]
+        return (
+            f'[ RotIdentityGaussianNormalizer ] dim: {self.means.size}\n'
+            f'    normalized dims: {norm_dims}\n'
+            f'    skipped dims:    {self.skip_dims.tolist()}\n'
+            f'    means: {np.round(self.means, 4)}\n'
+            f'    stds:  {np.round(self.stds, 4)}\n'
+            f'    z (temp): {self.z}\n'
+        )
+
+    def normalize(self, x):
+        return (x - self._effective_mean) / (self.z * self._effective_std + 1e-6)
+
+    def unnormalize(self, x):
+        return x * (self.z * self._effective_std) + self._effective_mean
 
 
 class LimitsNormalizer(Normalizer):

@@ -190,10 +190,19 @@ dataset_config = utils.Config(
     use_padding=args.use_padding,
     max_path_length=args.max_path_length,
     overfit=args.overfit,
-    single_view=(args.input_type == "dlp" and not args.multiview),
+    # Skip the buffer's legacy single_view hack (which halves bg_features assuming
+    # a 2-view pkl) when we're doing our own view slicing via use_views.
+    single_view=(
+        args.input_type == "dlp"
+        and not args.multiview
+        and getattr(args, 'use_views', None) is None
+    ),
     action_z_scale=getattr(args, 'action_z_scale', 1.0),
     use_gripper_obs=getattr(args, 'use_gripper_obs', False),
     use_bg_obs=getattr(args, 'use_bg_obs', False),
+    use_views=getattr(args, 'use_views', None),
+    num_source_views=getattr(args, 'num_source_views', None),
+    action_normalizer=getattr(args, 'action_normalizer', None),
 )
 
 render_config = utils.Config(
@@ -255,6 +264,12 @@ model_config = utils.Config(
     gripper_dim=gripper_dim,
     bg_dim=bg_dim,
     lang_dim=getattr(args, 'lang_dim', 0),
+    act_pos_dim=getattr(args, 'act_pos_dim', 3),
+    act_rot_dim=getattr(args, 'act_rot_dim', 3),
+    act_grip_dim=getattr(args, 'act_grip_dim', 1),
+    prop_pos_dim=getattr(args, 'prop_pos_dim', 3),
+    prop_rot_dim=getattr(args, 'prop_rot_dim', 6),
+    prop_grip_dim=getattr(args, 'prop_grip_dim', 1),
 )
 
 diffusion_config = utils.Config(
@@ -381,6 +396,81 @@ if do_eval and eval_backend == "mimicgen":
         return setup_mimicgen_env(args, use_absolute_actions=use_absolute_actions)
 
 
+make_policy_fn = None
+if do_eval and eval_backend == "rlbench":
+    dlp_ckpt = getattr(args, "dlp_ckpt", None)
+    dlp_cfg_path = getattr(args, "dlp_cfg", None)
+    if dlp_ckpt is None or dlp_cfg_path is None:
+        raise RuntimeError("eval_backend='rlbench' requires --dlp_ckpt and --dlp_cfg")
+
+    print(f"[rlbench eval] loading DLP from cfg={dlp_cfg_path} ckpt={dlp_ckpt}", flush=True)
+    _dlp_ctor_eval = getattr(args, "dlp_ctor", "models:DLP")
+    dlp_model, dlp_cfg = load_dlp_lpwm(
+        dlp_cfg_path, dlp_ckpt, args.device, dlp_ctor=_dlp_ctor_eval
+    )
+    dlp_model.eval()
+
+    # Build an online 5/4-view DLP encode callback that matches preprocess.pack_tokens_2d.
+    _cams = getattr(args, "rlbench_cams",
+                    ["front", "overhead", "left_shoulder", "right_shoulder"])
+    _img_size = int(getattr(args, "rlbench_image_size", 128))
+
+    def _pack_tokens_2d(enc):
+        import torch as _torch
+        z = enc["z"][:, 0]
+        z_scale = enc["z_scale"][:, 0]
+        z_depth = enc["z_depth"][:, 0]
+        z_feat = enc["z_features"][:, 0]
+        z_bg = enc["z_bg_features"][:, 0]
+        obj_on = enc.get("z_obj_on", enc.get("obj_on"))[:, 0]
+        if obj_on.dim() == 2:
+            obj_on = obj_on.unsqueeze(-1)
+        if z_bg.dim() == 3:
+            z_bg = z_bg.squeeze(1)
+        return _torch.cat([z, z_scale, z_depth, obj_on, z_feat], dim=-1), z_bg
+
+    @torch.no_grad()
+    def _dlp_encode_fn(rgbs_np):
+        """rgbs_np: (V, H, W, 3) uint8 -> dict(tokens=(V*K, Dtok), bg=(V*bg_F,))."""
+        import numpy as _np
+        import torch as _torch
+        rgbs = _torch.from_numpy(_np.asarray(rgbs_np)).float() / 255.0
+        rgbs = rgbs.permute(0, 3, 1, 2).to(args.device)  # (V, 3, H, W)
+        if rgbs.shape[-1] != _img_size:
+            rgbs = _torch.nn.functional.interpolate(
+                rgbs, size=(_img_size, _img_size), mode="bilinear", align_corners=False
+            )
+        enc = dlp_model.encode_all(rgbs, deterministic=True)
+        toks, bg = _pack_tokens_2d(enc)  # (V, K, Dtok), (V, bg_F)
+        V, K, Dtok = toks.shape
+        return {
+            "tokens": toks.reshape(V * K, Dtok).cpu().numpy(),
+            "bg": bg.reshape(-1).cpu().numpy(),
+        }
+
+    def make_env_fn():
+        from diffuser.envs.rlbench_dlp_wrapper import RLBenchDLPEnv
+        return RLBenchDLPEnv(
+            task_name=args.dataset,
+            dlp_encode_fn=_dlp_encode_fn,
+            cams=_cams,
+            image_size=_img_size,
+            headless=bool(getattr(args, "rlbench_headless", True)),
+            episode_length=int(getattr(args, "rlbench_max_steps", 400)),
+        )
+
+    def make_policy_fn():
+        from diffuser.sampling import LanguageConditionedPolicy
+        return LanguageConditionedPolicy(
+            diffusion_model=trainer.ema_model,
+            normalizer=dataset.normalizer,
+            preprocess_fns=[],
+            clip_model_name=getattr(args, "clip_model_name", "openai/clip-vit-base-patch32"),
+            lang_pooled=bool(getattr(args, "lang_pooled", False)),
+            max_lang_tokens=int(getattr(args, "max_lang_tokens", 32)),
+        )
+
+
 # -----------------------------------------------------------------------------#
 #                                  main loop                                   #
 # -----------------------------------------------------------------------------#
@@ -426,6 +516,18 @@ for i in range(start_epoch, n_epochs):
             log_stats = {k if k.startswith("sim/") else f"sim/{k}": v for k, v in sim_stats.items()}
             wandb.log({"step": trainer.step, **log_stats})
             print(f"[mimicgen eval] epoch={i} :: {sim_stats}", flush=True)
+
+        elif eval_backend == "rlbench":
+            sim_stats = trainer.eval_rlbench_rollouts(
+                make_env_fn=make_env_fn,
+                make_policy_fn=make_policy_fn,
+                n_episodes=getattr(args, "rlbench_eval_episodes", 5),
+                max_steps=getattr(args, "rlbench_max_steps", 400),
+                task_name=getattr(args, "dataset", None),
+            )
+            log_stats = {k if k.startswith("sim/") else f"sim/{k}": v for k, v in sim_stats.items()}
+            wandb.log({"step": trainer.step, **log_stats})
+            print(f"[rlbench eval] epoch={i} :: {sim_stats}", flush=True)
 
         else:
             raise RuntimeError(

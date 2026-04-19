@@ -198,12 +198,15 @@ class RLBenchDLPEnv:
         self._current_lang = None
         self._current_variation = None
         self._step_count = 0
+        self._recorded_frames = []          # list of np.uint8 (H,W,3) for video
+        self._recorded_tokens_front = []    # list of (K_front, Dtok) for kp overlay
+        self._record_enabled = True
 
     # ------------------------------------------------------------------ launch
     def _launch(self):
         from rlbench import ObservationConfig, CameraConfig
         from rlbench.action_modes.action_mode import MoveArmThenGripper
-        from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaIK
+        from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning
         from rlbench.action_modes.gripper_action_modes import Discrete
         from rlbench.environment import Environment
 
@@ -231,10 +234,10 @@ class RLBenchDLPEnv:
             )
             setattr(obs_config, attr, cc)
 
-        # EndEffectorPoseViaIK: direct IK for per-frame dense control (horizon=5, exe_steps=1).
+        # EndEffectorPoseViaPlanning: direct IK for per-frame dense control (horizon=5, exe_steps=1).
         # EndEffectorPoseViaPlanning would RRT-plan every small delta and frequently fail.
         action_mode = MoveArmThenGripper(
-            arm_action_mode=EndEffectorPoseViaIK(**self.action_mode_kwargs),
+            arm_action_mode=EndEffectorPoseViaPlanning(**self.action_mode_kwargs),
             gripper_action_mode=Discrete(),
         )
 
@@ -260,6 +263,11 @@ class RLBenchDLPEnv:
         tokens = np.asarray(enc["tokens"], dtype=np.float32)         # (K, Dtok)
         bg = np.asarray(enc["bg"], dtype=np.float32).reshape(-1)     # (bg_dim,)
         gripper_state = _gripper_state_from_obs(rlbench_obs)         # (10,)
+        # Front view is the first block of tokens (cams are concatenated in order,
+        # and self.cams[0] == 'front' by convention).
+        K_per_view = tokens.shape[0] // max(len(self.cams), 1)
+        tokens_front = tokens[:K_per_view] if self.cams and self.cams[0] == "front" else None
+        self._last_tokens_front = tokens_front
         return {
             "obs": tokens,
             "bg_features": bg,
@@ -269,6 +277,39 @@ class RLBenchDLPEnv:
         }
 
     # ------------------------------------------------------------------ reset
+    def _record(self, rlbench_obs, tokens_front=None):
+        if not self._record_enabled:
+            return
+        frame = getattr(rlbench_obs, "front_rgb", None)
+        if frame is not None:
+            arr = np.asarray(frame)
+            # Normalize to (H, W, 3) uint8
+            if arr.ndim == 4 and arr.shape[0] == 1:
+                arr = arr[0]
+            if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+                arr = np.transpose(arr, (1, 2, 0))  # CHW -> HWC
+            if arr.dtype != np.uint8:
+                if arr.max() <= 1.5:
+                    arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
+                else:
+                    arr = np.clip(arr, 0, 255).astype(np.uint8)
+            if not getattr(self, "_logged_frame_shape", False):
+                print(f"[RLBenchDLPEnv] front_rgb stored as shape={arr.shape} dtype={arr.dtype}",
+                      flush=True)
+                self._logged_frame_shape = True
+            self._recorded_frames.append(arr)
+        if tokens_front is not None:
+            self._recorded_tokens_front.append(np.asarray(tokens_front, dtype=np.float32))
+
+    def pop_recorded_frames(self):
+        """Return (frames, front_tokens) and clear the recording buffer.
+        front_tokens is a list of (K_front, Dtok) arrays aligned with frames."""
+        frames = self._recorded_frames
+        front_toks = getattr(self, "_recorded_tokens_front", [])
+        self._recorded_frames = []
+        self._recorded_tokens_front = []
+        return frames, front_toks
+
     def reset(self, variation: int = None):
         if self._env is None:
             self._launch()
@@ -278,12 +319,19 @@ class RLBenchDLPEnv:
         self._task.set_variation(variation)
         self._current_variation = variation
         descriptions, rlbench_obs = self._task.reset()
-        # descriptions: list[str]; pick the canonical one (first paraphrase).
         self._current_lang = descriptions[0] if len(descriptions) > 0 else ""
         self._step_count = 0
+        self._recorded_frames = []
+        self._record(rlbench_obs, tokens_front=getattr(self, "_last_tokens_front", None))
         return self._make_obs_dict(rlbench_obs)
 
     # ------------------------------------------------------------------ step
+    # Workspace clamp: RLBench rejects poses at/below the table as
+    # InvalidActionError even if they're just ~mm below. Clamp z to a small
+    # safety margin above the table. Values matched to training data +
+    # RLBench Panda table height.
+    _Z_MIN = 0.760   # training min was 0.758; a tiny ε above to be safe
+
     def _action_to_rlbench(self, action: np.ndarray) -> np.ndarray:
         """Convert the policy's 10D [pos(3), rot6d(6), open(1)] action into the
         8D RLBench EndEffectorPoseViaPlanning + Discrete format
@@ -293,7 +341,9 @@ class RLBenchDLPEnv:
             raise ValueError(
                 f"Expected 10D action [pos(3)+rot6d(6)+open(1)], got shape {a.shape}"
             )
-        pos = a[:3]
+        pos = a[:3].copy()
+        # Clamp z above table to avoid InvalidActionError on near-table predictions.
+        pos[2] = max(float(pos[2]), self._Z_MIN)
         quat = rot6d_to_quat_xyzw(a[3:9])
         gopen = np.array([1.0 if a[9] >= 0.5 else 0.0], dtype=np.float32)
         return np.concatenate([pos, quat, gopen], axis=0)
@@ -309,16 +359,32 @@ class RLBenchDLPEnv:
         rlb_action = self._action_to_rlbench(action)
         info = {"variation_number": self._current_variation,
                 "language": self._current_lang}
-        try:
-            rlbench_obs, reward, terminal = self._task.step(rlb_action)
-        except _path_errs as e:
-            # IK/planning failures: terminate the episode with reward 0.
-            info["error"] = type(e).__name__
+        # Retry-on-fail: a single bad prediction shouldn't kill the rollout.
+        # Mirror lpwm-occ's _Mover: up to MAX_RETRIES attempts on planning errors
+        # before we give up and terminate.
+        MAX_RETRIES = 10
+        rlbench_obs, reward, terminal = None, 0.0, False
+        caught = []
+        for attempt in range(MAX_RETRIES):
+            try:
+                rlbench_obs, reward, terminal = self._task.step(rlb_action)
+                break
+            except _path_errs as e:
+                caught.append(type(e).__name__)
+                # stale last obs is fine as a placeholder; the policy will replan
+                # from _last_tokens_front next env.step() anyway.
+                continue
+        if rlbench_obs is None:
+            info["error"] = caught[-1] if caught else "PlanningError"
+            info["retry_history"] = caught
             return None, 0.0, True, info
+        if caught:
+            info["retried"] = caught  # surfaces to eval log for diagnostics
 
         self._step_count += 1
         if self._step_count >= self.episode_length:
             terminal = True
+        self._record(rlbench_obs, tokens_front=getattr(self, "_last_tokens_front", None))
         return self._make_obs_dict(rlbench_obs), float(reward), bool(terminal), info
 
     # ------------------------------------------------------------------ props
