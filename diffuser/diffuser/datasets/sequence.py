@@ -18,7 +18,8 @@ from .normalization import DatasetNormalizer
 from .buffer import ReplayBuffer
 
 
-Batch = namedtuple('Batch', 'trajectories conditions')
+Batch = namedtuple('Batch', ['trajectories', 'conditions', 'lang'])
+Batch.__new__.__defaults__ = (None,)  # lang defaults to None for non-language datasets
 ValueBatch = namedtuple('ValueBatch', 'trajectories conditions values')
 
 class SequenceDataset(torch.utils.data.Dataset):
@@ -287,3 +288,86 @@ class GoalDataset(SequenceDataset):
         return {
             0: np.concatenate(parts_0, axis=-1).copy(),
         }
+
+
+class LanguageConditionedDataset(GoalDataset):
+    """
+    Drop-in replacement for GoalDataset that also yields a per-sample CLIP-encoded
+    language instruction. Picks one of the N paraphrases available per episode
+    uniformly at random each __getitem__ call (free text-level augmentation).
+
+    Assumes the loaded pickle has a 'language' field of type list[list[str]] (one
+    inner list per episode, each with >=1 paraphrases). Falls back to zeros if
+    the field is missing.
+
+    New kwargs:
+        clip_model_name (str):     HuggingFace model id (default ViT-B/32)
+        lang_device (str):         device for CLIP encoding (default 'cpu')
+        lang_pooled (bool):        if True, use single EOS-pooled token; else
+                                   full CLIP last_hidden_state sequence (default False)
+        max_lang_tokens (int):     truncate CLIP sequence to at most this many
+                                   tokens (default 32, saves compute)
+    """
+
+    def __init__(self, *args,
+                 clip_model_name: str = "openai/clip-vit-base-patch32",
+                 lang_device: str = "cpu",
+                 lang_pooled: bool = False,
+                 max_lang_tokens: int = 32,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+
+        from diffuser.models.lang import CLIPTextEncoder, LanguageInstructionCache
+
+        self.lang_pooled = lang_pooled
+        self.max_lang_tokens = int(max_lang_tokens)
+
+        if 'language' not in self.fields._dict:
+            print('[ datasets/sequence ] WARNING: LanguageConditionedDataset but no '
+                  '"language" field in pkl -- falling back to empty strings')
+            self._has_lang = False
+            self.lang_dim = 0
+            return
+
+        self._has_lang = True
+        self._encoder = CLIPTextEncoder(
+            model_name=clip_model_name, device=lang_device, return_pooled=lang_pooled,
+        )
+        self.lang_dim = self._encoder.clip_dim
+        self._cache = LanguageInstructionCache(self._encoder)
+
+        # Pre-encode every unique paraphrase across all episodes.
+        unique = set()
+        for ep_lang in self.fields.language:
+            for s in ep_lang:
+                unique.add(s)
+        print(f'[ datasets/sequence ] Pre-encoding {len(unique)} unique language strings with CLIP...')
+        for s in unique:
+            self._cache.get(s)
+
+    def _get_lang_tokens(self, path_ind):
+        """Pick a random paraphrase for episode path_ind, return encoded tensor.
+
+        Always returns a fixed-shape tensor so default collate works:
+          pooled: (1, clip_dim)
+          else:   (max_lang_tokens, clip_dim), zero-padded beyond valid length.
+        """
+        if not self._has_lang:
+            return torch.zeros((1, 1), dtype=torch.float32)
+        paraphrases = self.fields.language[path_ind]
+        s = paraphrases[np.random.randint(len(paraphrases))]
+        emb = self._cache.get(s)
+        if self.lang_pooled:
+            return emb.unsqueeze(0).float()                   # (1, clip_dim)
+        tokens, mask = emb
+        valid = int(mask.sum().item())
+        valid = max(1, min(valid, self.max_lang_tokens))
+        out = torch.zeros((self.max_lang_tokens, tokens.shape[-1]), dtype=torch.float32)
+        out[:valid] = tokens[:valid].float()
+        return out                                            # (max_lang_tokens, clip_dim)
+
+    def __getitem__(self, idx):
+        batch = super().__getitem__(idx)  # (trajectories, conditions, lang=None from default)
+        path_ind = int(self.indices[idx][0])
+        lang = self._get_lang_tokens(path_ind)
+        return Batch(trajectories=batch.trajectories, conditions=batch.conditions, lang=lang)

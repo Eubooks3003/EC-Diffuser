@@ -25,6 +25,8 @@ def to_torch(x, dtype=None, device=None):
 	return torch.tensor(x, dtype=dtype, device=device)
 
 def to_device(x, device=DEVICE):
+	if x is None:
+		return None
 	if torch.is_tensor(x):
 		return x.to(device)
 	elif type(x) is dict:
