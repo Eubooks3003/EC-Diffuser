@@ -710,6 +710,7 @@ class Trainer(object):
         n_episodes: int = 5,
         max_steps: int = 400,
         task_name: str = None,
+        exe_steps: int = 1,
     ):
         """
         Live RLBench rollouts with the trained language-conditioned 2D-DLP policy.
@@ -722,9 +723,22 @@ class Trainer(object):
         - make_policy_fn: () -> LanguageConditionedPolicy  (used ONLY for its
                           set_instruction() + CLIP encoder; the actual sampling
                           is done via self.ema_model directly below).
+        - exe_steps:      Number of predicted actions a[1..exe_steps] to execute
+                          per plan before re-encoding and re-sampling. a[0] is
+                          skipped because it is pinned to the current gripper
+                          pose by apply_conditioning. Override at runtime with
+                          ECDIFF_EXE_STEPS=<int>.
         """
         import torch as _torch
         device = next(self.ema_model.parameters()).device
+
+        _env_exe_steps = os.environ.get("ECDIFF_EXE_STEPS")
+        if _env_exe_steps is not None:
+            try:
+                exe_steps = int(_env_exe_steps)
+            except ValueError:
+                print(f"[eval_rlbench] invalid ECDIFF_EXE_STEPS={_env_exe_steps!r}; ignoring", flush=True)
+        exe_steps = max(1, int(exe_steps))
 
         env = make_env_fn()
         policy = make_policy_fn()
@@ -756,14 +770,87 @@ class Trainer(object):
         lengths = []
         per_variation = {}
 
+        # OCGS-style GT replay: save expert-demo video alongside policy rollout,
+        # both starting from the same initial scene via task.reset_to_demo(demo).
+        # Enabled when ECDIFF_SAVE_GT_VIDEO=1 and ECDIFF_DEMO_ROOT is set to the
+        # raw RLBench dataset root (with <task>/all_variations/episodes/episodeN/).
+        _save_gt = os.environ.get("ECDIFF_SAVE_GT_VIDEO") == "1"
+        _demo_root = os.environ.get("ECDIFF_DEMO_ROOT")
+        _pkl_actions_all = None
+        _pkl_vars = None
+        if _save_gt:
+            if not _demo_root:
+                print("[eval_rlbench] WARN: ECDIFF_SAVE_GT_VIDEO=1 but ECDIFF_DEMO_ROOT unset; GT replay disabled", flush=True)
+                _save_gt = False
+            else:
+                _pkl_path = (
+                    getattr(self.dataset, "dataset_path", None)
+                    or os.environ.get("ECDIFF_PKL_PATH")
+                )
+                if _pkl_path and os.path.isfile(_pkl_path):
+                    import pickle as _pickle
+                    with open(_pkl_path, "rb") as _f:
+                        _pkl = _pickle.load(_f)
+                    _pkl_actions_all = np.asarray(_pkl["actions"])
+                    _pkl_vars = np.asarray(_pkl.get("variation_number",
+                                                    np.zeros(_pkl_actions_all.shape[0], dtype=int)))
+                    print(f"[eval_rlbench] GT replay: {_pkl_actions_all.shape[0]} demos from {_pkl_path}", flush=True)
+                else:
+                    print(f"[eval_rlbench] WARN: pkl not found ({_pkl_path!r}); GT replay disabled", flush=True)
+                    _save_gt = False
+
+        def _load_demo_from_disk(ep_idx):
+            """Load a raw RLBench Demo from low_dim_obs.pkl for reset_to_demo."""
+            import pickle as _pickle
+            ep_dir = os.path.join(
+                _demo_root, task_name, "all_variations", "episodes", f"episode{ep_idx}"
+            )
+            with open(os.path.join(ep_dir, "low_dim_obs.pkl"), "rb") as _f:
+                demo = _pickle.load(_f)
+            _var_path = os.path.join(ep_dir, "variation_number.pkl")
+            if os.path.isfile(_var_path):
+                with open(_var_path, "rb") as _f:
+                    demo.variation_number = int(_pickle.load(_f))
+            return demo
+
+        # Imagined-state visualization: dump the model's predicted particle tokens
+        # for the step just executed, overlay on the real post-step RGB, save as
+        # its own video. Lets us tell apart "action predictions correct / dynamics
+        # imagined correctly" from "actions right but no scene understanding".
+        _save_imagined = os.environ.get("ECDIFF_SAVE_IMAGINED") == "1"
+        _save_imagined_recon = os.environ.get("ECDIFF_SAVE_IMAGINED_RECON") == "1"
+        _obs_start = a_dim + gripper_dim + bg_dim  # particle tokens begin here in traj
+        _bg_start = a_dim + gripper_dim            # bg features begin here
+        _V = max(len(getattr(env, "cams", []) or []), 1)
+        _K_per_view = max(K // _V, 1)
+        _bg_per_view = max(bg_dim // _V, 1) if bg_dim > 0 else 0
+        _dlp_model = getattr(env, "_dlp_model", None)
+        if _save_imagined_recon and _dlp_model is None:
+            print("[eval_rlbench] WARN: ECDIFF_SAVE_IMAGINED_RECON=1 but env._dlp_model not set; disabling", flush=True)
+            _save_imagined_recon = False
+
         print("=" * 60)
         print(f"[eval_rlbench] task={task_name} n_episodes={n_episodes} max_steps={max_steps}")
         print(f"[eval_rlbench] a_dim={a_dim} gripper_dim={gripper_dim} bg_dim={bg_dim} K={K} D={D}")
+        print(f"[eval_rlbench] action chunking: exe_steps={exe_steps}")
+        print(f"[eval_rlbench] save_gt={_save_gt} save_imagined={_save_imagined}")
         print("=" * 60, flush=True)
 
         for ep in range(n_episodes):
+            # GT replay: pick a demo to anchor this episode's initial state
+            _demo = None
+            _demo_idx = None
+            if _save_gt and _pkl_actions_all is not None:
+                _demo_idx = ep % _pkl_actions_all.shape[0]
+                try:
+                    _demo = _load_demo_from_disk(_demo_idx)
+                except Exception as e:
+                    print(f"[eval_rlbench] ep={ep}: demo {_demo_idx} load failed "
+                          f"({type(e).__name__}: {str(e)[:160]}); falling back to random reset", flush=True)
+                    _demo = None
+
             try:
-                obs_dict = env.reset()
+                obs_dict = env.reset(demo=_demo) if _demo is not None else env.reset()
             except Exception as e:
                 print(f"[eval_rlbench] ep={ep} reset failed: {type(e).__name__}: {e}", flush=True)
                 successes.append(0.0); lengths.append(0); continue
@@ -783,67 +870,202 @@ class Trainer(object):
             done = False
             t = 0
             _printed_token_stats = False
+            # ACTION CHUNKING: mirror the OCGS receding-horizon pattern.
+            # Each plan produces an H-step trajectory; a[0] is pinned to the
+            # current pose, so we buffer a[1..H-1] and play out up to
+            # exe_steps of them before re-encoding and re-sampling.
+            action_buffer = None  # (H-1, a_dim) normalized actions from last plan
+            chunk_idx = 0
+            last_traj = None      # retained for debug-action printing
+            last_gs_np = None
+            # Per-step imagined particle XY (front view only) for the step just
+            # executed. Populated when ECDIFF_SAVE_IMAGINED=1; one entry per step
+            # aligned with env frame indices [1:], since frames[0] is pre-step.
+            _imagined_kps_front = []
+            # Per-step DLP decoder RGB reconstruction of imagined particle state.
+            _imagined_recon_frames = []
+            _imagined_recon_error_printed = False
+            # Per-step DLP decoder RGB reconstruction of the LIVE (ground-truth)
+            # particle state. Isolates decoder-pipeline correctness from model
+            # prediction quality: if this reconstructs the real scene but the
+            # imagined one doesn't, the model's obs predictions are the problem.
+            _live_recon_frames = []
+            _live_recon_error_printed = False
             while not done and t < max_steps:
-                tokens = np.asarray(obs_dict["obs"], dtype=np.float32)
-                if tokens.ndim == 1:
-                    tokens = tokens.reshape(K, D)
-                if os.environ.get("ECDIFF_ABLATE_TOKENS") == "1":
-                    # Replace tokens with Gaussian noise matching training-data stats
-                    # (~N(0, 1.5^2) based on inspection). If rollout behavior is
-                    # ~indistinguishable from the real run, the policy is not using
-                    # the particle tokens.
-                    tokens = np.random.randn(*tokens.shape).astype(np.float32) * 1.5
-                if not _printed_token_stats:
-                    print(f"[eval_rlbench] live token stats ep={ep} t={t}: "
-                          f"z=[{tokens[:,0].min():+.3f},{tokens[:,0].max():+.3f}] "
-                          f"depth=[{tokens[:,4].min():+.3f},{tokens[:,4].max():+.3f}] "
-                          f"feat_mean={tokens[:,6:].mean():+.3f} feat_std={tokens[:,6:].std():.3f}",
-                          flush=True)
-                    _printed_token_stats = True
-                bg_np = np.asarray(obs_dict["bg_features"], dtype=np.float32)
-                gs_np = np.asarray(obs_dict["gripper_state"], dtype=np.float32)
+                need_replan = (
+                    action_buffer is None
+                    or chunk_idx >= exe_steps
+                    or chunk_idx >= action_buffer.shape[0]
+                )
 
-                parts = []
-                if gripper_dim > 0:
-                    parts.append(norm_gripper(gs_np))
-                if bg_dim > 0:
-                    parts.append(norm_bg(bg_np))
-                parts.append(norm_obs(tokens))
-                cond_0 = _torch.cat(parts, dim=-1).to(device)   # (1, gripper+bg+K*D)
-                cond = {0: cond_0}
+                if need_replan:
+                    tokens = np.asarray(obs_dict["obs"], dtype=np.float32)
+                    if tokens.ndim == 1:
+                        tokens = tokens.reshape(K, D)
+                    if os.environ.get("ECDIFF_ABLATE_TOKENS") == "1":
+                        # Replace tokens with Gaussian noise matching training-data stats
+                        # (~N(0, 1.5^2) based on inspection). If rollout behavior is
+                        # ~indistinguishable from the real run, the policy is not using
+                        # the particle tokens.
+                        tokens = np.random.randn(*tokens.shape).astype(np.float32) * 1.5
+                    if not _printed_token_stats:
+                        print(f"[eval_rlbench] live token stats ep={ep} t={t}: "
+                              f"z=[{tokens[:,0].min():+.3f},{tokens[:,0].max():+.3f}] "
+                              f"depth=[{tokens[:,4].min():+.3f},{tokens[:,4].max():+.3f}] "
+                              f"feat_mean={tokens[:,6:].mean():+.3f} feat_std={tokens[:,6:].std():.3f}",
+                              flush=True)
+                        _printed_token_stats = True
+                    bg_np = np.asarray(obs_dict["bg_features"], dtype=np.float32)
+                    gs_np = np.asarray(obs_dict["gripper_state"], dtype=np.float32)
 
-                # Proprioception conditioning: pin action[0] = current gripper pose
-                # (same 10D [pos, rot6d, open] format as actions) in actions-normalized space.
-                action_cond_raw = gs_np.reshape(1, -1)  # (1, 10) — gripper_state matches action dim
-                action_cond_normed = self.dataset.normalizer.normalize(action_cond_raw, "actions")
-                action_cond_tensor = _torch.from_numpy(action_cond_normed).float().to(device)
-                action_cond = {0: action_cond_tensor}
+                    parts = []
+                    if gripper_dim > 0:
+                        parts.append(norm_gripper(gs_np))
+                    if bg_dim > 0:
+                        parts.append(norm_bg(bg_np))
+                    parts.append(norm_obs(tokens))
+                    cond_0 = _torch.cat(parts, dim=-1).to(device)   # (1, gripper+bg+K*D)
+                    cond = {0: cond_0}
 
-                sample = self.ema_model(cond, lang=lang, lang_mask=lang_mask,
-                                        action_cond=action_cond, verbose=False)
-                traj = sample.trajectories[0]                   # (H, a_dim + gripper + bg + K*D)
-                # Execute action[1] (first predicted step after pinned current pose),
-                # not action[0] (which equals current pose by construction).
-                a_norm = traj[1, :a_dim].detach().cpu().numpy().astype(np.float32)
+                    # Proprioception conditioning: pin action[0] = current gripper pose
+                    # (same 10D [pos, rot6d, open] format as actions) in actions-normalized space.
+                    action_cond_raw = gs_np.reshape(1, -1)  # (1, 10) — gripper_state matches action dim
+                    action_cond_normed = self.dataset.normalizer.normalize(action_cond_raw, "actions")
+                    action_cond_tensor = _torch.from_numpy(action_cond_normed).float().to(device)
+                    action_cond = {0: action_cond_tensor}
+
+                    sample = self.ema_model(cond, lang=lang, lang_mask=lang_mask,
+                                            action_cond=action_cond, verbose=False)
+                    traj = sample.trajectories[0]                   # (H, a_dim + gripper + bg + K*D)
+                    # Skip a[0] (pinned to current gripper pose); buffer a[1..H-1].
+                    action_buffer = traj[1:, :a_dim].detach().cpu().numpy().astype(np.float32)
+                    chunk_idx = 0
+                    last_traj = traj
+                    last_gs_np = gs_np
+
+                a_norm = action_buffer[chunk_idx]
                 action = self.dataset.normalizer.unnormalize(a_norm[None], "actions")[0]
 
-                if os.environ.get("ECDIFF_DEBUG_ACTIONS") == "1":
-                    a0n = traj[0, :a_dim].detach().cpu().numpy().astype(np.float32)
+                if os.environ.get("ECDIFF_DEBUG_ACTIONS") == "1" and last_traj is not None:
+                    a0n = last_traj[0, :a_dim].detach().cpu().numpy().astype(np.float32)
                     a0 = self.dataset.normalizer.unnormalize(a0n[None], "actions")[0]
-                    aH_n = traj[-1, :a_dim].detach().cpu().numpy().astype(np.float32)
+                    aH_n = last_traj[-1, :a_dim].detach().cpu().numpy().astype(np.float32)
                     aH = self.dataset.normalizer.unnormalize(aH_n[None], "actions")[0]
-                    dpos_01 = float(np.linalg.norm(action[:3] - a0[:3]))
+                    dpos_0a = float(np.linalg.norm(action[:3] - a0[:3]))
                     dpos_0H = float(np.linalg.norm(aH[:3] - a0[:3]))
-                    print(f"[debug t={t:3d}] "
-                          f"gs.pos=({gs_np[0]:+.3f},{gs_np[1]:+.3f},{gs_np[2]:+.3f}) "
+                    print(f"[debug t={t:3d} chunk={chunk_idx}/{exe_steps}] "
+                          f"gs.pos=({last_gs_np[0]:+.3f},{last_gs_np[1]:+.3f},{last_gs_np[2]:+.3f}) "
                           f"a0.pos=({a0[0]:+.3f},{a0[1]:+.3f},{a0[2]:+.3f}) "
-                          f"a1.pos=({action[0]:+.3f},{action[1]:+.3f},{action[2]:+.3f}) "
-                          f"|a1-a0|={dpos_01:.4f} |aH-a0|={dpos_0H:.4f} "
-                          f"grip[a0,a1,aH]=({a0[9]:+.2f},{action[9]:+.2f},{aH[9]:+.2f}) "
-                          f"gs.grip={gs_np[9]:+.2f}",
+                          f"a.pos=({action[0]:+.3f},{action[1]:+.3f},{action[2]:+.3f}) "
+                          f"|a-a0|={dpos_0a:.4f} |aH-a0|={dpos_0H:.4f} "
+                          f"grip[a0,a,aH]=({a0[9]:+.2f},{action[9]:+.2f},{aH[9]:+.2f}) "
+                          f"gs.grip={last_gs_np[9]:+.2f}",
                           flush=True)
 
                 next_obs, reward, done, info = env.step(action)
+
+                # Record what the model *thought* the state would look like after
+                # executing this action (chunk_idx indexes into action_buffer =
+                # last_traj[1:], so the corresponding predicted obs row is
+                # last_traj[chunk_idx + 1]).
+                if (_save_imagined or _save_imagined_recon) and last_traj is not None:
+                    _pred_row = min(chunk_idx + 1, last_traj.shape[0] - 1)
+                    _pred_obs_norm = last_traj[_pred_row, _obs_start:].detach().cpu().numpy()
+                    _pred_obs_norm = _pred_obs_norm.reshape(K, D)
+                    _pred_obs = self.dataset.normalizer.unnormalize(_pred_obs_norm, "observations")
+                    # Front view = first K_per_view particles (views concatenated in order)
+                    _front_pred = _pred_obs[:_K_per_view]
+                    if _save_imagined:
+                        _imagined_kps_front.append(_front_pred[:, :2].astype(np.float32))
+
+                    # Full DLP decoder reconstruction of the imagined state.
+                    # Decode only the front view (first K_per_view particles,
+                    # first bg_per_view bg features) so the result aligns with
+                    # the existing rollout RGB video.
+                    if _save_imagined_recon and _dlp_model is not None:
+                        try:
+                            import torch as _torch
+                            _dlp_dev = next(_dlp_model.parameters()).device
+                            if not hasattr(_dlp_model, "_decode_sig_printed"):
+                                import inspect as _inspect
+                                try:
+                                    _sig = _inspect.signature(_dlp_model.decode_all)
+                                    print(f"[eval_rlbench] dlp.decode_all signature: {_sig}", flush=True)
+                                except Exception:
+                                    pass
+                                _dlp_model._decode_sig_printed = True
+                            # Front-view bg
+                            if bg_dim > 0:
+                                _pred_bg_norm = last_traj[_pred_row, _bg_start:_bg_start + bg_dim].detach().cpu().numpy()
+                                _pred_bg = self.dataset.normalizer.unnormalize(
+                                    _pred_bg_norm.reshape(1, -1), "bg_features"
+                                )[0]
+                                _front_bg = _pred_bg[:_bg_per_view]
+                            else:
+                                _front_bg = np.zeros((1,), dtype=np.float32)
+                            # Pack front-view particles into decoder inputs.
+                            # 10-D layout: [z(2), z_scale(2), z_depth(1), obj_on(1), z_features(4)]
+                            _fp = _torch.from_numpy(_front_pred).float().to(_dlp_dev).unsqueeze(0)  # (1, K_per_view, D)
+                            _fb = _torch.from_numpy(_front_bg).float().to(_dlp_dev).unsqueeze(0)    # (1, bg_per_view)
+                            _z = _fp[:, :, 0:2]
+                            _z_scale = _fp[:, :, 2:4]
+                            _z_depth = _fp[:, :, 4:5]
+                            # Keep obj_on as (B, K, 1) to match the encoder's
+                            # packing (eval_rlbench.py:244-246 ensures trailing
+                            # dim = 1 before concat into the 10D token).
+                            _obj_on = _fp[:, :, 5:6]
+                            _z_feat = _fp[:, :, 6:]  # (1, K_per_view, D-6)
+                            # Matches the canonical decode pattern in
+                            # origin/2D_DLP scripts/visualize_imagined_states.py:
+                            # z_ctx=None, use 'rec' key, squeeze + clip to [0,1].
+                            with _torch.no_grad():
+                                _dec = _dlp_model.decode_all(
+                                    _z, _z_scale, _z_feat, _obj_on, _z_depth, _fb, None,
+                                    warmup=False,
+                                )
+                            _rec = _dec["rec"].squeeze(0).permute(1, 2, 0).cpu().numpy()
+                            _rec = np.clip(_rec, 0.0, 1.0)
+                            _imagined_recon_frames.append((_rec * 255).astype(np.uint8))
+                        except Exception as _e:
+                            if not _imagined_recon_error_printed:
+                                print(f"[eval_rlbench] imagined recon decode failed: "
+                                      f"{type(_e).__name__}: {_e}", flush=True)
+                                _imagined_recon_error_printed = True
+
+                # LIVE-token recon: decode the actual live-encoded post-step tokens
+                # through the same pipeline. Sanity check for decoder-pipeline bugs.
+                if _save_imagined_recon and _dlp_model is not None and next_obs is not None:
+                    try:
+                        import torch as _torch
+                        _dlp_dev = next(_dlp_model.parameters()).device
+                        _live_toks = np.asarray(next_obs["obs"], dtype=np.float32)
+                        if _live_toks.ndim == 1:
+                            _live_toks = _live_toks.reshape(K, D)
+                        _live_bg_full = np.asarray(next_obs["bg_features"], dtype=np.float32)
+                        _live_front = _live_toks[:_K_per_view]
+                        _live_front_bg = _live_bg_full[:_bg_per_view] if bg_dim > 0 else np.zeros((1,), dtype=np.float32)
+
+                        _fp_l = _torch.from_numpy(_live_front).float().to(_dlp_dev).unsqueeze(0)
+                        _fb_l = _torch.from_numpy(_live_front_bg).float().to(_dlp_dev).unsqueeze(0)
+                        _z_l = _fp_l[:, :, 0:2]
+                        _z_scale_l = _fp_l[:, :, 2:4]
+                        _z_depth_l = _fp_l[:, :, 4:5]
+                        _obj_on_l = _fp_l[:, :, 5:6]
+                        _z_feat_l = _fp_l[:, :, 6:]
+                        with _torch.no_grad():
+                            _dec_l = _dlp_model.decode_all(
+                                _z_l, _z_scale_l, _z_feat_l, _obj_on_l, _z_depth_l, _fb_l, None,
+                                warmup=False,
+                            )
+                        _rec_l = _dec_l["rec"].squeeze(0).permute(1, 2, 0).cpu().numpy()
+                        _rec_l = np.clip(_rec_l, 0.0, 1.0)
+                        _live_recon_frames.append((_rec_l * 255).astype(np.uint8))
+                    except Exception as _e:
+                        if not _live_recon_error_printed:
+                            print(f"[eval_rlbench] live recon decode failed: "
+                                  f"{type(_e).__name__}: {_e}", flush=True)
+                            _live_recon_error_printed = True
+
                 last_reward = float(reward)
                 last_error = info.get("error")
                 if last_error:
@@ -857,6 +1079,7 @@ class Trainer(object):
                           flush=True)
                 if next_obs is not None:
                     obs_dict = next_obs
+                chunk_idx += 1
                 t += 1
 
             success = 1.0 if last_reward >= 0.5 else 0.0
@@ -908,8 +1131,97 @@ class Trainer(object):
                         except Exception as e:
                             print(f"[eval_rlbench] kp overlay skipped: {type(e).__name__}: {e}",
                                   flush=True)
+
+                    # Imagined-state DLP reconstruction video: each frame is
+                    # the front-view RGB the DLP decoder produces from the
+                    # model's predicted particle tokens for that step.
+                    if _save_imagined_recon and _imagined_recon_frames:
+                        try:
+                            recon_path = os.path.join(video_dir, f"ep{ep:02d}_{tag}_imagined_recon.mp4")
+                            _imageio.mimsave(recon_path, _imagined_recon_frames, fps=20, macro_block_size=1)
+                            print(f"[eval_rlbench] saved imagined recon video: {recon_path}", flush=True)
+                        except Exception as e:
+                            print(f"[eval_rlbench] imagined recon save failed: {type(e).__name__}: {e}", flush=True)
+
+                    # LIVE-token recon: DLP decoder rendering of the actual live
+                    # particle tokens at each step. Should look like the real
+                    # scene if the decoder pipeline is correct.
+                    if _save_imagined_recon and _live_recon_frames:
+                        try:
+                            live_path = os.path.join(video_dir, f"ep{ep:02d}_{tag}_live_recon.mp4")
+                            _imageio.mimsave(live_path, _live_recon_frames, fps=20, macro_block_size=1)
+                            print(f"[eval_rlbench] saved live recon video: {live_path}", flush=True)
+                        except Exception as e:
+                            print(f"[eval_rlbench] live recon save failed: {type(e).__name__}: {e}", flush=True)
+
+                    # Imagined-state KP overlay: each frame shows where the model
+                    # predicted the front-view particles would be at that step,
+                    # drawn on the actual post-step RGB. Divergence from the real
+                    # KP overlay => the model's scene dynamics imagination is
+                    # wrong (even if its action reconstruction on training data
+                    # is accurate).
+                    if _save_imagined and _imagined_kps_front:
+                        try:
+                            from utils.util_func import plot_keypoints_on_image
+                            import torch as _torch
+                            im_frames = []
+                            # frames[0] is the pre-step frame; imagined_kps[i]
+                            # corresponds to frames[i+1] (the post-step frame).
+                            n_pairs = min(len(_imagined_kps_front), len(frames) - 1)
+                            for i in range(n_pairs):
+                                kp_xy = _torch.from_numpy(_imagined_kps_front[i])
+                                img_chw = _torch.from_numpy(frames[i + 1]).permute(2, 0, 1).float() / 255.0
+                                kp_img = plot_keypoints_on_image(
+                                    kp_xy, img_chw,
+                                    radius=2, thickness=1,
+                                    kp_range=(-1, 1), plot_numbers=False,
+                                )
+                                im_frames.append(np.asarray(kp_img, dtype=np.uint8))
+                            if im_frames:
+                                im_path = os.path.join(video_dir, f"ep{ep:02d}_{tag}_imagined_kp.mp4")
+                                _imageio.mimsave(im_path, im_frames, fps=20, macro_block_size=1)
+                                print(f"[eval_rlbench] saved imagined KP video: {im_path}", flush=True)
+                        except Exception as e:
+                            print(f"[eval_rlbench] imagined KP save failed: {type(e).__name__}: {e}", flush=True)
             except Exception as e:
                 print(f"[eval_rlbench] video save failed: {type(e).__name__}: {e}", flush=True)
+
+            # GT replay: reset to same demo initial state, execute the recorded
+            # demo actions open-loop, save alongside the rollout for side-by-side
+            # comparison. Pop happens after the rollout save above, so the
+            # buffer is already empty here.
+            if _save_gt and _demo is not None and _pkl_actions_all is not None:
+                try:
+                    env.reset(demo=_demo)
+                    _demo_actions = np.asarray(_pkl_actions_all[_demo_idx])  # (T, a_dim)
+                    _demo_steps = 0
+                    for _dt in range(_demo_actions.shape[0]):
+                        _a_demo = _demo_actions[_dt]
+                        if np.allclose(_a_demo, 0.0):
+                            break
+                        try:
+                            _, _r_demo, _done_demo, _info_demo = env.step(_a_demo)
+                            _demo_steps += 1
+                            if _done_demo:
+                                break
+                        except Exception:
+                            continue
+                    import imageio.v2 as _imageio
+                    demo_frames, _ = env.pop_recorded_frames()
+                    if demo_frames:
+                        video_dir = os.path.join(self.logdir, "eval_videos", f"step_{self.step}")
+                        os.makedirs(video_dir, exist_ok=True)
+                        _demo_var = int(getattr(_demo, "variation_number", -1))
+                        demo_path = os.path.join(
+                            video_dir,
+                            f"ep{ep:02d}_demo_ep{_demo_idx}_var{_demo_var}.mp4",
+                        )
+                        _imageio.mimsave(demo_path, demo_frames, fps=20, macro_block_size=1)
+                        print(f"[eval_rlbench] saved GT demo video: {demo_path} "
+                              f"(replayed {_demo_steps} actions)", flush=True)
+                except Exception as e:
+                    print(f"[eval_rlbench] GT demo replay failed: "
+                          f"{type(e).__name__}: {e}", flush=True)
 
         env.shutdown()
 

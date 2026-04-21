@@ -197,6 +197,14 @@ class AdaLNPINTDenoiser(nn.Module):
         else:
             self.particle_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
 
+        # Background features: prior versions sliced bg from input and concat'd
+        # it straight to the output unchanged, so bg_dim was never denoised.
+        # Project it into a token, run through the transformer, decode back.
+        if self.bg_dim > 0:
+            self.bg_projection = _make_proj(self.bg_dim)
+            self.bg_decoder = _make_dec(self.bg_dim)
+            self.bg_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+
     def forward(self, x, cond, time, return_attention=False, lang=None, lang_mask=None):
         """
         Input/output flat layout (both paths):
@@ -232,6 +240,12 @@ class AdaLNPINTDenoiser(nn.Module):
 
         t_embed = self.time_mlp(time)  # [bs, projection_dim]
 
+        # Build bg token (inserted between robot tokens and particle tokens).
+        bg_tok_list = []
+        if self.bg_dim > 0 and bg_features is not None:
+            bg_tok = self.bg_projection(bg_features) + self.bg_encoding  # (bs, T, projection_dim)
+            bg_tok_list = [bg_tok.unsqueeze(2)]
+
         if self.split_robot_tokens:
             # Slice action into (pos, rot, grip) and gripper_state into (pos, rot, grip).
             ap0 = 0
@@ -258,7 +272,7 @@ class AdaLNPINTDenoiser(nn.Module):
             p_rot_tok = self.p_rot_projection(p_rot) + self.p_rot_encoding.repeat(bs, T, 1)
             p_grip_tok = self.p_grip_projection(p_grip) + self.p_grip_encoding.repeat(bs, T, 1)
 
-            # Transformer sequence: six robot tokens then particle tokens.
+            # Transformer sequence: six robot tokens, [optional bg token,] then particle tokens.
             x_cat = torch.cat([
                 a_pos_tok.unsqueeze(2),
                 a_rot_tok.unsqueeze(2),
@@ -266,15 +280,18 @@ class AdaLNPINTDenoiser(nn.Module):
                 p_pos_tok.unsqueeze(2),
                 p_rot_tok.unsqueeze(2),
                 p_grip_tok.unsqueeze(2),
+                *bg_tok_list,
                 new_state_particles,
             ], dim=2)
-            particle_start_token_idx = 6
+            bg_token_idx = 6
+            particle_start_token_idx = 6 + len(bg_tok_list)
             anchor = a_pos_tok  # used by the transformer's AdaLN anchor path
         else:
             actions = x[:, :, :self.action_dim]
             action_particle = self.action_projection(actions) + self.action_encoding.repeat(bs, T, 1)
-            x_cat = torch.cat([action_particle.unsqueeze(2), new_state_particles], dim=2)
-            particle_start_token_idx = 1
+            x_cat = torch.cat([action_particle.unsqueeze(2), *bg_tok_list, new_state_particles], dim=2)
+            bg_token_idx = 1
+            particle_start_token_idx = 1 + len(bg_tok_list)
             anchor = action_particle
 
         # Language conditioning: concatenate projected tokens into the self-attention
@@ -317,6 +334,11 @@ class AdaLNPINTDenoiser(nn.Module):
         particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
         particle_decoder_out = particle_decoder_out.view(bs, T, -1)
 
+        # Decode the bg token output (if enabled).
+        bg_decoder_out = None
+        if self.bg_dim > 0 and bg_features is not None:
+            bg_decoder_out = self.bg_decoder(particles_trans[:, :, bg_token_idx, :])
+
         if self.split_robot_tokens:
             a_pos_out = self.a_pos_decoder(particles_trans[:, :, 0, :])
             a_rot_out = self.a_rot_decoder(particles_trans[:, :, 1, :])
@@ -327,15 +349,15 @@ class AdaLNPINTDenoiser(nn.Module):
 
             parts = [a_pos_out, a_rot_out, a_grip_out,
                      p_pos_out, p_rot_out, p_grip_out]
-            if self.bg_dim > 0 and bg_features is not None:
-                parts.append(bg_features)
+            if bg_decoder_out is not None:
+                parts.append(bg_decoder_out)
             parts.append(particle_decoder_out)
             x_out = torch.cat(parts, dim=-1)
         else:
             action_decoder_out = self.action_decoder(particles_trans[:, :, 0, :])
             parts = [action_decoder_out]
-            if self.bg_dim > 0 and bg_features is not None:
-                parts.append(bg_features)
+            if bg_decoder_out is not None:
+                parts.append(bg_decoder_out)
             parts.append(particle_decoder_out)
             x_out = torch.cat(parts, dim=-1)
 

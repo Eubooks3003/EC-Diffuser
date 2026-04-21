@@ -25,6 +25,7 @@ and pulling it into EC-Diffuser would create a hard dep. The training pipeline
 already loads dlp_ckpt + dlp_cfg from disk; the rollout entrypoint passes a
 small wrapper that runs that encoder per-frame and returns the 2D-DLP tokens.
 """
+import os
 import re
 
 import numpy as np
@@ -229,7 +230,7 @@ class RLBenchDLPEnv:
     def __init__(self, task_name: str, dlp_encode_fn,
                  cams=None, image_size: int = 128, headless: bool = True,
                  episode_length: int = 400, action_mode_kwargs=None,
-                 delta_actions: bool = False):
+                 delta_actions: bool = False, dataset_root: str = None):
         self.task_name = task_name
         self.dlp_encode_fn = dlp_encode_fn
         self.cams = list(cams) if cams is not None else list(DEFAULT_CAMS)
@@ -238,6 +239,9 @@ class RLBenchDLPEnv:
         self.episode_length = int(episode_length)
         self.action_mode_kwargs = action_mode_kwargs or {}
         self.delta_actions = bool(delta_actions)
+        # Required for reset_to_demo (OCGS-style GT replay). Falls back to
+        # ECDIFF_DEMO_ROOT env var so existing callers don't need updating.
+        self.dataset_root = dataset_root or os.environ.get("ECDIFF_DEMO_ROOT")
 
         self._env = None
         self._task = None
@@ -256,6 +260,7 @@ class RLBenchDLPEnv:
         from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning
         from rlbench.action_modes.gripper_action_modes import Discrete
         from rlbench.environment import Environment
+        from pyrep.const import RenderMode
 
         obs_config = ObservationConfig()
         obs_config.set_all(False)
@@ -275,9 +280,14 @@ class RLBenchDLPEnv:
             attr = cam_attrs.get(cam)
             if attr is None:
                 raise ValueError(f"Unknown RLBench camera name: {cam}")
+            # render_mode=OPENGL matches how demos were collected (no shadow,
+            # flat lighting). CameraConfig's default is OPENGL3 which has
+            # different shadows/lighting, producing RGB that differs from the
+            # PNGs the DLP was trained on.
             cc = CameraConfig(
                 image_size=(self.image_size, self.image_size),
                 rgb=True, depth=False, point_cloud=False, mask=False,
+                render_mode=RenderMode.OPENGL,
             )
             setattr(obs_config, attr, cc)
 
@@ -288,9 +298,12 @@ class RLBenchDLPEnv:
             gripper_action_mode=Discrete(),
         )
 
-        self._env = Environment(action_mode=action_mode,
-                                obs_config=obs_config,
-                                headless=self.headless)
+        env_kwargs = dict(action_mode=action_mode,
+                          obs_config=obs_config,
+                          headless=self.headless)
+        if self.dataset_root:
+            env_kwargs["dataset_root"] = self.dataset_root
+        self._env = Environment(**env_kwargs)
         self._env.launch()
         self._task_class = _resolve_task_class(self.task_name)
         self._task = self._env.get_task(self._task_class)
@@ -359,28 +372,33 @@ class RLBenchDLPEnv:
         self._recorded_tokens_front = []
         return frames, front_toks
 
-    def reset(self, variation: int = None):
+    def reset(self, variation: int = None, demo=None):
         if self._env is None:
             self._launch()
-        if variation is None:
-            variation = np.random.randint(self._task.variation_count())
-        variation = int(variation) % self._task.variation_count()
-        self._task.set_variation(variation)
-        self._current_variation = variation
-        descriptions, rlbench_obs = self._task.reset()
+        if demo is not None:
+            # reset_to_demo path: restores the exact initial scene state of
+            # the recorded demo so rollout and demo replay are directly
+            # comparable frame-by-frame. Demo's own variation wins.
+            demo_var = int(getattr(demo, "variation_number", variation or 0))
+            demo_var = demo_var % self._task.variation_count()
+            self._task.set_variation(demo_var)
+            self._current_variation = demo_var
+            descriptions, rlbench_obs = self._task.reset_to_demo(demo)
+        else:
+            if variation is None:
+                variation = np.random.randint(self._task.variation_count())
+            variation = int(variation) % self._task.variation_count()
+            self._task.set_variation(variation)
+            self._current_variation = variation
+            descriptions, rlbench_obs = self._task.reset()
         self._current_lang = descriptions[0] if len(descriptions) > 0 else ""
         self._step_count = 0
         self._recorded_frames = []
+        self._recorded_tokens_front = []
         self._record(rlbench_obs, tokens_front=getattr(self, "_last_tokens_front", None))
         return self._make_obs_dict(rlbench_obs)
 
     # ------------------------------------------------------------------ step
-    # Workspace clamp: RLBench rejects poses at/below the table as
-    # InvalidActionError even if they're just ~mm below. Clamp z to a small
-    # safety margin above the table. Values matched to training data +
-    # RLBench Panda table height.
-    _Z_MIN = 0.760   # training min was 0.758; a tiny ε above to be safe
-
     def _action_to_rlbench(self, action: np.ndarray, current_pose: np.ndarray = None) -> np.ndarray:
         """Convert the policy's 10D action into the 9D RLBench format
         [pos(3), quat_xyzw(4), gripper_open(1), ignore_collisions(1)].
@@ -413,9 +431,7 @@ class RLBenchDLPEnv:
         else:
             pos = a[:3].copy()
             quat = rot6d_to_quat_xyzw(a[3:9])
-        # Clamp z above table to avoid InvalidActionError on near-table predictions.
         pos = pos.astype(np.float32)
-        pos[2] = max(float(pos[2]), self._Z_MIN)
         gopen = np.array([1.0 if a[9] >= 0.5 else 0.0], dtype=np.float32)
         ignore_coll = np.array([1.0], dtype=np.float32)  # skip planner collision checks
         return np.concatenate([pos, quat, gopen, ignore_coll], axis=0)

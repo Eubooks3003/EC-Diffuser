@@ -440,8 +440,19 @@ if do_eval and eval_backend == "rlbench":
             rgbs = _torch.nn.functional.interpolate(
                 rgbs, size=(_img_size, _img_size), mode="bilinear", align_corners=False
             )
-        enc = dlp_model.encode_all(rgbs, deterministic=True)
-        toks, bg = _pack_tokens_2d(enc)  # (V, K, Dtok), (V, bg_F)
+        # Match preprocessing's per-view batching (preprocess script encodes
+        # one view at a time). All-views-in-one-batch gives different tokens
+        # due to cross-batch dependency in the encoder.
+        per_view_toks = []
+        per_view_bg = []
+        for vi in range(rgbs.shape[0]):
+            chunk = rgbs[vi:vi + 1]
+            enc = dlp_model.encode_all(chunk, deterministic=True)
+            toks_v, bg_v = _pack_tokens_2d(enc)
+            per_view_toks.append(toks_v)
+            per_view_bg.append(bg_v)
+        toks = _torch.cat(per_view_toks, dim=0)
+        bg = _torch.cat(per_view_bg, dim=0)
         V, K, Dtok = toks.shape
         return {
             "tokens": toks.reshape(V * K, Dtok).cpu().numpy(),
@@ -450,7 +461,7 @@ if do_eval and eval_backend == "rlbench":
 
     def make_env_fn():
         from diffuser.envs.rlbench_dlp_wrapper import RLBenchDLPEnv
-        return RLBenchDLPEnv(
+        _env = RLBenchDLPEnv(
             task_name=args.dataset,
             dlp_encode_fn=_dlp_encode_fn,
             cams=_cams,
@@ -459,6 +470,9 @@ if do_eval and eval_backend == "rlbench":
             episode_length=int(getattr(args, "rlbench_max_steps", 400)),
             delta_actions=not bool(getattr(args, "use_absolute_actions", True)),
         )
+        # Expose DLP decoder for imagined-recon video rendering during eval.
+        _env._dlp_model = dlp_model
+        return _env
 
     def make_policy_fn():
         from diffuser.sampling import LanguageConditionedPolicy
@@ -519,12 +533,26 @@ for i in range(start_epoch, n_epochs):
             print(f"[mimicgen eval] epoch={i} :: {sim_stats}", flush=True)
 
         elif eval_backend == "rlbench":
+            # Auto-populate diagnostic flags from config so the user can run
+            # plain `python train.py ...` without exporting ECDIFF_* vars.
+            # setdefault() lets shell-exported vars still win if set.
+            if getattr(args, "save_gt_video", False):
+                os.environ.setdefault("ECDIFF_SAVE_GT_VIDEO", "1")
+            _demo_root_cfg = getattr(args, "demo_dataset_root", None)
+            if _demo_root_cfg:
+                os.environ.setdefault("ECDIFF_DEMO_ROOT", str(_demo_root_cfg))
+            if getattr(args, "save_imagined", False):
+                os.environ.setdefault("ECDIFF_SAVE_IMAGINED", "1")
+            if getattr(args, "save_imagined_recon", False):
+                os.environ.setdefault("ECDIFF_SAVE_IMAGINED_RECON", "1")
+
             sim_stats = trainer.eval_rlbench_rollouts(
                 make_env_fn=make_env_fn,
                 make_policy_fn=make_policy_fn,
                 n_episodes=getattr(args, "rlbench_eval_episodes", 5),
                 max_steps=getattr(args, "rlbench_max_steps", 400),
                 task_name=getattr(args, "dataset", None),
+                exe_steps=getattr(args, "exe_steps", 1),
             )
             log_stats = {k if k.startswith("sim/") else f"sim/{k}": v for k, v in sim_stats.items()}
             wandb.log({"step": trainer.step, **log_stats})

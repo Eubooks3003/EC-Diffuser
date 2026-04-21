@@ -250,14 +250,26 @@ def main(argv):
 
     @torch.no_grad()
     def _dlp_encode_fn(rgbs_np):
+        # Match preprocessing's per-view batching (see
+        # lpwm-copy/scripts/ec_diffuser_rlbench_multiview_preprocess.py:332-360).
+        # Encoding all views in a single batch vs one-at-a-time produces
+        # different tokens because of cross-batch dependencies in the encoder.
         rgbs = torch.from_numpy(np.asarray(rgbs_np)).float() / 255.0
-        rgbs = rgbs.permute(0, 3, 1, 2).to(args.device)
+        rgbs = rgbs.permute(0, 3, 1, 2).to(args.device)  # (V, 3, H, W)
         if rgbs.shape[-1] != _img_size:
             rgbs = torch.nn.functional.interpolate(
                 rgbs, size=(_img_size, _img_size), mode="bilinear", align_corners=False
             )
-        enc = dlp_model.encode_all(rgbs, deterministic=True)
-        toks, bg = _pack_tokens_2d(enc)
+        per_view_toks = []
+        per_view_bg = []
+        for vi in range(rgbs.shape[0]):
+            chunk = rgbs[vi:vi + 1]  # (1, 3, H, W)
+            enc = dlp_model.encode_all(chunk, deterministic=True)
+            toks_v, bg_v = _pack_tokens_2d(enc)
+            per_view_toks.append(toks_v)
+            per_view_bg.append(bg_v)
+        toks = torch.cat(per_view_toks, dim=0)  # (V, K, Dtok)
+        bg = torch.cat(per_view_bg, dim=0)      # (V, bg_F)
         V, K, Dtok = toks.shape
         return {
             "tokens": toks.reshape(V * K, Dtok).cpu().numpy(),
@@ -298,7 +310,7 @@ def main(argv):
     # -------------------------------------------------------------------
     def make_env_fn():
         from diffuser.envs.rlbench_dlp_wrapper import RLBenchDLPEnv
-        return RLBenchDLPEnv(
+        _env = RLBenchDLPEnv(
             task_name=args.dataset,
             dlp_encode_fn=_dlp_encode_fn,
             cams=_cams,
@@ -307,6 +319,10 @@ def main(argv):
             episode_length=int(args._max_steps),
             delta_actions=not bool(getattr(args, "use_absolute_actions", True)),
         )
+        # Expose the DLP encoder+decoder to the trainer so it can optionally
+        # render imagined particle states (ECDIFF_SAVE_IMAGINED_RECON=1).
+        _env._dlp_model = dlp_model
+        return _env
 
     def make_policy_fn():
         from diffuser.sampling import LanguageConditionedPolicy
@@ -322,12 +338,25 @@ def main(argv):
     # -------------------------------------------------------------------
     # Run
     # -------------------------------------------------------------------
+    # Auto-populate diagnostic flags from config so `python eval_rlbench.py ...`
+    # works without any exported env vars. setdefault() lets shell overrides win.
+    if getattr(args, "save_gt_video", False):
+        os.environ.setdefault("ECDIFF_SAVE_GT_VIDEO", "1")
+    _demo_root_cfg = getattr(args, "demo_dataset_root", None)
+    if _demo_root_cfg:
+        os.environ.setdefault("ECDIFF_DEMO_ROOT", str(_demo_root_cfg))
+    if getattr(args, "save_imagined", False):
+        os.environ.setdefault("ECDIFF_SAVE_IMAGINED", "1")
+    if getattr(args, "save_imagined_recon", False):
+        os.environ.setdefault("ECDIFF_SAVE_IMAGINED_RECON", "1")
+
     sim_stats = trainer.eval_rlbench_rollouts(
         make_env_fn=make_env_fn,
         make_policy_fn=make_policy_fn,
         n_episodes=args._n_episodes,
         max_steps=args._max_steps,
         task_name=args.dataset,
+        exe_steps=getattr(args, "exe_steps", 1),
     )
     print(f"\n[eval_rlbench] final :: {sim_stats}", flush=True)
 

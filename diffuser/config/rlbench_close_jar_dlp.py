@@ -31,7 +31,7 @@ mode_to_args = {
     'use_views': [0, 1],      # 0=front, 1=overhead, 2=left_shoulder, 3=right_shoulder
     'num_source_views': 4,    # total views in the multiview pkl
     'device': 'cuda:0',
-    'max_path_length': 400,   # Tmax from RLBench demos
+    'max_path_length': 600,   # Tmax from RLBench demos (pkl has 600 timesteps)
     'max_demos': 100,
     'eval_freq': 60,
     'eval_backend': 'rlbench',
@@ -50,10 +50,16 @@ mode_to_args = {
     'rlbench_max_steps': 400,
     # -------------------------
     "use_absolute_actions": True,
-    'horizon': 5,
-    'exe_steps': 1,
+    'horizon': 6,
+    'exe_steps': 3,
     "random_init": True,
     "random_init_eval": True,
+    # Eval-time diagnostics (auto-exported to ECDIFF_* env vars by train.py /
+    # eval_rlbench.py so no shell setup is needed).
+    'save_gt_video': True,
+    'demo_dataset_root': '/home/ellina/Desktop/data/rlbench_rgb',
+    'save_imagined': True,
+    'save_imagined_recon': True,
   },
 }
 
@@ -72,7 +78,7 @@ base = {
         'dropout': 0.0,
 
         'n_diffusion_steps': 5,
-        'action_weight': 50,
+        'action_weight': 1,
 
         'max_particles': 40,
         'positional_bias': False,
