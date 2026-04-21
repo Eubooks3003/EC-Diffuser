@@ -200,7 +200,7 @@ class CausalParticleAttention(nn.Module):
         else:
             self.rel_pos_bias = nn.Identity()
 
-    def forward(self, x, c=None, return_attention=False):
+    def forward(self, x, c=None, return_attention=False, attn_mask=None):
         B, N, T, C = x.size()  # batch size, n_particles, sequence length, embedding dim
         # Determine inputs for query and key/value projections based on attention type.
         query_input = x
@@ -243,6 +243,12 @@ class CausalParticleAttention(nn.Module):
             att = att.view(B, -1, N, T, N, T)
             att = att.masked_fill(self.mask[:, :, :, :T, :, :T] == 0, float('-inf'))
             att = att.view(B, -1, N * T, N * T)
+
+        # Padding mask over key positions: attn_mask is (B, N) token-level validity,
+        # broadcast across key-time so softmax ignores invalid tokens entirely.
+        if attn_mask is not None and self.att_type == 'self':
+            key_mask = attn_mask.unsqueeze(-1).expand(B, N, T).reshape(B, N * T)
+            att = att.masked_fill(key_mask.view(B, 1, 1, N * T) == 0, float('-inf'))
 
         att = F.softmax(att, dim=-1)
         if return_attention:
@@ -376,26 +382,26 @@ class AdaLNPINTBlock(nn.Module):
         nn.init.zeros_(self.gamma_1.weight)
         nn.init.zeros_(self.beta_1.weight)
         nn.init.zeros_(self.gamma_1.bias)
-        nn.init.zeros_(self.beta_1.bias)  
+        nn.init.zeros_(self.beta_1.bias)
 
         nn.init.zeros_(self.gamma_2.weight)
         nn.init.zeros_(self.beta_2.weight)
         nn.init.zeros_(self.gamma_2.bias)
-        nn.init.zeros_(self.beta_2.bias)  
+        nn.init.zeros_(self.beta_2.bias)
 
         nn.init.zeros_(self.scale_1.weight)
         nn.init.zeros_(self.scale_2.weight)
         nn.init.zeros_(self.scale_1.bias)
-        nn.init.zeros_(self.scale_2.bias)  
+        nn.init.zeros_(self.scale_2.bias)
 
-    def forward(self, x, c):
+    def forward(self, x, c, attn_mask=None):
         scale_msa = self.gamma_1(c)
         shift_msa = self.beta_1(c)
         scale_mlp = self.gamma_2(c)
         shift_mlp = self.beta_2(c)
         gate_msa = self.scale_1(c).unsqueeze(1)
         gate_mlp = self.scale_2(c).unsqueeze(1)
-        x = self.attn(modulate(self.ln_1(x), shift_msa, scale_msa)) * gate_msa + x
+        x = self.attn(modulate(self.ln_1(x), shift_msa, scale_msa), attn_mask=attn_mask) * gate_msa + x
         return self.mlp(modulate(self.ln_2(x), shift_mlp, scale_mlp)) * gate_mlp + x
     
 
@@ -441,13 +447,10 @@ class AdaLNParticleTransformer(nn.Module):
         super().__init__()
         self.positional_bias = positional_bias
         self.max_particles = max_particles
-        if self.positional_bias: 
-            # When positional_bias is True, a per-particle bias is used, so no extra embedding is added.
+        if self.positional_bias:
             self.pos_emb = nn.Identity()
         else:
-            # Otherwise, use a shared learned positional embedding for all particles at each timestep.
             self.pos_emb = nn.Parameter(torch.zeros(1, block_size, n_embed))
-        # Build the stacked transformer blocks.
         self.blocks = nn.Sequential(*[AdaLNPINTBlock(n_embed, n_head, block_size, attn_pdrop,
                                                        resid_pdrop, hidden_dim_multiplier,
                                                        positional_bias, activation=activation,
@@ -485,7 +488,7 @@ class AdaLNParticleTransformer(nn.Module):
             if not self.positional_bias:
                 torch.nn.init.normal_(module.pos_emb, mean=0.0, std=std)
 
-    def forward(self, x, action_embed, t_embed, return_attention=False):
+    def forward(self, x, action_embed, t_embed, return_attention=False, attn_mask=None):
         b, n, t, f = x.size()
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
         assert f == self.n_embed, "invalid particle feature dim"
@@ -504,7 +507,7 @@ class AdaLNParticleTransformer(nn.Module):
                 x, attention_matrix = block(x, return_attention=True)
                 attention_dict[f'layer_{i}'] = attention_matrix
             else:
-                x = block(x, c)
+                x = block(x, c, attn_mask=attn_mask)
         x = self.ln_f(x, c)
         logits = self.head(x)
 

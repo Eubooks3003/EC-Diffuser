@@ -18,8 +18,8 @@ from .normalization import DatasetNormalizer
 from .buffer import ReplayBuffer
 
 
-Batch = namedtuple('Batch', ['trajectories', 'conditions', 'lang'])
-Batch.__new__.__defaults__ = (None,)  # lang defaults to None for non-language datasets
+Batch = namedtuple('Batch', ['trajectories', 'conditions', 'action_conditions', 'lang', 'lang_mask'])
+Batch.__new__.__defaults__ = (None, None, None)  # action_conditions / lang / lang_mask default to None
 ValueBatch = namedtuple('ValueBatch', 'trajectories conditions values')
 
 class SequenceDataset(torch.utils.data.Dataset):
@@ -119,6 +119,21 @@ class SequenceDataset(torch.utils.data.Dataset):
                 print(f'[ datasets/sequence ] Background features available but not used (use_bg_obs=False)')
 
         self.successful_episode_idxes = fields.successful_episode_idxes
+
+        # OCGS-style action convention: action[t] = current pose, not next pose.
+        # The pkl was preprocessed with action[t] = gripper_state[t+1] (next pose,
+        # see lpwm-copy/scripts/ec_diffuser_rlbench_multiview_preprocess.py:171-179),
+        # but the in-trainer eval at utils/training.py:817-828 pins action[0] to
+        # the *current* gripper pose from the env and executes traj[1]. Training
+        # and eval therefore see different distributions for the action[0] pin.
+        # Rebind actions to gripper_state so action[t] = current pose at frame t
+        # (matching OCGS scripts/preprocess_data.py:255). Must happen before the
+        # normalizer below so action statistics are computed from the new labels.
+        if self.has_gripper_state:
+            fields._dict['actions'] = fields._dict['gripper_state'].copy()
+            print('[ datasets/sequence ] Rebinding actions <- gripper_state '
+                  '(current-pose convention; matches eval pin)')
+
         self.normalizer = DatasetNormalizer(fields, normalizer, particle_normalizer=particle_normalizer, path_lengths=fields['path_lengths'], action_normalizer=action_normalizer)
 
         # Sanity check: verify normalize -> unnormalize round-trip
@@ -201,6 +216,10 @@ class SequenceDataset(torch.utils.data.Dataset):
         parts.append(observations[0])
         return {0: np.concatenate(parts, axis=-1)}
 
+    def get_action_conditions(self, actions):
+        '''Proprioception conditioning: pin action at t=0 to demo's action[0].'''
+        return {0: actions[0]}
+
     def __len__(self):
         return len(self.indices)
 
@@ -223,6 +242,7 @@ class SequenceDataset(torch.utils.data.Dataset):
             bg_features = None
 
         conditions = self.get_conditions(observations, gripper_state, bg_features)
+        action_conditions = self.get_action_conditions(actions)
         if self.obs_only:
             trajectories = observations
         else:
@@ -234,7 +254,7 @@ class SequenceDataset(torch.utils.data.Dataset):
                 traj_parts.append(bg_features)
             traj_parts.append(observations)
             trajectories = np.concatenate(traj_parts, axis=-1)
-        batch = Batch(trajectories, conditions)
+        batch = Batch(trajectories, conditions, action_conditions)
         return batch
 
 
@@ -294,6 +314,7 @@ class GoalDataset(SequenceDataset):
                 bg_features = np.vstack([bg_features] + [last_bg] * padding_needed)
 
         conditions = self.get_conditions(observations, gripper_state, bg_features)
+        action_conditions = self.get_action_conditions(actions)
         if self.obs_only:
             trajectories = observations
         else:
@@ -305,7 +326,7 @@ class GoalDataset(SequenceDataset):
                 traj_parts.append(bg_features)
             traj_parts.append(observations)
             trajectories = np.concatenate(traj_parts, axis=-1)
-        batch = Batch(trajectories, conditions)
+        batch = Batch(trajectories, conditions, action_conditions)
         return batch
 
     def get_conditions(self, observations, gripper_state=None, bg_features=None):
@@ -383,28 +404,23 @@ class LanguageConditionedDataset(GoalDataset):
             self._cache.get(s)
 
     def _get_lang_tokens(self, path_ind):
-        """Pick a random paraphrase for episode path_ind, return encoded tensor.
-
-        Always returns a fixed-shape tensor so default collate works:
-          pooled: (1, clip_dim)
-          else:   (max_lang_tokens, clip_dim), zero-padded beyond valid length.
-        """
+        """Return (tokens, mask). tokens: (L, clip_dim). mask: (L,) 1=valid, 0=pad."""
         if not self._has_lang:
-            return torch.zeros((1, 1), dtype=torch.float32)
+            return (torch.zeros((1, 1), dtype=torch.float32),
+                    torch.zeros((1,), dtype=torch.float32))
         paraphrases = self.fields.language[path_ind]
         s = paraphrases[np.random.randint(len(paraphrases))]
         emb = self._cache.get(s)
         if self.lang_pooled:
-            return emb.unsqueeze(0).float()                   # (1, clip_dim)
+            return emb.unsqueeze(0).float(), torch.ones((1,), dtype=torch.float32)
         tokens, mask = emb
-        valid = int(mask.sum().item())
-        valid = max(1, min(valid, self.max_lang_tokens))
-        out = torch.zeros((self.max_lang_tokens, tokens.shape[-1]), dtype=torch.float32)
-        out[:valid] = tokens[:valid].float()
-        return out                                            # (max_lang_tokens, clip_dim)
+        return (tokens[:self.max_lang_tokens].float(),
+                mask[:self.max_lang_tokens].float())
 
     def __getitem__(self, idx):
-        batch = super().__getitem__(idx)  # (trajectories, conditions, lang=None from default)
+        batch = super().__getitem__(idx)
         path_ind = int(self.indices[idx][0])
-        lang = self._get_lang_tokens(path_ind)
-        return Batch(trajectories=batch.trajectories, conditions=batch.conditions, lang=lang)
+        lang, lang_mask = self._get_lang_tokens(path_ind)
+        return Batch(trajectories=batch.trajectories, conditions=batch.conditions,
+                     action_conditions=batch.action_conditions,
+                     lang=lang, lang_mask=lang_mask)

@@ -76,11 +76,18 @@ def main(argv):
         overfit=getattr(args, "overfit", False),
         max_demos=getattr(args, "max_demos", None),
         gripper_state_mask_ratio=getattr(args, "gripper_state_mask_ratio", 0.0),
-        single_view=(args.input_type == "dlp" and not args.multiview),
+        single_view=(
+            args.input_type == "dlp"
+            and not args.multiview
+            and getattr(args, "use_views", None) is None
+        ),
         clip_model_name=getattr(args, "clip_model_name", "openai/clip-vit-base-patch32"),
         lang_pooled=getattr(args, "lang_pooled", False),
         max_lang_tokens=getattr(args, "max_lang_tokens", 32),
         lang_device=getattr(args, "lang_device", "cpu"),
+        use_views=getattr(args, "use_views", None),
+        num_source_views=getattr(args, "num_source_views", None),
+        action_normalizer=getattr(args, "action_normalizer", None),
     )
     dataset = dataset_config()
     observation_dim = dataset.observation_dim
@@ -298,6 +305,7 @@ def main(argv):
             image_size=_img_size,
             headless=bool(getattr(args, "rlbench_headless", True)),
             episode_length=int(args._max_steps),
+            delta_actions=not bool(getattr(args, "use_absolute_actions", True)),
         )
 
     def make_policy_fn():

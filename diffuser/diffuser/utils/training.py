@@ -768,11 +768,15 @@ class Trainer(object):
                 print(f"[eval_rlbench] ep={ep} reset failed: {type(e).__name__}: {e}", flush=True)
                 successes.append(0.0); lengths.append(0); continue
 
-            policy.set_instruction(obs_dict["language"])
-            # Broadcast lang tokens to batch=1, move to device.
-            lang = policy._lang_tokens.to(device)
-            if lang.shape[0] != 1:
-                lang = lang[:1]
+            _lang_override = os.environ.get("ECDIFF_LANG_OVERRIDE")
+            if _lang_override:
+                print(f"[eval_rlbench]   LANG OVERRIDE: replacing {obs_dict['language']!r} with {_lang_override!r}", flush=True)
+                policy.set_instruction(_lang_override)
+            else:
+                policy.set_instruction(obs_dict["language"])
+            # Broadcast lang tokens + mask to batch=1, move to device.
+            lang = policy._lang_tokens.to(device)[:1]
+            lang_mask = policy._lang_mask.to(device)[:1]
 
             last_reward = 0.0
             last_error = None
@@ -808,10 +812,36 @@ class Trainer(object):
                 cond_0 = _torch.cat(parts, dim=-1).to(device)   # (1, gripper+bg+K*D)
                 cond = {0: cond_0}
 
-                sample = self.ema_model(cond, lang=lang, verbose=False)
+                # Proprioception conditioning: pin action[0] = current gripper pose
+                # (same 10D [pos, rot6d, open] format as actions) in actions-normalized space.
+                action_cond_raw = gs_np.reshape(1, -1)  # (1, 10) — gripper_state matches action dim
+                action_cond_normed = self.dataset.normalizer.normalize(action_cond_raw, "actions")
+                action_cond_tensor = _torch.from_numpy(action_cond_normed).float().to(device)
+                action_cond = {0: action_cond_tensor}
+
+                sample = self.ema_model(cond, lang=lang, lang_mask=lang_mask,
+                                        action_cond=action_cond, verbose=False)
                 traj = sample.trajectories[0]                   # (H, a_dim + gripper + bg + K*D)
-                a_norm = traj[0, :a_dim].detach().cpu().numpy().astype(np.float32)
+                # Execute action[1] (first predicted step after pinned current pose),
+                # not action[0] (which equals current pose by construction).
+                a_norm = traj[1, :a_dim].detach().cpu().numpy().astype(np.float32)
                 action = self.dataset.normalizer.unnormalize(a_norm[None], "actions")[0]
+
+                if os.environ.get("ECDIFF_DEBUG_ACTIONS") == "1":
+                    a0n = traj[0, :a_dim].detach().cpu().numpy().astype(np.float32)
+                    a0 = self.dataset.normalizer.unnormalize(a0n[None], "actions")[0]
+                    aH_n = traj[-1, :a_dim].detach().cpu().numpy().astype(np.float32)
+                    aH = self.dataset.normalizer.unnormalize(aH_n[None], "actions")[0]
+                    dpos_01 = float(np.linalg.norm(action[:3] - a0[:3]))
+                    dpos_0H = float(np.linalg.norm(aH[:3] - a0[:3]))
+                    print(f"[debug t={t:3d}] "
+                          f"gs.pos=({gs_np[0]:+.3f},{gs_np[1]:+.3f},{gs_np[2]:+.3f}) "
+                          f"a0.pos=({a0[0]:+.3f},{a0[1]:+.3f},{a0[2]:+.3f}) "
+                          f"a1.pos=({action[0]:+.3f},{action[1]:+.3f},{action[2]:+.3f}) "
+                          f"|a1-a0|={dpos_01:.4f} |aH-a0|={dpos_0H:.4f} "
+                          f"grip[a0,a1,aH]=({a0[9]:+.2f},{action[9]:+.2f},{aH[9]:+.2f}) "
+                          f"gs.grip={gs_np[9]:+.2f}",
+                          flush=True)
 
                 next_obs, reward, done, info = env.step(action)
                 last_reward = float(reward)

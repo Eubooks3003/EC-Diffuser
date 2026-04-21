@@ -220,15 +220,13 @@ class LanguageConditionedPolicy:
     def set_instruction(self, text: str):
         """Encode once. Call at env reset; reuse for every denoising step after."""
         if self.lang_pooled:
-            emb = self._encoder.encode([text])        # (1, clip_dim)
-            self._lang_tokens = emb.unsqueeze(1).float()  # (1, 1, clip_dim)
+            emb = self._encoder.encode([text])
+            self._lang_tokens = emb.unsqueeze(1).float()
+            self._lang_mask = torch.ones((1, 1), dtype=torch.float32)
         else:
-            tokens, mask = self._encoder.encode([text])   # (1, 77, D), (1, 77)
-            valid = int(mask.sum().item())
-            valid = max(1, min(valid, self.max_lang_tokens))
-            out = torch.zeros((1, self.max_lang_tokens, tokens.shape[-1]), dtype=torch.float32)
-            out[0, :valid] = tokens[0, :valid].float()
-            self._lang_tokens = out                       # (1, max_lang_tokens, clip_dim)
+            tokens, mask = self._encoder.encode([text])
+            self._lang_tokens = tokens[:, :self.max_lang_tokens, :].float()
+            self._lang_mask = mask[:, :self.max_lang_tokens].float()
 
     def __call__(self, conditions, batch_size=1, verbose=True, return_attention=False,
                  gripper_state=None):
@@ -258,18 +256,22 @@ class LanguageConditionedPolicy:
 
         # Broadcast lang to match batch, move to device.
         lang = self._lang_tokens.to(self.device)  # (1, L, D)
+        lang_mask = self._lang_mask.to(self.device)  # (1, L)
         if lang.shape[0] != batch_size:
             lang = lang.expand(batch_size, -1, -1).contiguous()
+            lang_mask = lang_mask.expand(batch_size, -1).contiguous()
 
         if return_attention:
             samples, att_dict = self.diffusion_model(
                 conditions, verbose=verbose, sort_by_value=False,
-                return_attention=return_attention, lang=lang, **self.sample_kwargs)
+                return_attention=return_attention, lang=lang, lang_mask=lang_mask,
+                **self.sample_kwargs)
             att_dict = {k: utils.to_np(v) for k, v in att_dict.items()}
         else:
             samples = self.diffusion_model(
                 conditions, verbose=verbose, sort_by_value=False,
-                return_attention=return_attention, lang=lang, **self.sample_kwargs)
+                return_attention=return_attention, lang=lang, lang_mask=lang_mask,
+                **self.sample_kwargs)
         trajectories = utils.to_np(samples.trajectories)
 
         obs_start_idx = self.action_dim + self.gripper_dim

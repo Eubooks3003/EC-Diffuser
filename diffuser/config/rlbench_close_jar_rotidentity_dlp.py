@@ -38,10 +38,10 @@ mode_to_args = {
     'act_rot_dim': 6,             # rot6d occupies 6 action dims
     'lang_dim': 512,                          # CLIP ViT-B/32 hidden size
     'lang_pooled': False,
-    'max_lang_tokens': 32,
+    'max_lang_tokens': 10,
     'clip_model_name': 'openai/clip-vit-base-patch32',
     'lang_device': 'cpu',
-    'rlbench_cams': ['front'],
+    'rlbench_cams': ['front', 'overhead', 'left_shoulder', 'right_shoulder'],
     'rlbench_image_size': 128,
     'rlbench_headless': True,
     'rlbench_max_steps': 400,

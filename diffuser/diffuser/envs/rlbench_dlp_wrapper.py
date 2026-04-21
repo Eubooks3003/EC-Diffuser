@@ -132,6 +132,51 @@ def quat_xyzw_to_rot6d(quat: np.ndarray) -> np.ndarray:
     return np.array([r00, r10, r20, r01, r11, r21], dtype=np.float32)
 
 
+def quat_xyzw_to_matrix(quat: np.ndarray) -> np.ndarray:
+    """xyzw quat -> 3x3 rotation matrix."""
+    x, y, z, w = quat[0], quat[1], quat[2], quat[3]
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
+def rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
+    """rot6d = [r00, r10, r20, r01, r11, r21] -> 3x3 R via Gram-Schmidt."""
+    rot6d = np.asarray(rot6d, dtype=np.float64).reshape(6)
+    a1 = rot6d[:3]; a2 = rot6d[3:]
+    b1 = a1 / (np.linalg.norm(a1) + 1e-12)
+    b2 = a2 - np.dot(b1, a2) * b1
+    b2 = b2 / (np.linalg.norm(b2) + 1e-12)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=1)
+
+
+def matrix_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
+    """3x3 rotation matrix -> (x, y, z, w) unit quaternion (Shepperd's method)."""
+    m = np.asarray(R, dtype=np.float64)
+    m00, m01, m02 = m[0, 0], m[0, 1], m[0, 2]
+    m10, m11, m12 = m[1, 0], m[1, 1], m[1, 2]
+    m20, m21, m22 = m[2, 0], m[2, 1], m[2, 2]
+    tr = m00 + m11 + m22
+    if tr > 0.0:
+        s = np.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * s; x = (m21 - m12) / s; y = (m02 - m20) / s; z = (m10 - m01) / s
+    elif (m00 > m11) and (m00 > m22):
+        s = np.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        w = (m21 - m12) / s; x = 0.25 * s; y = (m01 + m10) / s; z = (m02 + m20) / s
+    elif m11 > m22:
+        s = np.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        w = (m02 - m20) / s; x = (m01 + m10) / s; y = 0.25 * s; z = (m12 + m21) / s
+    else:
+        s = np.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        w = (m10 - m01) / s; x = (m02 + m20) / s; y = (m12 + m21) / s; z = 0.25 * s
+    q = np.array([x, y, z, w], dtype=np.float64)
+    q /= (np.linalg.norm(q) + 1e-12)
+    return q.astype(np.float32)
+
+
 def _gripper_state_from_obs(obs) -> np.ndarray:
     """Build the 10D gripper-state vector [pos(3), rot6d(6), open(1)] from a
     raw RLBench Observation. Mirrors the preprocessing pipeline so the trained
@@ -183,7 +228,8 @@ class RLBenchDLPEnv:
 
     def __init__(self, task_name: str, dlp_encode_fn,
                  cams=None, image_size: int = 128, headless: bool = True,
-                 episode_length: int = 400, action_mode_kwargs=None):
+                 episode_length: int = 400, action_mode_kwargs=None,
+                 delta_actions: bool = False):
         self.task_name = task_name
         self.dlp_encode_fn = dlp_encode_fn
         self.cams = list(cams) if cams is not None else list(DEFAULT_CAMS)
@@ -191,6 +237,7 @@ class RLBenchDLPEnv:
         self.headless = headless
         self.episode_length = int(episode_length)
         self.action_mode_kwargs = action_mode_kwargs or {}
+        self.delta_actions = bool(delta_actions)
 
         self._env = None
         self._task = None
@@ -263,6 +310,8 @@ class RLBenchDLPEnv:
         tokens = np.asarray(enc["tokens"], dtype=np.float32)         # (K, Dtok)
         bg = np.asarray(enc["bg"], dtype=np.float32).reshape(-1)     # (bg_dim,)
         gripper_state = _gripper_state_from_obs(rlbench_obs)         # (10,)
+        # Stash the raw 7D gripper_pose (xyz + xyzw quat) for delta-action conversion.
+        self._last_gripper_pose = np.asarray(rlbench_obs.gripper_pose, dtype=np.float32)
         # Front view is the first block of tokens (cams are concatenated in order,
         # and self.cams[0] == 'front' by convention).
         K_per_view = tokens.shape[0] // max(len(self.cams), 1)
@@ -332,21 +381,44 @@ class RLBenchDLPEnv:
     # RLBench Panda table height.
     _Z_MIN = 0.760   # training min was 0.758; a tiny ε above to be safe
 
-    def _action_to_rlbench(self, action: np.ndarray) -> np.ndarray:
-        """Convert the policy's 10D [pos(3), rot6d(6), open(1)] action into the
-        8D RLBench EndEffectorPoseViaPlanning + Discrete format
-        [pos(3), quat_xyzw(4), gripper_open(1)]."""
+    def _action_to_rlbench(self, action: np.ndarray, current_pose: np.ndarray = None) -> np.ndarray:
+        """Convert the policy's 10D action into the 9D RLBench format
+        [pos(3), quat_xyzw(4), gripper_open(1), ignore_collisions(1)].
+
+        ignore_collisions=1 tells MoveArmThenGripper.action() (action_mode.py:34)
+        to skip collision checks for this step. Without it the planner detours
+        around the lid/jar and the policy's exact target pose isn't reached.
+
+        Absolute mode: action = [pos(3), rot6d(6), gripper_open(1)] in world frame.
+        Delta mode (self.delta_actions=True): action = [pos_delta(3),
+            rot6d_delta_local(6), gripper_open(1)]; combined with current_pose to
+            produce the absolute target:
+                pos_target = current_pos + pos_delta
+                R_target   = R_current @ R_delta
+        """
         a = np.asarray(action, dtype=np.float32).reshape(-1)
         if a.shape[0] != 10:
             raise ValueError(
                 f"Expected 10D action [pos(3)+rot6d(6)+open(1)], got shape {a.shape}"
             )
-        pos = a[:3].copy()
+        if self.delta_actions:
+            if current_pose is None:
+                raise RuntimeError("delta_actions=True requires current_pose in _action_to_rlbench")
+            cur = np.asarray(current_pose, dtype=np.float32).reshape(-1)
+            R_cur = quat_xyzw_to_matrix(cur[3:7])
+            R_delta = rot6d_to_matrix(a[3:9])
+            R_target = R_cur @ R_delta
+            pos = cur[:3] + a[:3]
+            quat = matrix_to_quat_xyzw(R_target)
+        else:
+            pos = a[:3].copy()
+            quat = rot6d_to_quat_xyzw(a[3:9])
         # Clamp z above table to avoid InvalidActionError on near-table predictions.
+        pos = pos.astype(np.float32)
         pos[2] = max(float(pos[2]), self._Z_MIN)
-        quat = rot6d_to_quat_xyzw(a[3:9])
         gopen = np.array([1.0 if a[9] >= 0.5 else 0.0], dtype=np.float32)
-        return np.concatenate([pos, quat, gopen], axis=0)
+        ignore_coll = np.array([1.0], dtype=np.float32)  # skip planner collision checks
+        return np.concatenate([pos, quat, gopen, ignore_coll], axis=0)
 
     def step(self, action):
         from rlbench.backend.exceptions import InvalidActionError
@@ -356,7 +428,10 @@ class RLBenchDLPEnv:
         except Exception:
             _path_errs = (InvalidActionError,)
 
-        rlb_action = self._action_to_rlbench(action)
+        rlb_action = self._action_to_rlbench(
+            action,
+            current_pose=getattr(self, "_last_gripper_pose", None),
+        )
         info = {"variation_number": self._current_variation,
                 "language": self._current_lang}
         # Retry-on-fail: a single bad prediction shouldn't kill the rollout.
@@ -380,6 +455,22 @@ class RLBenchDLPEnv:
             return None, 0.0, True, info
         if caught:
             info["retried"] = caught  # surfaces to eval log for diagnostics
+
+        # Workaround for RLBench Discrete gripper transition bug:
+        # screw-motion can physically force the fingers >0.9 open while the
+        # commanded state is still "closed". The next "open" command then sees
+        # current_open == commanded_open and skips firing release(); the lid
+        # stays re-parented to the gripper and NothingGrasped is False forever.
+        # When the policy commands open AND the gripper still holds an object,
+        # release directly. Confirmed against scripts/replay_demos.py
+        # --force_release: turned 2/5 demo replay successes into 5/5.
+        if rlb_action[7] >= 0.5:
+            try:
+                gripper = self._task._task.robot.gripper
+                if len(gripper.get_grasped_objects()) > 0:
+                    gripper.release()
+            except Exception:
+                pass
 
         self._step_count += 1
         if self._step_count >= self.episode_length:

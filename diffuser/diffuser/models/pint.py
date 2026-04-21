@@ -146,23 +146,23 @@ class AdaLNPINTDenoiser(nn.Module):
             # Legacy single action token (no proprio).
             self.action_projection = _make_proj(action_dim)
 
-        # Language token projection (if lang_dim > 0). CLIP embedding dim -> projection_dim.
+        # Language tokens are concatenated into the self-attention sequence with a
+        # shared type encoding, matching object-centric-gauss-splat's
+        # AdaLNPINTDenoiserSelfAtten (ParticleSplat reference).
         if self.lang_dim > 0:
             self.lang_projection = nn.Sequential(
                 nn.Linear(self.lang_dim, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, self.projection_dim),
             )
-            # Learnable language-token type encoding.
-            self.lang_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            self.lang_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
 
-        # Instantiate the AdaLN Particle Transformer.
         self.particle_transformer = AdaLNParticleTransformer(
             self.projection_dim, n_head, n_layer, block_size, self.projection_dim,
             attn_pdrop=dropout, resid_pdrop=dropout,
             hidden_dim_multiplier=4,
             positional_bias=positional_bias,
-            activation='gelu', max_particles=max_particles
+            activation='gelu', max_particles=max_particles,
         )
 
         # Decoder networks for particle outputs.
@@ -197,7 +197,7 @@ class AdaLNPINTDenoiser(nn.Module):
         else:
             self.particle_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
 
-    def forward(self, x, cond, time, return_attention=False, lang=None):
+    def forward(self, x, cond, time, return_attention=False, lang=None, lang_mask=None):
         """
         Input/output flat layout (both paths):
             [action(action_dim), gripper(gripper_dim), bg(bg_dim), particles(K*features_dim)]
@@ -277,19 +277,26 @@ class AdaLNPINTDenoiser(nn.Module):
             particle_start_token_idx = 1
             anchor = action_particle
 
-        # Language conditioning: prepend projected CLIP tokens (broadcast over T,
-        # since the instruction is time-invariant). Lang tokens are non-denoised
-        # context dropped before decoding.
+        # Language conditioning: concatenate projected tokens into the self-attention
+        # sequence with shared type encoding. Time embedding added uniformly below.
         n_lang = 0
+        lang_valid = None
         if self.lang_dim > 0 and lang is not None:
-            lang_proj = self.lang_projection(lang)                     # [bs, L_lang, projection_dim]
-            lang_proj = lang_proj + self.lang_encoding                 # broadcast
-            lang_proj = lang_proj.unsqueeze(1).expand(-1, T, -1, -1)   # [bs, T, L_lang, projection_dim]
-            x_cat = torch.cat([lang_proj, x_cat], dim=2)
-            n_lang = lang_proj.shape[2]
-            particle_start_token_idx = particle_start_token_idx + n_lang
+            L_lang = lang.size(1)
+            lang_tok = self.lang_projection(lang)
+            lang_tok = lang_tok.unsqueeze(1).expand(bs, T, L_lang, self.projection_dim)
+            lang_tok = lang_tok + self.lang_encoding
+            x_cat = torch.cat([x_cat, lang_tok], dim=2)
+            n_lang = L_lang
+            lang_valid = lang_mask
 
-        # Add time embedding to every token and permute to [bs, n_tokens, T, projection_dim].
+        # Padding mask: 1 for robot/particle/valid-lang tokens, 0 for lang pad.
+        attn_mask = None
+        if n_lang > 0 and lang_valid is not None:
+            n_nonlang = x_cat.size(2) - n_lang
+            ones = torch.ones(bs, n_nonlang, device=x.device, dtype=lang_valid.dtype)
+            attn_mask = torch.cat([ones, lang_valid], dim=1)
+
         x_proj = x_cat + t_embed[:, None, None, :]
         x_proj = x_proj.permute(0, 2, 1, 3)
 
@@ -297,10 +304,13 @@ class AdaLNPINTDenoiser(nn.Module):
         # Apply the particle transformer.
         if return_attention:
             particles_trans, attention_dict = self.particle_transformer(
-                x_proj, anchor, t_embed, return_attention=return_attention)
+                x_proj, anchor, t_embed, return_attention=return_attention, attn_mask=attn_mask)
         else:
-            particles_trans = self.particle_transformer(x_proj, anchor, t_embed)
+            particles_trans = self.particle_transformer(x_proj, anchor, t_embed, attn_mask=attn_mask)
         particles_trans = particles_trans.permute(0, 2, 1, 3)  # [bs, T, n_tokens, projection_dim]
+
+        if n_lang > 0:
+            particles_trans = particles_trans[:, :, :particles_trans.size(2) - n_lang, :]
 
         # ---------------------------------------------------------------------
         # Decode.
@@ -308,12 +318,12 @@ class AdaLNPINTDenoiser(nn.Module):
         particle_decoder_out = particle_decoder_out.view(bs, T, -1)
 
         if self.split_robot_tokens:
-            a_pos_out = self.a_pos_decoder(particles_trans[:, :, n_lang + 0, :])
-            a_rot_out = self.a_rot_decoder(particles_trans[:, :, n_lang + 1, :])
-            a_grip_out = self.a_grip_decoder(particles_trans[:, :, n_lang + 2, :])
-            p_pos_out = self.p_pos_decoder(particles_trans[:, :, n_lang + 3, :])
-            p_rot_out = self.p_rot_decoder(particles_trans[:, :, n_lang + 4, :])
-            p_grip_out = self.p_grip_decoder(particles_trans[:, :, n_lang + 5, :])
+            a_pos_out = self.a_pos_decoder(particles_trans[:, :, 0, :])
+            a_rot_out = self.a_rot_decoder(particles_trans[:, :, 1, :])
+            a_grip_out = self.a_grip_decoder(particles_trans[:, :, 2, :])
+            p_pos_out = self.p_pos_decoder(particles_trans[:, :, 3, :])
+            p_rot_out = self.p_rot_decoder(particles_trans[:, :, 4, :])
+            p_grip_out = self.p_grip_decoder(particles_trans[:, :, 5, :])
 
             parts = [a_pos_out, a_rot_out, a_grip_out,
                      p_pos_out, p_rot_out, p_grip_out]
@@ -322,7 +332,7 @@ class AdaLNPINTDenoiser(nn.Module):
             parts.append(particle_decoder_out)
             x_out = torch.cat(parts, dim=-1)
         else:
-            action_decoder_out = self.action_decoder(particles_trans[:, :, n_lang, :])
+            action_decoder_out = self.action_decoder(particles_trans[:, :, 0, :])
             parts = [action_decoder_out]
             if self.bg_dim > 0 and bg_features is not None:
                 parts.append(bg_features)

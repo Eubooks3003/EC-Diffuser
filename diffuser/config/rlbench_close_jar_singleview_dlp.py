@@ -42,7 +42,7 @@ mode_to_args = {
     'act_rot_dim': 6,             # rot6d occupies 6 action dims
     'lang_dim': 512,                          # CLIP ViT-B/32 hidden size
     'lang_pooled': False,
-    'max_lang_tokens': 32,
+    'max_lang_tokens': 10,
     'clip_model_name': 'openai/clip-vit-base-patch32',
     'lang_device': 'cpu',
     'rlbench_cams': ['front'],
@@ -81,11 +81,11 @@ base = {
 
         # dataset
         'loader': 'datasets.LanguageConditionedDataset',
-        'normalizer': 'GaussianNormalizer',
-        'particle_normalizer': 'ParticleGaussianNormalizer',
+        'normalizer': 'SafeLimitsNormalizer',
+        'particle_normalizer': 'ParticleLimitsNormalizer',
         'preprocess_fns': [],
         'clip_denoised': False,
-        'use_padding': True,
+        'use_padding': False,
         'max_path_length': 10,
         'obs_only': False,
         'action_only': False,

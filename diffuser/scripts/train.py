@@ -457,6 +457,7 @@ if do_eval and eval_backend == "rlbench":
             image_size=_img_size,
             headless=bool(getattr(args, "rlbench_headless", True)),
             episode_length=int(getattr(args, "rlbench_max_steps", 400)),
+            delta_actions=not bool(getattr(args, "use_absolute_actions", True)),
         )
 
     def make_policy_fn():
