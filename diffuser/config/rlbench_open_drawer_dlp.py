@@ -14,11 +14,11 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'open_drawer',
-    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_open_drawer/rlbench_open_drawer.pkl',
+    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens/rlbench_open_drawer/rlbench_open_drawer.pkl',
     'calib_h5_path': None,  # RLBench does not use a robomimic calib HDF5
-    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_open_drawer/dlp_ckpt.pt',
+    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens/rlbench_open_drawer/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_open_drawer/dlp_config.json',
+    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens/rlbench_open_drawer/dlp_config.json',
     'features_dim': 10,       # Dtok from pkl meta (2D DLP multiview tokens: z2+scale2+depth1+obj_on1+feat4)
     'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': False,
@@ -34,7 +34,7 @@ mode_to_args = {
     'max_path_length': 600,   # Tmax from RLBench demos (pkl has 600 timesteps)
     'max_demos': 100,
     'eval_freq': 60,
-    'eval_backend': 'rlbench',
+    'eval_backend': 'none',
     'n_steps_per_epoch': 500,
     # --- RLBench-specific ---
     'action_dim': 10,                        # [pos(3), rot6d(6), open(1)] absolute EEF control
