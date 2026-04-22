@@ -1223,7 +1223,10 @@ class Trainer(object):
                     print(f"[eval_rlbench] GT demo replay failed: "
                           f"{type(e).__name__}: {e}", flush=True)
 
-        env.shutdown()
+        # Intentionally NOT calling env.shutdown(): CoppeliaSim's headless
+        # OpenGL has a cross-launch texture-loss bug, so the env must persist
+        # across eval cycles within one training process. train.py's
+        # make_env_fn caches the wrapper accordingly.
 
         out = {
             "sim/success_rate": float(np.mean(successes)) if successes else 0.0,

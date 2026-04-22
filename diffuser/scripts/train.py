@@ -459,7 +459,15 @@ if do_eval and eval_backend == "rlbench":
             "bg": bg.reshape(-1).cpu().numpy(),
         }
 
+    # Cached across eval cycles. CoppeliaSim's headless OpenGL has a
+    # cross-launch texture-loss bug: every launch after the first in a
+    # given process renders with a flat washed-yellow floor instead of the
+    # textured scene. Reusing one env across all eval cycles avoids it.
+    _env_cache = {"env": None}
+
     def make_env_fn():
+        if _env_cache["env"] is not None:
+            return _env_cache["env"]
         from diffuser.envs.rlbench_dlp_wrapper import RLBenchDLPEnv
         _env = RLBenchDLPEnv(
             task_name=args.dataset,
@@ -472,6 +480,7 @@ if do_eval and eval_backend == "rlbench":
         )
         # Expose DLP decoder for imagined-recon video rendering during eval.
         _env._dlp_model = dlp_model
+        _env_cache["env"] = _env
         return _env
 
     def make_policy_fn():
