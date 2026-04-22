@@ -39,7 +39,7 @@ mode_to_args = {
     # --- RLBench-specific ---
     'action_dim': 10,                        # [pos(3), rot6d(6), open(1)] absolute EEF control
     'act_rot_dim': 6,             # rot6d occupies 6 action dims
-    'lang_dim': 512,                          # CLIP ViT-B/32 hidden size
+    'lang_dim': 0,                          # CLIP ViT-B/32 hidden size
     'lang_pooled': False,
     'max_lang_tokens': 10,
     'clip_model_name': 'openai/clip-vit-base-patch32',
