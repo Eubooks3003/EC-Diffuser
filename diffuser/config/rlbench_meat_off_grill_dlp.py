@@ -31,7 +31,7 @@ mode_to_args = {
     'max_path_length': 400,   # Tmax from RLBench demos (episodes typically 100-400 frames)
     'max_demos': 100,
     'eval_freq': 60,
-    'eval_backend': 'rlbench',
+    'eval_backend': 'none',
     # ---- RLBench live eval (logs videos to wandb, not to disk) ----
     'rlbench_eval_episodes': 2,
     'rlbench_eval_max_steps': 200,
