@@ -14,11 +14,11 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'close_jar',
-    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_voxel_tokens/rlbench_close_jar/close_jar.pkl',
+    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_voxel_tokens/rlbench_close_jar/close_jar.pkl',
     'calib_h5_path': None,  # RLBench does not use a robomimic calib HDF5
-    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_voxel_tokens/rlbench_close_jar/dlp_ckpt.pt',
+    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_voxel_tokens/rlbench_close_jar/dlp_ckpt.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_voxel_tokens/rlbench_close_jar/dlp_config.json',
+    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_voxel_tokens/rlbench_close_jar/dlp_config.json',
     'features_dim': 12,       # z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': False,
