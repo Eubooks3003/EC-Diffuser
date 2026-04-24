@@ -366,9 +366,8 @@ def main(argv):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-        # Route this seed's videos to eval_videos/step_seed{S}_ckpt{step}/
-        trainer.step = seed  # used by trainer as the video-dir suffix
-        video_dir = os.path.join(args.savepath, "eval_videos", f"step_{seed}")
+        # Route this seed's videos to eval_results/seed_{S}/
+        video_dir = os.path.join(args.savepath, "eval_results", f"seed_{seed}")
 
         sim_stats = trainer.eval_rlbench_rollouts(
             make_env_fn=make_env_fn,
@@ -377,6 +376,7 @@ def main(argv):
             max_steps=args._max_steps,
             task_name=args.dataset,
             exe_steps=getattr(args, "exe_steps", 1),
+            video_dir_override=video_dir,
         )
 
         # Optionally prune extra episode videos

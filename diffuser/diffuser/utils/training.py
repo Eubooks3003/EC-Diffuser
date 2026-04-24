@@ -711,6 +711,7 @@ class Trainer(object):
         max_steps: int = 400,
         task_name: str = None,
         exe_steps: int = 1,
+        video_dir_override: str = None,
     ):
         """
         Live RLBench rollouts with the trained language-conditioned 2D-DLP policy.
@@ -1101,7 +1102,7 @@ class Trainer(object):
                 import imageio.v2 as _imageio
                 frames, front_toks = env.pop_recorded_frames()
                 if frames:
-                    video_dir = os.path.join(self.logdir, "eval_videos", f"step_{self.step}")
+                    video_dir = video_dir_override or os.path.join(self.logdir, "eval_videos", f"step_{self.step}")
                     os.makedirs(video_dir, exist_ok=True)
                     tag = "success" if success > 0 else "fail"
 
@@ -1209,7 +1210,7 @@ class Trainer(object):
                     import imageio.v2 as _imageio
                     demo_frames, _ = env.pop_recorded_frames()
                     if demo_frames:
-                        video_dir = os.path.join(self.logdir, "eval_videos", f"step_{self.step}")
+                        video_dir = video_dir_override or os.path.join(self.logdir, "eval_videos", f"step_{self.step}")
                         os.makedirs(video_dir, exist_ok=True)
                         _demo_var = int(getattr(_demo, "variation_number", -1))
                         demo_path = os.path.join(

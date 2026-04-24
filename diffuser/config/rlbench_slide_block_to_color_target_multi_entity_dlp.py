@@ -100,7 +100,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/rlbench_slide_block_to_color_target_multiview_fo/',
+        'prefix': 'diffusion/rlbench_slide_block_to_color_target_multientity/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -141,7 +141,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/rlbench_slide_block_to_color_target_multiview_fo/',
+        'prefix': 'plans/rlbench_slide_block_to_color_target_multientity/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

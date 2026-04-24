@@ -270,6 +270,7 @@ model_config = utils.Config(
     prop_pos_dim=getattr(args, 'prop_pos_dim', 3),
     prop_rot_dim=getattr(args, 'prop_rot_dim', 6),
     prop_grip_dim=getattr(args, 'prop_grip_dim', 1),
+    split_action_tokens=getattr(args, 'split_action_tokens', None),
 )
 
 diffusion_config = utils.Config(

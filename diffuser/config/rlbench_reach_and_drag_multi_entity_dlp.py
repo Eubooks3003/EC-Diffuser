@@ -100,7 +100,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/rlbench_reach_and_drag_multiview_fo/',
+        'prefix': 'diffusion/rlbench_reach_and_drag_multientity/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -141,7 +141,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/rlbench_reach_and_drag_multiview_fo/',
+        'prefix': 'plans/rlbench_reach_and_drag_multientity/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,
