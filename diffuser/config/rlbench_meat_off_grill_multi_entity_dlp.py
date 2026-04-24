@@ -9,19 +9,20 @@ args_to_watch = [
 
 logbase = 'data'
 
-# RLBench 2D-DLP language-conditioned config for task: open_drawer
+# RLBench 2D-DLP language-conditioned config for task: meat_off_grill
 # Mode key matches setup.py: "{num_entity}C_{input_type}". Use --num_entity 16 --input_type dlp.
 mode_to_args = {
   '16C_dlp': {
-    'dataset': 'open_drawer',
-    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_open_drawer/rlbench_open_drawer.pkl',
+    'dataset': 'meat_off_grill',
+    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens/rlbench_meat_off_grill/rlbench_meat_off_grill.pkl',
     'calib_h5_path': None,  # RLBench does not use a robomimic calib HDF5
-    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_open_drawer/dlp_ckpt.pt',
+    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens/rlbench_meat_off_grill/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_open_drawer/dlp_config.json',
+    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens/rlbench_meat_off_grill/dlp_config.json',
     'features_dim': 10,       # Dtok from pkl meta (2D DLP multiview tokens: z2+scale2+depth1+obj_on1+feat4)
     'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': False,
+    'split_action_tokens': True,  # multi-entity action: decode pos/rot/grip as 3 separate heads
     'gripper_state_mask_ratio': 0.0,
     'bg_dim': 8,              # 2 views x learned_bg_feature_dim(4)
     'use_bg_obs': True,
@@ -99,7 +100,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/rlbench_open_drawer_multiview_fo/',
+        'prefix': 'diffusion/rlbench_meat_off_grill_multiview_fo/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -140,7 +141,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/rlbench_open_drawer_multiview_fo/',
+        'prefix': 'plans/rlbench_meat_off_grill_multiview_fo/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

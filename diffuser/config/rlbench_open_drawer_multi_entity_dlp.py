@@ -22,6 +22,7 @@ mode_to_args = {
     'features_dim': 10,       # Dtok from pkl meta (2D DLP multiview tokens: z2+scale2+depth1+obj_on1+feat4)
     'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': False,
+    'split_action_tokens': True,  # multi-entity action: decode pos/rot/grip as 3 separate heads
     'gripper_state_mask_ratio': 0.0,
     'bg_dim': 8,              # 2 views x learned_bg_feature_dim(4)
     'use_bg_obs': True,
