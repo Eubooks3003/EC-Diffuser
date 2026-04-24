@@ -19,13 +19,27 @@ logging.basicConfig(level=logging.WARNING, force=True)
 #                        make lpwm-dev importable                               #
 # -----------------------------------------------------------------------------#
 
-# train.py is usually at:  EC-Diffuser/diffuser/scripts/train.py
-# lpwm-dev is sibling of EC-Diffuser:  .../Code/lpwm-dev
-LPWM_DEV = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "lpwm-dev")
-)
-if os.path.isdir(LPWM_DEV) and LPWM_DEV not in sys.path:
-    sys.path.append(LPWM_DEV)
+# Resolve lpwm-dev so `from voxel_models import DLP` works. Strategy:
+#   1) explicit LPWM_DEV env var (most portable across machines)
+#   2) sibling of EC-Diffuser: train.py is at EC-Diffuser/diffuser/scripts/train.py
+#      so EC-Diffuser/.. is 3 levels up, then look for ./lpwm-dev there
+# If voxel_models is already importable (e.g. installed in the env), nothing
+# extra is needed.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_LPWM_CANDIDATES = []
+_env_lpwm = os.environ.get("LPWM_DEV")
+if _env_lpwm:
+    _LPWM_CANDIDATES.append(_env_lpwm)
+_LPWM_CANDIDATES.append(os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "lpwm-dev")))
+for _p in _LPWM_CANDIDATES:
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.append(_p)
+        print(f"[train] added lpwm-dev to sys.path: {_p}", flush=True)
+        break
+else:
+    # No directory matched; rely on voxel_models being installed in the env.
+    print("[train] no lpwm-dev dir found via LPWM_DEV or sibling; "
+          "expecting voxel_models to be importable from env", flush=True)
 
 
 # -----------------------------------------------------------------------------#
@@ -316,6 +330,62 @@ if do_eval and eval_backend == "mimicgen":
 
 
 # -----------------------------------------------------------------------------#
+#                          rlbench eval wiring                                  #
+# -----------------------------------------------------------------------------#
+
+if do_eval and eval_backend == "rlbench":
+    dlp_ckpt = getattr(args, "dlp_ckpt", None)
+    dlp_cfg_path = getattr(args, "dlp_cfg", None)
+    if dlp_ckpt is None or dlp_cfg_path is None:
+        raise RuntimeError("eval_backend='rlbench' requires --dlp_ckpt and --dlp_cfg")
+
+    if dlp_model is None:
+        # Renderer already loaded a DLP at module level (renderer.latent_rep_model);
+        # reuse if possible, otherwise load a fresh one for the wrapper.
+        dlp_model = getattr(renderer, "latent_rep_model", None)
+        if dlp_model is None:
+            print(f"[rlbench eval] loading DLP from cfg={dlp_cfg_path} ckpt={dlp_ckpt}", flush=True)
+            dlp_model, dlp_cfg = load_dlp_lpwm(dlp_cfg_path, dlp_ckpt, args.device)
+        else:
+            from utils.util_func import get_config
+            dlp_cfg = get_config(dlp_cfg_path)
+
+    # Cache the wrapper across eval cycles. Headless CoppeliaSim's OpenGL
+    # has a known cross-launch texture-loss bug — only the first launch keeps
+    # textures, every subsequent launch in the same process renders washed-out.
+    _rlbench_env_cache = {"env": None}
+
+    def make_env_fn():
+        if _rlbench_env_cache["env"] is not None:
+            return _rlbench_env_cache["env"]
+        from diffuser.envs.rlbench_dlp_wrapper import RLBenchDLPEnv
+        env = RLBenchDLPEnv(
+            task_name=args.dataset,
+            dlp_model=dlp_model,
+            dlp_cfg=dlp_cfg,
+            cams=getattr(args, "rlbench_eval_cams",
+                         ["front", "overhead", "left_shoulder", "right_shoulder"]),
+            image_size=int(getattr(args, "rlbench_eval_image_size", 128)),
+            headless=True,
+            episode_length=int(getattr(args, "rlbench_eval_max_steps", 200)),
+            device=args.device,
+        )
+        _rlbench_env_cache["env"] = env
+        return env
+
+    def make_policy_fn():
+        from diffuser.sampling import LanguageConditionedPolicy
+        return LanguageConditionedPolicy(
+            diffusion_model=trainer.ema_model,
+            normalizer=dataset.normalizer,
+            preprocess_fns=[],
+            clip_model_name=getattr(args, "clip_model_name", "openai/clip-vit-base-patch32"),
+            lang_pooled=bool(getattr(args, "lang_pooled", False)),
+            max_lang_tokens=int(getattr(args, "max_lang_tokens", 32)),
+        )
+
+
+# -----------------------------------------------------------------------------#
 #                                  main loop                                   #
 # -----------------------------------------------------------------------------#
 
@@ -360,6 +430,22 @@ for i in range(start_epoch, n_epochs):
             log_stats = {k if k.startswith("sim/") else f"sim/{k}": v for k, v in sim_stats.items()}
             wandb.log({"step": trainer.step, **log_stats})
             print(f"[mimicgen eval] epoch={i} :: {sim_stats}", flush=True)
+
+        elif eval_backend == "rlbench":
+            sim_stats = trainer.eval_rlbench_rollouts(
+                make_env_fn=make_env_fn,
+                make_policy_fn=make_policy_fn,
+                n_episodes=int(getattr(args, "rlbench_eval_episodes", 2)),
+                max_steps=int(getattr(args, "rlbench_eval_max_steps", 200)),
+                exe_steps=int(getattr(args, "exe_steps", 1)),
+                video_fps=int(getattr(args, "rlbench_eval_video_fps", 10)),
+                wandb_step=trainer.step,
+            )
+
+            log_stats = {k if k.startswith("sim/") else f"sim/{k}": v
+                         for k, v in sim_stats.items()}
+            wandb.log({"step": trainer.step, **log_stats})
+            print(f"[rlbench eval] epoch={i} :: {sim_stats}", flush=True)
 
         else:
             raise RuntimeError(

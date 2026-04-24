@@ -26,8 +26,15 @@ class ReplayBuffer:
         self.termination_penalty = termination_penalty
 
     def __repr__(self):
+        def _shape(val):
+            if hasattr(val, 'shape'):
+                return val.shape
+            try:
+                return f'list(len={len(val)})'
+            except Exception:
+                return type(val).__name__
         return '[ datasets/buffer ] Fields:\n' + '\n'.join(
-            f'    {key}: {val.shape}'
+            f'    {key}: {_shape(val)}'
             for key, val in self.items()
         )
 

@@ -177,7 +177,7 @@ class AdaLNPINTDenoiser(nn.Module):
         # Learnable action encoding.
         self.action_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
 
-    def forward(self, x, cond, time, return_attention=False, lang=None):
+    def forward(self, x, cond, time, return_attention=False, lang=None, lang_mask=None):
         """
         Forward pass for the denoiser.
 
@@ -276,6 +276,16 @@ class AdaLNPINTDenoiser(nn.Module):
             gripper_token_idx = (gripper_token_idx + n_lang) if gripper_token_idx is not None else None
             particle_start_token_idx = particle_start_token_idx + n_lang
 
+        # Build per-token padding mask (B, n_tokens). Lang tokens come first in
+        # x_cat, so we pad lang positions with lang_mask validity and mark all
+        # non-lang positions as valid (1). Used by the transformer to ignore
+        # CLIP padding in self-attention.
+        attn_mask = None
+        if n_lang > 0 and lang_mask is not None:
+            n_nonlang = x_cat.size(2) - n_lang
+            ones = torch.ones(bs, n_nonlang, device=x.device, dtype=lang_mask.dtype)
+            attn_mask = torch.cat([lang_mask, ones], dim=1)
+
         # Time embedding: project time indices and add to all tokens.
         t_embed = self.time_mlp(time)  # [bs, projection_dim]
         x_proj = x_cat + t_embed[:, None, None, :]  # Broadcast addition.
@@ -287,9 +297,10 @@ class AdaLNPINTDenoiser(nn.Module):
         # Apply the particle transformer.
         if return_attention:
             particles_trans, attention_dict = self.particle_transformer(x_proj, action_particle, t_embed,
-                                                                         return_attention=return_attention)
+                                                                         return_attention=return_attention,
+                                                                         attn_mask=attn_mask)
         else:
-            particles_trans = self.particle_transformer(x_proj, action_particle, t_embed)
+            particles_trans = self.particle_transformer(x_proj, action_particle, t_embed, attn_mask=attn_mask)
         # Permute back to [bs, T, n_tokens, projection_dim].
         particles_trans = particles_trans.permute(0, 2, 1, 3)
 

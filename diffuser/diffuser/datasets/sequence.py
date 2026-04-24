@@ -18,8 +18,8 @@ from .normalization import DatasetNormalizer
 from .buffer import ReplayBuffer
 
 
-Batch = namedtuple('Batch', ['trajectories', 'conditions', 'lang'])
-Batch.__new__.__defaults__ = (None,)  # lang defaults to None for non-language datasets
+Batch = namedtuple('Batch', ['trajectories', 'conditions', 'action_conditions', 'lang', 'lang_mask'])
+Batch.__new__.__defaults__ = (None, None, None)  # action_conditions/lang/lang_mask default to None
 ValueBatch = namedtuple('ValueBatch', 'trajectories conditions values')
 
 class SequenceDataset(torch.utils.data.Dataset):
@@ -49,6 +49,18 @@ class SequenceDataset(torch.utils.data.Dataset):
             print(f'[ datasets/sequence ] Limiting to {max_demos}/{fields._count} demos')
             fields._count = max_demos
         fields.finalize()
+
+        # Auto-correct max_path_length to match the actual loaded data. The pkl
+        # stores arrays of shape (E, T, ...) and the normalize() reshape below
+        # assumes T == self.max_path_length. If the config's max_path_length
+        # disagrees with the pkl's T, reshape blows up; just trust the pkl.
+        if 'observations' in fields._dict:
+            actual_T = int(fields['observations'].shape[1])
+            if actual_T != self.max_path_length:
+                print(f'[ datasets/sequence ] adjusting max_path_length: '
+                      f'{self.max_path_length} -> {actual_T} (from pkl shape)')
+                self.max_path_length = actual_T
+                fields.max_path_length = actual_T
 
         # Apply Z scaling to actions before normalization
         if self.action_z_scale != 1.0:
@@ -164,6 +176,12 @@ class SequenceDataset(torch.utils.data.Dataset):
         parts.append(observations[0])
         return {0: np.concatenate(parts, axis=-1)}
 
+    def get_action_conditions(self, actions):
+        '''Proprioception conditioning: pin action at t=0 to demo's action[0].
+        Lets the model focus loss on a1.. instead of trivially copying the
+        already-known initial action through the denoising trajectory.'''
+        return {0: actions[0]}
+
     def __len__(self):
         return len(self.indices)
 
@@ -186,6 +204,7 @@ class SequenceDataset(torch.utils.data.Dataset):
             bg_features = None
 
         conditions = self.get_conditions(observations, gripper_state, bg_features)
+        action_conditions = self.get_action_conditions(actions)
         if self.obs_only:
             trajectories = observations
         else:
@@ -197,7 +216,7 @@ class SequenceDataset(torch.utils.data.Dataset):
                 traj_parts.append(bg_features)
             traj_parts.append(observations)
             trajectories = np.concatenate(traj_parts, axis=-1)
-        batch = Batch(trajectories, conditions)
+        batch = Batch(trajectories, conditions, action_conditions)
         return batch
 
 
@@ -257,6 +276,7 @@ class GoalDataset(SequenceDataset):
                 bg_features = np.vstack([bg_features] + [last_bg] * padding_needed)
 
         conditions = self.get_conditions(observations, gripper_state, bg_features)
+        action_conditions = self.get_action_conditions(actions)
         if self.obs_only:
             trajectories = observations
         else:
@@ -268,7 +288,7 @@ class GoalDataset(SequenceDataset):
                 traj_parts.append(bg_features)
             traj_parts.append(observations)
             trajectories = np.concatenate(traj_parts, axis=-1)
-        batch = Batch(trajectories, conditions)
+        batch = Batch(trajectories, conditions, action_conditions)
         return batch
 
     def get_conditions(self, observations, gripper_state=None, bg_features=None):
@@ -346,28 +366,37 @@ class LanguageConditionedDataset(GoalDataset):
             self._cache.get(s)
 
     def _get_lang_tokens(self, path_ind):
-        """Pick a random paraphrase for episode path_ind, return encoded tensor.
+        """Pick a random paraphrase for episode path_ind, return (tokens, mask).
 
-        Always returns a fixed-shape tensor so default collate works:
-          pooled: (1, clip_dim)
-          else:   (max_lang_tokens, clip_dim), zero-padded beyond valid length.
+        Always returns fixed-shape tensors so default collate works:
+          pooled: tokens (1, clip_dim),         mask (1,)
+          else:   tokens (max_lang_tokens, D),  mask (max_lang_tokens,)
+                  zero-padded beyond valid length; mask is 1 for valid positions.
         """
         if not self._has_lang:
-            return torch.zeros((1, 1), dtype=torch.float32)
+            return torch.zeros((1, 1), dtype=torch.float32), torch.ones((1,), dtype=torch.float32)
         paraphrases = self.fields.language[path_ind]
         s = paraphrases[np.random.randint(len(paraphrases))]
         emb = self._cache.get(s)
         if self.lang_pooled:
-            return emb.unsqueeze(0).float()                   # (1, clip_dim)
+            return emb.unsqueeze(0).float(), torch.ones((1,), dtype=torch.float32)
         tokens, mask = emb
         valid = int(mask.sum().item())
         valid = max(1, min(valid, self.max_lang_tokens))
         out = torch.zeros((self.max_lang_tokens, tokens.shape[-1]), dtype=torch.float32)
         out[:valid] = tokens[:valid].float()
-        return out                                            # (max_lang_tokens, clip_dim)
+        out_mask = torch.zeros((self.max_lang_tokens,), dtype=torch.float32)
+        out_mask[:valid] = 1.0
+        return out, out_mask
 
     def __getitem__(self, idx):
-        batch = super().__getitem__(idx)  # (trajectories, conditions, lang=None from default)
+        batch = super().__getitem__(idx)  # (trajectories, conditions, action_conditions, lang, lang_mask)
         path_ind = int(self.indices[idx][0])
-        lang = self._get_lang_tokens(path_ind)
-        return Batch(trajectories=batch.trajectories, conditions=batch.conditions, lang=lang)
+        lang, lang_mask = self._get_lang_tokens(path_ind)
+        return Batch(
+            trajectories=batch.trajectories,
+            conditions=batch.conditions,
+            action_conditions=batch.action_conditions,
+            lang=lang,
+            lang_mask=lang_mask,
+        )

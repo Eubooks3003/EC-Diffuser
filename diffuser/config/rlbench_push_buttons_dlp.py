@@ -14,12 +14,11 @@ logbase = 'data'
 mode_to_args = {
   '16C_dlp': {
     'dataset': 'push_buttons',
-    'override_dataset_path': '/home/ellina/Desktop/data/preprocessed/rlbench_push_buttons/push_buttons.pkl',
+    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_voxel_tokens/rlbench_push_buttons/push_buttons.pkl',
     'calib_h5_path': None,  # RLBench does not use a robomimic calib HDF5
-    # Placeholder paths -- point at the RLBench voxel-DLP ckpt once it's trained.
-    'dlp_ckpt': '/home/ellina/Desktop/data/preprocessed/rlbench_push_buttons/dlp_ckpt.pt',
+    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_voxel_tokens/rlbench_push_buttons/dlp_ckpt.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/preprocessed/rlbench_push_buttons/dlp_config.json',
+    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_voxel_tokens/rlbench_push_buttons/dlp_config.json',
     'features_dim': 12,       # z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': True,
@@ -31,8 +30,14 @@ mode_to_args = {
     'device': 'cuda:0',
     'max_path_length': 400,   # Tmax from RLBench demos (episodes typically 100-400 frames)
     'max_demos': 100,
-    'eval_freq': 0,
-    'eval_backend': 'none',
+    'eval_freq': 60,
+    'eval_backend': 'rlbench',
+    # ---- RLBench live eval (logs videos to wandb, not to disk) ----
+    'rlbench_eval_episodes': 2,
+    'rlbench_eval_max_steps': 200,
+    'rlbench_eval_cams': ['front', 'overhead', 'left_shoulder', 'right_shoulder'],
+    'rlbench_eval_image_size': 128,
+    'rlbench_eval_video_fps': 10,
     'n_steps_per_epoch': 500,
     # --- RLBench-specific ---
     'action_dim': 10,          # [pos(3), rot6d(6), open(1)] absolute EEF control
@@ -43,8 +48,8 @@ mode_to_args = {
     'lang_device': 'cpu',
     # -------------------------
     "use_absolute_actions": True,
-    'horizon': 16,
-    'exe_steps': 8,
+    'horizon': 6,
+    'exe_steps': 3,
     "random_init": True,
     "random_init_eval": True,
   },

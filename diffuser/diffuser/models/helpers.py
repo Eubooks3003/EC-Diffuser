@@ -139,9 +139,21 @@ def cosine_beta_schedule(timesteps, s=0.008, dtype=torch.float32):
     betas_clipped = np.clip(betas, a_min=0, a_max=0.999)
     return torch.tensor(betas_clipped, dtype=dtype)
 
-def apply_conditioning(x, conditions, action_dim):
+def apply_conditioning(x, conditions, action_dim, action_conditions=None):
+    """Pin parts of x at specified timesteps.
+
+    - `conditions[t] = val`  -> pins x[:, t, action_dim:] to val (obs/gripper/bg).
+    - `action_conditions[t] = val` -> pins x[:, t, :action_dim] to val (action).
+
+    With `action_conditions = {0: a0_value}` the model never has to learn a0
+    (it's overwritten at every denoising step), so the loss-weight schedule
+    that skips a0 (`weights[1:, :action_dim] = action_weight`) becomes correct.
+    """
     for t, val in conditions.items():
         x[:, t, action_dim:] = val.clone()
+    if action_conditions is not None:
+        for t, val in action_conditions.items():
+            x[:, t, :action_dim] = val.clone()
     return x
 
 
@@ -164,7 +176,20 @@ class WeightedLoss(nn.Module):
         loss = self._loss(pred, targ)
         weighted_loss = (loss * self.weights).mean()
         a0_loss = (loss[:, 0, :self.action_dim] / self.weights[0, :self.action_dim]).mean()
-        return weighted_loss, {'a0_loss': a0_loss}
+        H = loss.shape[1]
+        # Last-timestep action loss (hardest step to predict).
+        aH_loss = (loss[:, H - 1, :self.action_dim] / self.weights[0, :self.action_dim]).mean()
+        # Mean action loss across all executable timesteps (t=1..H-1).
+        a_exec_loss = loss[:, 1:, :self.action_dim].mean()
+        # Observation-side loss (everything past action dims = gripper + bg + particles).
+        # Unweighted so the number is comparable across configs.
+        obs_loss = loss[:, :, self.action_dim:].mean()
+        return weighted_loss, {
+            'a0_loss': a0_loss,
+            'aH_loss': aH_loss,
+            'a_exec_loss': a_exec_loss,
+            'obs_loss': obs_loss,
+        }
 
 class ValueLoss(nn.Module):
     def __init__(self, *args):

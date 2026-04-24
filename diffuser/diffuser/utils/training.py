@@ -947,5 +947,253 @@ class Trainer(object):
             "sim/avg_len": float(np.mean(lengths)) if len(lengths) else 0.0,
         }
         return out
-    
+
+    # ------------------------------------------------------------------
+    # RLBench live eval (3D voxel DLP). Runs N episodes in the live wrapper,
+    # records front_rgb frames into wandb.Video instead of writing to disk.
+    # ------------------------------------------------------------------
+    def eval_rlbench_rollouts(
+        self,
+        make_env_fn,
+        *,
+        make_policy_fn=None,
+        n_episodes: int = 2,
+        max_steps: int = 200,
+        exe_steps: int = 1,
+        video_fps: int = 10,
+        wandb_step: int = None,
+        log_voxel_viz: bool = True,
+        video_dir_override: str = None,
+    ):
+        """Run `n_episodes` rollouts in the RLBenchDLPEnv wrapper, log each
+        episode's front_rgb video to wandb.
+
+        - make_env_fn() must return an RLBenchDLPEnv-compatible env. The env is
+          NOT shut down here so it can be reused across eval cycles (the
+          headless CoppeliaSim cross-launch texture-loss bug otherwise wipes
+          textures on re-launch).
+        - Action chunking mirrors eval_mimicgen_rollouts: each plan emits a
+          horizon-length trajectory, the first `exe_steps` actions are executed
+          before re-planning.
+        """
+        import torch as _torch
+        import numpy as _np
+        device = _torch.device(getattr(self, "device", "cuda:0"))
+
+        env = make_env_fn()
+        # LanguageConditionedPolicy owns a frozen CLIP encoder; when provided,
+        # we pass lang + action_cond into self.ema_model so rollout matches
+        # the training-time conditioning. Without it, we fall back to
+        # unconditional sampling (pre-existing 3D behavior).
+        policy = make_policy_fn() if make_policy_fn is not None else None
+
+        a_dim = int(self.ema_model.action_dim)
+        gripper_dim = int(getattr(self.ema_model.model, "gripper_dim", 0))
+        bg_dim = int(getattr(self.ema_model.model, "bg_dim", 0))
+        z_scale = float(getattr(self.dataset, "action_z_scale", 1.0))
+
+        # Optional voxel viz (gt + rec_full + rec_fg + rec_bg + kp overlay).
+        # Same logger used by train_dlp_voxel.py val visuals.
+        _log_rgb_voxels = None
+        if log_voxel_viz:
+            try:
+                from eval.eval_vox import log_rgb_voxels as _log_rgb_voxels
+            except Exception as e:
+                print(f"[eval_rlbench] voxel viz disabled: {e}", flush=True)
+
+        def _voxel_panel(env_obj, prefix, step_for_log):
+            """Decode env_obj's most-recent voxel + kp through the DLP and log
+            gt/rec_full/rec_fg/rec_bg under '<prefix>/...' to wandb."""
+            if _log_rgb_voxels is None:
+                return
+            vox = getattr(env_obj, "_last_voxel", None)
+            kp  = getattr(env_obj, "_last_kp",    None)
+            cov = getattr(env_obj, "_last_cov",   None)
+            dlp = getattr(env_obj, "dlp_model",   None)
+            if vox is None or dlp is None:
+                return
+            with _torch.no_grad():
+                vob = vox.unsqueeze(0).to(next(dlp.parameters()).device)
+                rgb_only = vob[:, :int(env_obj.dlp_cfg.get("ch", 3))].contiguous() \
+                    if env_obj.dlp_cfg else vob[:, :3].contiguous()
+                kp_b  = kp.unsqueeze(0).to(rgb_only.device)  if kp  is not None else None
+                cov_b = cov.unsqueeze(0).to(rgb_only.device) if cov is not None else None
+                meta = {"kmeans_kp": kp_b, "kmeans_cov": cov_b} if kp_b is not None else None
+                full = dlp(rgb_only, deterministic=True, warmup=False,
+                           with_loss=False, meta=meta)
+            gt   = full["x"][0].cpu()
+            rec  = (full["rec"][0] if full.get("rec") is not None else full["rec_rgb"][0]).cpu()
+            fg   = full["dec_objects"][0].cpu() if full.get("dec_objects") is not None else None
+            bg_v = None
+            if full.get("bg_mask") is not None and full.get("bg") is not None:
+                bg_v = (full["bg_mask"] * full["bg"][:, :3])[0].cpu()
+            mu = full["mu_tot"][0]
+            if mu.dim() == 3: mu = mu[0]
+            mu = mu.cpu()
+            try:
+                _log_rgb_voxels(name=f"{prefix}/gt",       rgb_vol=gt,  KPx=mu, step=step_for_log)
+                _log_rgb_voxels(name=f"{prefix}/rec_full", rgb_vol=rec, KPx=mu, step=step_for_log)
+                if fg is not None:
+                    _log_rgb_voxels(name=f"{prefix}/rec_fg", rgb_vol=fg, KPx=mu, step=step_for_log)
+                if bg_v is not None:
+                    _log_rgb_voxels(name=f"{prefix}/rec_bg", rgb_vol=bg_v, KPx=None, step=step_for_log)
+            except Exception as e:
+                print(f"[eval_rlbench] voxel viz failed for {prefix}: {e}", flush=True)
+
+        use_gripper_obs = bool(getattr(self.dataset, "use_gripper_obs", False))
+        use_bg_obs = bool(getattr(self.dataset, "use_bg_obs", False))
+
+        successes, lengths = [], []
+        print(f"[eval_rlbench_rollouts] Starting {n_episodes} episodes, "
+              f"max_steps={max_steps}, exe_steps={exe_steps}", flush=True)
+
+        for ep in range(n_episodes):
+            try:
+                obs_dict = env.reset(variation=ep)
+            except Exception as e:
+                print(f"[eval_rlbench] ep={ep} reset failed: {type(e).__name__}: {e}", flush=True)
+                successes.append(0.0); lengths.append(0); continue
+
+            obs_vec = _np.asarray(obs_dict["obs"], dtype=_np.float32).reshape(-1)
+            language = obs_dict.get("language", "")
+            print(f"\n[eval_rlbench] ep {ep+1}/{n_episodes}  variation={obs_dict.get('variation_number')}  "
+                  f"lang={language!r}", flush=True)
+
+            # Encode the instruction once per episode; reuse cached tokens for
+            # every denoising step. Without a policy, lang_tok stays None and
+            # the model runs unconditional.
+            lang_tok = None
+            lang_mask_tok = None
+            if policy is not None:
+                policy.set_instruction(language if language else "")
+                lang_tok = policy._lang_tokens.to(device)[:1]
+                lang_mask_tok = (
+                    policy._lang_mask.to(device)[:1] if policy._lang_mask is not None else None
+                )
+
+            # Voxel viz from the reset frame (one panel per episode).
+            step_for_log = wandb_step if wandb_step is not None else self.step
+            _voxel_panel(env, prefix=f"sim/voxel/ep_{ep:02d}/reset",
+                         step_for_log=step_for_log)
+
+            action_buffer = None
+            action_idx = 0
+            t = 0
+            done = False
+            success = False
+            last_reward = 0.0
+
+            while t < max_steps and not done:
+                # Replan when buffer is empty / exhausted
+                need_replan = (action_buffer is None) or (action_idx >= exe_steps)
+                if need_replan:
+                    cond_parts = []
+                    if use_gripper_obs and gripper_dim > 0:
+                        gs = _np.asarray(obs_dict["gripper_state"], dtype=_np.float32).reshape(1, -1)
+                        gs_norm = self.dataset.normalizer.normalize(gs, "gripper_state")[0]
+                        cond_parts.append(_torch.from_numpy(gs_norm).float().to(device))
+                    if use_bg_obs and bg_dim > 0:
+                        bg = _np.asarray(obs_dict["bg_features"], dtype=_np.float32).reshape(1, -1)
+                        bg_norm = self.dataset.normalizer.normalize(bg, "bg_features")[0]
+                        cond_parts.append(_torch.from_numpy(bg_norm).float().to(device))
+                    obs_norm = self.dataset.normalizer.normalize(obs_vec[None], "observations")[0]
+                    cond_parts.append(_torch.from_numpy(obs_norm).float().to(device))
+                    cond_0 = _torch.cat(cond_parts, dim=-1)[None, :]
+                    cond = {0: cond_0}
+
+                    # Proprioception conditioning: pin action[0] to the current
+                    # gripper pose, normalized in actions-space. Requires the
+                    # env's gripper_state to have the same dim as action
+                    # (true for rot6d-based absolute-action configs).
+                    action_cond = None
+                    if policy is not None and "gripper_state" in obs_dict:
+                        gs_raw = _np.asarray(obs_dict["gripper_state"],
+                                             dtype=_np.float32).reshape(1, -1)
+                        if gs_raw.shape[-1] == a_dim:
+                            gs_as_act = self.dataset.normalizer.normalize(gs_raw, "actions")
+                            action_cond = {0: _torch.from_numpy(gs_as_act).float().to(device)}
+
+                    if policy is not None:
+                        sample = self.ema_model(
+                            cond, lang=lang_tok, lang_mask=lang_mask_tok,
+                            action_cond=action_cond, verbose=False,
+                        )
+                    else:
+                        sample = self.ema_model(cond, verbose=False)
+                    traj = sample.trajectories[0]  # (H, transition_dim)
+                    # If a[0] was pinned to the current pose, skip it and play
+                    # out a[1..H-1]; otherwise buffer the full H predictions.
+                    if action_cond is not None:
+                        action_buffer = traj[1:, :a_dim].detach().cpu().numpy().astype(_np.float32)
+                    else:
+                        action_buffer = traj[:, :a_dim].detach().cpu().numpy().astype(_np.float32)
+                    action_idx = 0
+
+                a_norm = action_buffer[action_idx]
+                a = self.dataset.normalizer.unnormalize(a_norm[None], "actions")[0]
+                if z_scale != 1.0:
+                    a[2] /= z_scale
+
+                obs_dict, r, done, info = env.step(a)
+                if obs_dict is None:
+                    print(f"[eval_rlbench] step failed at t={t}: {info}", flush=True)
+                    break
+                obs_vec = _np.asarray(obs_dict["obs"], dtype=_np.float32).reshape(-1)
+                last_reward = float(r)
+                action_idx += 1
+                t += 1
+                # RLBench emits reward=1.0 on task completion (no info["success"]).
+                # Mirrors the 2D wrapper's check (last_reward >= 0.5).
+                if last_reward >= 0.5:
+                    success = True
+                    print(f"[eval_rlbench]   succeeded at t={t} (reward={last_reward:.2f})", flush=True)
+                    break
+                if isinstance(info, dict) and info.get("success", False):
+                    success = True
+                    print(f"[eval_rlbench]   succeeded at t={t} (info.success)", flush=True)
+                    break
+
+            frames = env.pop_recorded_frames()
+            # Final safety net: if the last step's reward crossed threshold but we
+            # didn't break (shouldn't happen, but covers max_steps-exit races).
+            if not success and last_reward >= 0.5:
+                success = True
+            successes.append(1.0 if success else 0.0)
+            lengths.append(t)
+
+            if frames and len(frames) > 0:
+                # Save mp4 to <savepath>/eval_videos/, then upload that path to
+                # wandb (avoids wandb's raw-data encoder which requires moviepy).
+                import imageio.v2 as imageio
+                step_for_log = wandb_step if wandb_step is not None else self.step
+                status = "success" if success else "fail"
+                if video_dir_override:
+                    video_dir = video_dir_override
+                    os.makedirs(video_dir, exist_ok=True)
+                    out_path = os.path.join(video_dir, f"ep{ep:02d}_{status}.mp4")
+                else:
+                    video_dir = os.path.join(self.logdir, "eval_videos")
+                    os.makedirs(video_dir, exist_ok=True)
+                    out_path = os.path.join(video_dir, f"step{step_for_log}_ep{ep:02d}_{status}.mp4")
+                # macro_block_size=None avoids ffmpeg failing on non-multiple-of-16 sizes
+                imageio.mimsave(out_path, frames, fps=int(video_fps), macro_block_size=None)
+                tag = f"sim/video/ep_{ep:02d}"
+                wandb.log({
+                    tag: wandb.Video(out_path, fps=int(video_fps), format="mp4"),
+                    f"sim/ep_{ep:02d}/success": float(success),
+                    f"sim/ep_{ep:02d}/length": int(t),
+                    f"sim/ep_{ep:02d}/language": str(language),
+                }, step=step_for_log)
+                print(f"[eval_rlbench]   wrote {len(frames)} frames -> {out_path}  "
+                      f"(also wandb '{tag}')", flush=True)
+
+        # Intentionally NOT calling env.shutdown(): keep the CoppeliaSim
+        # process alive across eval cycles to avoid the headless OpenGL
+        # cross-launch texture-loss bug (project_coppeliasim_crosslaunch).
+        out = {
+            "sim/success_rate": float(_np.mean(successes)) if len(successes) else 0.0,
+            "sim/avg_len":      float(_np.mean(lengths))   if len(lengths)   else 0.0,
+            "sim/n_episodes":   int(len(successes)),
+        }
+        return out
 
