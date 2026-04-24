@@ -21,7 +21,7 @@ mode_to_args = {
     'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_voxel_tokens/rlbench_put_item_in_drawer/dlp_config.json',
     'features_dim': 12,       # z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
-    'use_gripper_obs': True,
+    'use_gripper_obs': False,
     'gripper_state_mask_ratio': 0.0,
     'bg_dim': 2,              # learned_bg_feature_dim
     'use_bg_obs': True,
@@ -70,7 +70,7 @@ base = {
         'dropout': 0.0,
 
         'n_diffusion_steps': 5,
-        'action_weight': 50,
+        'action_weight': 1,
 
         'max_particles': 64,
         'positional_bias': False,

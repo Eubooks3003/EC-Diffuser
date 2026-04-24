@@ -130,6 +130,16 @@ class AdaLNPINTDenoiser(nn.Module):
             # Learnable gripper encoding to distinguish from particles.
             self.gripper_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
 
+        # Background-feature projection (if bg_dim > 0). bg is denoised as its own
+        # transformer token rather than passed through unchanged.
+        if self.bg_dim > 0:
+            self.bg_projection = nn.Sequential(
+                nn.Linear(self.bg_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.projection_dim)
+            )
+            self.bg_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+
         # Language token projection (if lang_dim > 0). CLIP embedding dim -> projection_dim.
         if self.lang_dim > 0:
             self.lang_projection = nn.Sequential(
@@ -166,6 +176,13 @@ class AdaLNPINTDenoiser(nn.Module):
                 nn.Linear(self.projection_dim, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, self.gripper_dim)
+            )
+        # Bg decoder (if bg_dim > 0).
+        if self.bg_dim > 0:
+            self.bg_decoder = nn.Sequential(
+                nn.Linear(self.projection_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.bg_dim)
             )
         # Particle encoding: either shared or view-specific for multi-view inputs.
         if self.multiview:
@@ -210,7 +227,7 @@ class AdaLNPINTDenoiser(nn.Module):
         else:
             gripper_state = None
 
-        # Extract bg_features if present (will be passed through unchanged)
+        # Extract bg_features if present (projected into a transformer token below).
         if self.bg_dim > 0:
             bg_start = self.action_dim + self.gripper_dim
             bg_features = x[:, :, bg_start:bg_start + self.bg_dim]  # [bs, T, bg_dim]
@@ -234,6 +251,11 @@ class AdaLNPINTDenoiser(nn.Module):
             gripper_emb = self.gripper_projection(gripper_state)  # [bs, T, projection_dim]
             gripper_emb = gripper_emb + self.gripper_encoding.repeat(bs, T, 1)
 
+        # Project bg features if present (bg is denoised as its own token).
+        if self.bg_dim > 0 and bg_features is not None:
+            bg_emb = self.bg_projection(bg_features)  # [bs, T, projection_dim]
+            bg_emb = bg_emb + self.bg_encoding.repeat(bs, T, 1)
+
         if self.multiview:
             n_particles = state_particles.size(2) // 2
             particles_view1 = state_particles[:, :, :n_particles, :] + self.view1_encoding.repeat(bs, T, n_particles, 1)
@@ -244,22 +266,26 @@ class AdaLNPINTDenoiser(nn.Module):
 
         # ---------------------------------------------------------------------
         # Prepare transformer input.
-        # Token sequence: [action_token, gripper_token (optional), particle_token_1, ..., particle_token_N]
-        # Resulting shape: [bs, T, n_tokens, projection_dim]
+        # Token sequence: [action, gripper?, bg?, particle_1..N]. Each optional
+        # component occupies one slot when enabled; particles always last.
+        tokens = [action_particle.unsqueeze(2)]
+        next_idx = 1
+
+        gripper_token_idx = None
         if self.gripper_dim > 0 and gripper_state is not None:
-            # n_tokens = 1 (action) + 1 (gripper) + n_particles
-            x_cat = torch.cat([
-                action_particle.unsqueeze(2),
-                gripper_emb.unsqueeze(2),
-                new_state_particles
-            ], dim=2)
-            gripper_token_idx = 1  # Index of gripper token in the sequence
-            particle_start_token_idx = 2
-        else:
-            # n_tokens = 1 (action) + n_particles
-            x_cat = torch.cat([action_particle.unsqueeze(2), new_state_particles], dim=2)
-            gripper_token_idx = None
-            particle_start_token_idx = 1
+            tokens.append(gripper_emb.unsqueeze(2))
+            gripper_token_idx = next_idx
+            next_idx += 1
+
+        bg_token_idx = None
+        if self.bg_dim > 0 and bg_features is not None:
+            tokens.append(bg_emb.unsqueeze(2))
+            bg_token_idx = next_idx
+            next_idx += 1
+
+        tokens.append(new_state_particles)
+        x_cat = torch.cat(tokens, dim=2)
+        particle_start_token_idx = next_idx
 
         # ---------------------------------------------------------------------
         # Language conditioning: prepend projected CLIP tokens to the per-timestep
@@ -274,6 +300,7 @@ class AdaLNPINTDenoiser(nn.Module):
             x_cat = torch.cat([lang_proj, x_cat], dim=2)
             n_lang = lang_proj.shape[2]
             gripper_token_idx = (gripper_token_idx + n_lang) if gripper_token_idx is not None else None
+            bg_token_idx = (bg_token_idx + n_lang) if bg_token_idx is not None else None
             particle_start_token_idx = particle_start_token_idx + n_lang
 
         # Build per-token padding mask (B, n_tokens). Lang tokens come first in
@@ -310,23 +337,20 @@ class AdaLNPINTDenoiser(nn.Module):
         action_token_idx = n_lang
         action_decoder_out = self.action_decoder(particles_trans[:, :, action_token_idx, :])  # [bs, T, action_dim]
 
+        particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
+        particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
+
+        # Reassemble flat output: [action, gripper?, bg?, particles]. bg is decoded
+        # from its transformer slot (denoised), not passed through unchanged.
+        parts = [action_decoder_out]
         if self.gripper_dim > 0 and gripper_token_idx is not None:
             gripper_decoder_out = self.gripper_decoder(particles_trans[:, :, gripper_token_idx, :])  # [bs, T, gripper_dim]
-            particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
-            particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
-            # Concatenate action, gripper, bg_features (passthrough), and particle outputs.
-            if self.bg_dim > 0 and bg_features is not None:
-                x_out = torch.cat([action_decoder_out, gripper_decoder_out, bg_features, particle_decoder_out], dim=-1)
-            else:
-                x_out = torch.cat([action_decoder_out, gripper_decoder_out, particle_decoder_out], dim=-1)
-        else:
-            particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
-            particle_decoder_out = particle_decoder_out.view(bs, T, -1)  # Flatten particle outputs.
-            # Concatenate action, bg_features (passthrough), and particle outputs.
-            if self.bg_dim > 0 and bg_features is not None:
-                x_out = torch.cat([action_decoder_out, bg_features, particle_decoder_out], dim=-1)
-            else:
-                x_out = torch.cat([action_decoder_out, particle_decoder_out], dim=-1)
+            parts.append(gripper_decoder_out)
+        if self.bg_dim > 0 and bg_token_idx is not None:
+            bg_decoder_out = self.bg_decoder(particles_trans[:, :, bg_token_idx, :])  # [bs, T, bg_dim]
+            parts.append(bg_decoder_out)
+        parts.append(particle_decoder_out)
+        x_out = torch.cat(parts, dim=-1)
 
         if return_attention:
             return x_out, attention_dict

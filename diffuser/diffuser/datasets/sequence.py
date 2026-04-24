@@ -94,6 +94,20 @@ class SequenceDataset(torch.utils.data.Dataset):
                 print(f'[ datasets/sequence ] Background features available but not used (use_bg_obs=False)')
 
         self.successful_episode_idxes = fields.successful_episode_idxes
+
+        # OCGS-style action convention: action[t] = current pose, not next pose.
+        # The pkl was preprocessed with action[t] = gripper_state[t+1] (next pose),
+        # but the in-trainer eval pins action[0] to the *current* gripper pose
+        # from the env and executes traj[1]. Training and eval therefore see
+        # different distributions for the action[0] pin. Rebind actions to
+        # gripper_state so action[t] = current pose at frame t. Must happen
+        # before the normalizer below so action statistics are computed from
+        # the new labels.
+        if self.has_gripper_state:
+            fields._dict['actions'] = fields._dict['gripper_state'].copy()
+            print('[ datasets/sequence ] Rebinding actions <- gripper_state '
+                  '(current-pose convention; matches eval pin)')
+
         self.normalizer = DatasetNormalizer(fields, normalizer, particle_normalizer=particle_normalizer, path_lengths=fields['path_lengths'])
 
         # Sanity check: verify normalize -> unnormalize round-trip
