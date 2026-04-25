@@ -124,6 +124,7 @@ def main(argv):
         prop_pos_dim=getattr(args, "prop_pos_dim", 3),
         prop_rot_dim=getattr(args, "prop_rot_dim", 6),
         prop_grip_dim=getattr(args, "prop_grip_dim", 1),
+        split_action_tokens=getattr(args, "split_action_tokens", None),
     )
     diffusion_config = utils.Config(
         args.diffusion,
@@ -171,7 +172,7 @@ def main(argv):
     sd = torch.load(ckpt_path, map_location=args.device)
     state = sd.get("ema", sd.get("model", sd))
     # The saved dict may be the full EMA diffusion state
-    diffusion.load_state_dict(state, strict=False)
+    diffusion.load_state_dict(state, strict=True)
 
     # -------------------------------------------------------------------
     # DLP encoder for live encoding
@@ -298,7 +299,7 @@ def main(argv):
     trainer = trainer_config(diffusion, dataset, None)
 
     # Copy the loaded weights into ema_model (which eval uses).
-    trainer.ema_model.load_state_dict(state, strict=False)
+    trainer.ema_model.load_state_dict(state, strict=True)
     # Use the file's step as trainer.step so video path is tagged correctly.
     try:
         trainer.step = int(os.path.basename(ckpt_path).rsplit("_step", 1)[-1].split(".")[0])

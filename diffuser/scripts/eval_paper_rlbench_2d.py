@@ -170,6 +170,7 @@ def main(argv):
         prop_pos_dim=getattr(args, "prop_pos_dim", 3),
         prop_rot_dim=getattr(args, "prop_rot_dim", 6),
         prop_grip_dim=getattr(args, "prop_grip_dim", 1),
+        split_action_tokens=getattr(args, "split_action_tokens", None),
     )
     diffusion_config = utils.Config(
         args.diffusion,
@@ -197,7 +198,7 @@ def main(argv):
     print(f"[paper_eval_rlbench] loading checkpoint: {ckpt_path}", flush=True)
     sd = torch.load(ckpt_path, map_location=args.device)
     state = sd.get("ema", sd.get("model", sd))
-    diffusion.load_state_dict(state, strict=False)
+    diffusion.load_state_dict(state, strict=True)
 
     # -------- DLP encoder (for live encoding) ------------------------------
     dlp_ckpt = args.dlp_ckpt
@@ -303,7 +304,7 @@ def main(argv):
         n_reference=0,
     )
     trainer = trainer_config(diffusion, dataset, None)
-    trainer.ema_model.load_state_dict(state, strict=False)
+    trainer.ema_model.load_state_dict(state, strict=True)
 
     # Record ckpt step for bookkeeping (doesn't affect video dir: we override below)
     try:
