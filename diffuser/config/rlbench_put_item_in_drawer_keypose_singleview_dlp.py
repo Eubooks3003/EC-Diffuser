@@ -80,7 +80,7 @@ base = {
         'n_layers': 6,
         'dropout': 0.0,
 
-        'n_diffusion_steps': 20,
+        'n_diffusion_steps': 100,
         'action_weight': 1,
 
         'max_particles': 20,
