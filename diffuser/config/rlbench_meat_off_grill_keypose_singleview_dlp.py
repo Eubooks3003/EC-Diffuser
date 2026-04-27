@@ -9,44 +9,46 @@ args_to_watch = [
 
 logbase = 'data'
 
-# RLBench 2D-DLP language-conditioned config for task: close_jar
-# Mode key matches setup.py: "{num_entity}C_{input_type}". Use --num_entity 16 --input_type dlp.
+# RLBench 2D-DLP language-conditioned config for task: meat_off_grill
+# Singleview + keypose hybrid (front cam only, keypose-anchored windowing).
+# Paths point at the lambda remote root for training on lambda.
 mode_to_args = {
   '16C_dlp': {
     'keypose_mode': True,
 
-    'dataset': 'close_jar',
-    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens_with_keyposes/rlbench_close_jar/rlbench_close_jar.pkl',
-    'calib_h5_path': None,  # RLBench does not use a robomimic calib HDF5
-    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens_with_keyposes/rlbench_close_jar/dlp_ckpt.pt',
+    'dataset': 'meat_off_grill',
+    # Reuse the multiview-with-keyposes pkl; slice to front view at load time.
+    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes/rlbench_meat_off_grill/rlbench_meat_off_grill.pkl',
+    'calib_h5_path': None,
+    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes/rlbench_meat_off_grill/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens_with_keyposes/rlbench_close_jar/dlp_config.json',
-    'features_dim': 10,       # Dtok from pkl meta (2D DLP multiview tokens: z2+scale2+depth1+obj_on1+feat4)
-    'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
-    'use_gripper_obs': False,
+    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes/rlbench_meat_off_grill/dlp_config.json',
+    'features_dim': 10,
+    'gripper_dim': 10,
+    'use_gripper_obs': True,
     'gripper_state_mask_ratio': 0.0,
-    'bg_dim': 8,              # 2 views x learned_bg_feature_dim(4)
+    'bg_dim': 4,              # 1 view x learned_bg_feature_dim(4)
     'use_bg_obs': True,
-    'max_particles': 40,      # 2 views x n_kp_enc=20
-    'multiview': True,
-    # Slice multiview pkl down to front+overhead at load time:
-    'use_views': [0, 1],      # 0=front, 1=overhead, 2=left_shoulder, 3=right_shoulder
+    'max_particles': 20,      # 1 view x n_kp_enc=20
+    'multiview': False,
+    'use_views': [0],         # 0=front
     'num_source_views': 4,    # total views in the multiview pkl
     'device': 'cuda:0',
-    'max_path_length': 600,   # pkl T dim (must match preprocess output)
+    'max_path_length': 600,
     'max_demos': 100,
     'eval_freq': 10,
     'eval_backend': 'none',
     'n_steps_per_epoch': 500,
     # --- RLBench-specific ---
-    'action_dim': 10,                        # [pos(3), rot6d(6), open(1)] absolute EEF control
-    'act_rot_dim': 6,             # rot6d occupies 6 action dims
-    'lang_dim': 512,                          # CLIP ViT-B/32 hidden size
+    'action_dim': 10,
+    'act_rot_dim': 6,
+    'split_action_tokens': False,
+    'lang_dim': 512,
     'lang_pooled': False,
     'max_lang_tokens': 10,
     'clip_model_name': 'openai/clip-vit-base-patch32',
     'lang_device': 'cpu',
-    'rlbench_cams': ['front', 'overhead'],
+    'rlbench_cams': ['front'],
     'rlbench_image_size': 128,
     'rlbench_headless': True,
     'rlbench_max_steps': 400,
@@ -56,10 +58,8 @@ mode_to_args = {
     'exe_steps': 1,  # apply 1 keypose, replan
     "random_init": True,
     "random_init_eval": True,
-    # Eval-time diagnostics (auto-exported to ECDIFF_* env vars by train.py /
-    # eval_rlbench.py so no shell setup is needed).
     'save_gt_video': True,
-    'demo_dataset_root': '/home/ellina/Desktop/data/rlbench_rgb',
+    'demo_dataset_root': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/rlbench_rgb',
     'save_imagined': True,
     'save_imagined_recon': True,
   },
@@ -83,9 +83,9 @@ base = {
         'n_diffusion_steps': 20,
         'action_weight': 1,
 
-        'max_particles': 40,
+        'max_particles': 20,
         'positional_bias': False,
-        'multiview': True,
+        'multiview': False,
 
         # dataset
         'loader': 'datasets.LanguageConditionedDataset',
@@ -102,7 +102,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/rlbench_close_jar_keypose_multiview_fo/',
+        'prefix': 'diffusion/rlbench_meat_off_grill_keypose_singleview/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -122,7 +122,7 @@ base = {
         'bucket': None,
         'device': 'cuda:0',
         'seed': 0,
-        'renderer': 'utils.ParticleRenderer',  # 2D renderer
+        'renderer': 'utils.ParticleRenderer',
         'predict_epsilon': False,
         'env_config_dir': 'env_config/n_cubes',
 
@@ -143,7 +143,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/rlbench_close_jar_keypose_multiview_fo/',
+        'prefix': 'plans/rlbench_meat_off_grill_keypose_singleview/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

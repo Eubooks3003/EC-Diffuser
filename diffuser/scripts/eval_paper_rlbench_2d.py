@@ -105,6 +105,20 @@ def main(argv):
           f"max_steps={args._max_steps} "
           f"video_episodes={args._video_episodes}", flush=True)
 
+    # Catch keypose/dense config-vs-ckpt mismatch loudly. The savepath segment
+    # is set by the training config (rlbench_<task>_keypose_multiview_fo for
+    # keypose ckpts), so it disagrees with args.keypose_mode iff the eval was
+    # launched with the wrong config. The trainer auto-fixes exe_steps in this
+    # case but downstream rollout still runs with the wrong action contract.
+    _savepath_is_keypose = "_keypose_" in str(args.savepath)
+    _args_is_keypose = bool(getattr(args, "keypose_mode", False))
+    if _savepath_is_keypose != _args_is_keypose:
+        raise ValueError(
+            f"keypose_mode mismatch: savepath={args.savepath!r} suggests "
+            f"keypose_mode={_savepath_is_keypose}, but args.keypose_mode="
+            f"{_args_is_keypose}. Re-launch with the matching config."
+        )
+
     # -------- dataset (mirrors eval_rlbench.py) ----------------------------
     dataset_config = utils.Config(
         args.loader,

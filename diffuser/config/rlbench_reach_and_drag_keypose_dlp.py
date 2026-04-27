@@ -59,7 +59,7 @@ mode_to_args = {
     # Eval-time diagnostics (auto-exported to ECDIFF_* env vars by train.py /
     # eval_rlbench.py so no shell setup is needed).
     'save_gt_video': True,
-    'demo_dataset_root': '/home/ellina/Desktop/data/rlbench_rgb',
+    'demo_dataset_root': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/rlbench_rgb',
     'save_imagined': True,
     'save_imagined_recon': True,
   },

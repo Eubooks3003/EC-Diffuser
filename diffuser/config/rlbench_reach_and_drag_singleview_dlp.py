@@ -15,11 +15,11 @@ mode_to_args = {
   '16C_dlp': {
     'dataset': 'reach_and_drag',
     # Reuse the multiview pkl; slice to front view at dataset load time.
-    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_reach_and_drag/rlbench_reach_and_drag.pkl',
+    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens/rlbench_reach_and_drag/rlbench_reach_and_drag.pkl',
     'calib_h5_path': None,
-    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_reach_and_drag/dlp_ckpt.pt',
+    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens/rlbench_reach_and_drag/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_reach_and_drag/dlp_config.json',
+    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens/rlbench_reach_and_drag/dlp_config.json',
     'features_dim': 10,
     'gripper_dim': 10,
     'use_gripper_obs': True,
@@ -59,7 +59,7 @@ mode_to_args = {
     # Eval-time diagnostics (auto-exported to ECDIFF_* env vars by train.py /
     # eval_rlbench.py so no shell setup is needed).
     'save_gt_video': True,
-    'demo_dataset_root': '/home/ellina/Desktop/data/rlbench_rgb',
+    'demo_dataset_root': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/rlbench_rgb',
     'save_imagined': True,
     'save_imagined_recon': True,
   },
