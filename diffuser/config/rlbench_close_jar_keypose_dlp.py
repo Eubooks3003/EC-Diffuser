@@ -72,7 +72,7 @@ base = {
         'diffusion': 'models.GaussianDiffusion',
 
         'keypose_mode': True,
-        'horizon': 5,
+        'horizon': 2,
         'features_dim': 10,
         'hidden_dim': 256,
         'projection_dim': 256,
@@ -149,7 +149,7 @@ base = {
         'max_render': 8,
 
         'diffusion_epoch': 'latest',
-        'horizon': 5,
+        'horizon': 2,
         'n_diffusion_steps': 5,
         'verbose': False,
         'suffix': 'f:step_{diffusion_epoch}',

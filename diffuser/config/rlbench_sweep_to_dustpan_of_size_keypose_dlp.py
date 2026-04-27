@@ -52,7 +52,7 @@ mode_to_args = {
     'rlbench_max_steps': 400,
     # -------------------------
     "use_absolute_actions": True,
-    'horizon': 5,    # keypose chunk
+    'horizon': 2,    # keypose chunk
     'exe_steps': 1,  # apply 1 keypose, replan
     "random_init": True,
     "random_init_eval": True,
@@ -72,7 +72,7 @@ base = {
         'diffusion': 'models.GaussianDiffusion',
 
         'keypose_mode': True,
-        'horizon': 5,
+        'horizon': 2,
         'features_dim': 10,
         'hidden_dim': 256,
         'projection_dim': 256,
@@ -149,7 +149,7 @@ base = {
         'max_render': 8,
 
         'diffusion_epoch': 'latest',
-        'horizon': 5,
+        'horizon': 2,
         'n_diffusion_steps': 5,
         'verbose': False,
         'suffix': 'f:step_{diffusion_epoch}',
