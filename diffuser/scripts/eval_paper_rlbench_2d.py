@@ -138,6 +138,7 @@ def main(argv):
         use_views=getattr(args, "use_views", None),
         num_source_views=getattr(args, "num_source_views", None),
         action_normalizer=getattr(args, "action_normalizer", None),
+        keypose_mode=getattr(args, "keypose_mode", False),
     )
     dataset = dataset_config()
     observation_dim = dataset.observation_dim

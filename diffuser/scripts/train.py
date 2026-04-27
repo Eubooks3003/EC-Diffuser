@@ -203,6 +203,7 @@ dataset_config = utils.Config(
     use_views=getattr(args, 'use_views', None),
     num_source_views=getattr(args, 'num_source_views', None),
     action_normalizer=getattr(args, 'action_normalizer', None),
+    keypose_mode=getattr(args, 'keypose_mode', False),
 )
 
 render_config = utils.Config(

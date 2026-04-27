@@ -173,6 +173,9 @@ class ReplayBuffer:
                 self._dict[key] = list(val)
             elif key == 'variation_number':
                 self._dict[key] = np.asarray(val, dtype=np.int32)
+            elif key in ('keypose_indices', 'n_keyposes'):
+                # Keypose-aware preprocess fields. Keep as int32; -1 sentinel for padding.
+                self._dict[key] = np.asarray(val, dtype=np.int32)
             else:
                 self._dict[key] = val.astype(np.float32)
 

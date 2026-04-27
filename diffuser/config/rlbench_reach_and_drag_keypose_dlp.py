@@ -9,51 +9,51 @@ args_to_watch = [
 
 logbase = 'data'
 
-# RLBench 2D-DLP language-conditioned config for task: push_buttons
+# RLBench 2D-DLP language-conditioned config for task: reach_and_drag
 # Mode key matches setup.py: "{num_entity}C_{input_type}". Use --num_entity 16 --input_type dlp.
 mode_to_args = {
   '16C_dlp': {
-    'dataset': 'push_buttons',
-    # Reuse the multiview pkl; slice to front view at dataset load time.
-    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_push_buttons/rlbench_push_buttons.pkl',
-    'calib_h5_path': None,
-    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_push_buttons/dlp_ckpt.pt',
+    'keypose_mode': True,
+
+    'dataset': 'reach_and_drag',
+    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes/rlbench_reach_and_drag/rlbench_reach_and_drag.pkl',
+    'calib_h5_path': None,  # RLBench does not use a robomimic calib HDF5
+    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes/rlbench_reach_and_drag/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens/rlbench_push_buttons/dlp_config.json',
-    'features_dim': 10,
-    'gripper_dim': 10,
-    'use_gripper_obs': True,
+    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes/rlbench_reach_and_drag/dlp_config.json',
+    'features_dim': 10,       # Dtok from pkl meta (2D DLP multiview tokens: z2+scale2+depth1+obj_on1+feat4)
+    'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
+    'use_gripper_obs': False,
     'gripper_state_mask_ratio': 0.0,
-    'bg_dim': 4,              # 1 view x learned_bg_feature_dim(4)
+    'bg_dim': 8,              # 2 views x learned_bg_feature_dim(4)
     'use_bg_obs': True,
-    'max_particles': 20,      # 1 view x n_kp_enc=20
-    'multiview': False,
-    # Slice multiview pkl down to the front view at load time:
-    'use_views': [0],         # 0=front, 1=overhead, 2=left_shoulder, 3=right_shoulder
+    'max_particles': 40,      # 2 views x n_kp_enc=20
+    'multiview': True,
+    # Slice multiview pkl down to front+overhead at load time:
+    'use_views': [0, 1],      # 0=front, 1=overhead, 2=left_shoulder, 3=right_shoulder
     'num_source_views': 4,    # total views in the multiview pkl
     'device': 'cuda:0',
-    'max_path_length': 600,   # Tmax from RLBench demos (pkl has 600 timesteps)
+    'max_path_length': 600,   # pkl T dim (must match preprocess output)
     'max_demos': 100,
     'eval_freq': 60,
-    'eval_backend': 'rlbench',
+    'eval_backend': 'none',
     'n_steps_per_epoch': 500,
     # --- RLBench-specific ---
     'action_dim': 10,                        # [pos(3), rot6d(6), open(1)] absolute EEF control
     'act_rot_dim': 6,             # rot6d occupies 6 action dims
-    'split_action_tokens': False,  # single monolithic action token (no pos/rot/grip split)
-    'lang_dim': 512,                           # CLIP hidden size; 0 disables language conditioning
+    'lang_dim': 512,                          # CLIP ViT-B/32 hidden size
     'lang_pooled': False,
     'max_lang_tokens': 10,
     'clip_model_name': 'openai/clip-vit-base-patch32',
     'lang_device': 'cpu',
-    'rlbench_cams': ['front'],
+    'rlbench_cams': ['front', 'overhead'],
     'rlbench_image_size': 128,
     'rlbench_headless': True,
     'rlbench_max_steps': 400,
     # -------------------------
     "use_absolute_actions": True,
-    'horizon': 6,
-    'exe_steps': 3,
+    'horizon': 5,    # keypose chunk
+    'exe_steps': 1,  # apply 1 keypose, replan
     "random_init": True,
     "random_init_eval": True,
     # Eval-time diagnostics (auto-exported to ECDIFF_* env vars by train.py /
@@ -71,6 +71,7 @@ base = {
         'model': 'models.AdaLNPINTDenoiser',
         'diffusion': 'models.GaussianDiffusion',
 
+        'keypose_mode': True,
         'horizon': 5,
         'features_dim': 10,
         'hidden_dim': 256,
@@ -82,14 +83,14 @@ base = {
         'n_diffusion_steps': 5,
         'action_weight': 1,
 
-        'max_particles': 20,
+        'max_particles': 40,
         'positional_bias': False,
-        'multiview': False,
+        'multiview': True,
 
         # dataset
         'loader': 'datasets.LanguageConditionedDataset',
-        'normalizer': 'SafeLimitsNormalizer',
-        'particle_normalizer': 'ParticleLimitsNormalizer',
+        'normalizer': 'GaussianNormalizer',
+        'particle_normalizer': 'ParticleGaussianNormalizer',
         'preprocess_fns': [],
         'clip_denoised': False,
         'use_padding': False,
@@ -101,7 +102,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/rlbench_push_buttons_singleview/',
+        'prefix': 'diffusion/rlbench_reach_and_drag_keypose_multiview_fo/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -128,7 +129,7 @@ base = {
         'loss_weights': None,
         'loss_discount': 1,
 
-        'exe_steps': 3,
+        'exe_steps': 1,
     },
 
     'plan': {
@@ -138,11 +139,11 @@ base = {
         'preprocess_fns': [],
         'device': 'cuda:0',
         'seed': 0,
-        'exe_steps': 3,
+        'exe_steps': 1,
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/rlbench_push_buttons_singleview/',
+        'prefix': 'plans/rlbench_reach_and_drag_keypose_multiview_fo/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

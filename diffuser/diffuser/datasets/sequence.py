@@ -29,7 +29,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         max_n_episodes=5000, termination_penalty=0, use_padding=True, overfit=False, action_only=False, single_view=False,
         action_z_scale=1.0, use_gripper_obs=False, use_bg_obs=False,
         use_views=None, num_source_views=None,
-        action_normalizer=None, **kwargs):
+        action_normalizer=None, keypose_mode=False, **kwargs):
         self.preprocess_fn = get_preprocess_fn(preprocess_fns, dataset_name)
         self.dataset_path = dataset_path
         self.horizon = horizon
@@ -40,6 +40,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.action_z_scale = float(action_z_scale)  # Scale factor for Z action dimension
         self.use_gripper_obs = use_gripper_obs  # Whether to include gripper state in observations
         self.use_bg_obs = use_bg_obs  # Whether to include background features in observations
+        self.keypose_mode = bool(keypose_mode)
 
         max_demos = kwargs.pop('max_demos', None)
         fields = ReplayBuffer(max_n_episodes, max_path_length, termination_penalty)
@@ -51,6 +52,18 @@ class SequenceDataset(torch.utils.data.Dataset):
             print(f'[ datasets/sequence ] Limiting to {max_demos}/{fields._count} demos')
             fields._count = max_demos
         fields.finalize()
+
+        # Auto-correct max_path_length to match the actual loaded pkl. The pkl
+        # stores arrays of shape (E, T, ...) and normalize() reshapes via
+        # (E * self.max_path_length, -1); if the config disagrees with the pkl's
+        # T, the reshape silently produces wrong-shaped tensors. Trust the pkl.
+        if 'observations' in fields._dict:
+            actual_T = int(fields['observations'].shape[1])
+            if actual_T != self.max_path_length:
+                print(f'[ datasets/sequence ] adjusting max_path_length: '
+                      f'{self.max_path_length} -> {actual_T} (from pkl shape)')
+                self.max_path_length = actual_T
+                fields.max_path_length = actual_T
 
         # Optional view subsetting: the pkl stores tokens stacked in view order
         # (view0 particles | view1 particles | ...). If the caller wants to train
@@ -119,6 +132,47 @@ class SequenceDataset(torch.utils.data.Dataset):
                 print(f'[ datasets/sequence ] Background features available but not used (use_bg_obs=False)')
 
         self.successful_episode_idxes = fields.successful_episode_idxes
+
+        # Keypose-aware mode: validates and stores keypose metadata for windowing
+        # over keyframes (gripper-state-change / stopped-velocity decision points)
+        # rather than dense per-step frames. Pkls produced by the keypose-aware
+        # preprocess script (lpwm-copy/scripts/ec_diffuser_rlbench_multiview_preprocess.py)
+        # carry 'keypose_indices' (E, max_kp) int32 and 'n_keyposes' (E,) int32.
+        if self.keypose_mode:
+            if 'keypose_indices' not in fields._dict or 'n_keyposes' not in fields._dict:
+                raise RuntimeError(
+                    "keypose_mode=True but pkl is missing 'keypose_indices' / "
+                    "'n_keyposes' fields. Re-preprocess with the keypose-aware "
+                    "preprocess script (writes to *_with_keyposes/ folders)."
+                )
+            raw_kp = np.asarray(fields._dict['keypose_indices'], dtype=np.int64)  # (E, max_kp)
+            raw_n  = np.asarray(fields._dict['n_keyposes'], dtype=np.int64)       # (E,)
+            # Prepend frame 0 to every episode's keypose list (3DDA convention,
+            # see 3d_diffuser_actor/data_preprocessing/package_rlbench.py:53).
+            # Without this, the model never sees the initial-state obs at training
+            # time, but eval starts at frame 0 -> OOD and the policy freezes.
+            # Idempotent: skip if frame 0 is already the first keypose (forward-
+            # compat with future preprocess runs that do the prepend themselves).
+            E, max_kp_orig = raw_kp.shape
+            already_prepended = bool(((raw_n > 0) & (raw_kp[:, 0] == 0)).all())
+            if already_prepended:
+                self.keypose_indices = raw_kp
+                self.n_keyposes = raw_n
+                _msg_extra = '(already includes frame 0)'
+            else:
+                augmented = np.full((E, max_kp_orig + 1), -1, dtype=np.int64)
+                augmented[:, 0] = 0
+                for e in range(E):
+                    n = int(raw_n[e])
+                    augmented[e, 1:1 + n] = raw_kp[e, :n]
+                self.keypose_indices = augmented
+                self.n_keyposes = raw_n + 1
+                _msg_extra = '(prepended frame 0 to every demo)'
+            print(f'[ datasets/sequence ] keypose_mode=True {_msg_extra}: '
+                  f'keypose_indices {self.keypose_indices.shape} '
+                  f'n_keyposes min={int(self.n_keyposes.min())} '
+                  f'median={int(np.median(self.n_keyposes))} '
+                  f'max={int(self.n_keyposes.max())}')
 
         # OCGS-style action convention: action[t] = current pose, not next pose.
         # The pkl was preprocessed with action[t] = gripper_state[t+1] (next pose,
@@ -192,6 +246,8 @@ class SequenceDataset(torch.utils.data.Dataset):
             makes indices for sampling from dataset;
             each index maps to a datapoint
         '''
+        if self.keypose_mode:
+            return self._make_indices_keypose(horizon)
         indices = []
         for i, path_length in enumerate(path_lengths):
             max_start = min(path_length - 1, self.max_path_length - horizon)
@@ -202,6 +258,87 @@ class SequenceDataset(torch.utils.data.Dataset):
                 indices.append((i, start, end))
         indices = np.array(indices)
         return indices
+
+    def _make_indices_keypose(self, horizon):
+        '''Keypose-anchored windowing. Each sample = `horizon` consecutive keyposes.
+
+        Indices store (path_idx, kp_start, kp_end) where kp_start/kp_end are
+        positions in the per-episode keypose array (NOT raw demo frame indices).
+        Demo-frame translation happens in _getitem_keypose via self.keypose_indices.
+        '''
+        indices = []
+        for i, n_kp in enumerate(self.n_keyposes):
+            n_kp = int(n_kp)
+            if n_kp <= 0:
+                continue
+            max_start = max(n_kp - horizon, 0)
+            for start in range(max_start + 1):
+                indices.append((i, start, start + horizon))
+        return np.array(indices)
+
+    def _getitem_keypose(self, idx):
+        '''__getitem__ for keypose mode. Translates keypose-array positions to
+        demo frame indices via self.keypose_indices, then fancy-indexes the
+        normed obs/action/gripper/bg fields. Repeats the last valid keypose
+        when the window extends past the episode's keypose count.
+
+        Critical: in keypose mode we DO NOT pin action[0] (action_conditions={}).
+        Pinning action[0]=current_pose forces traj[1] to denoise consistent with
+        a fixed start, which combined with the model's smoothness inductive bias
+        collapses traj[1] toward action[0] -- causing jitter at eval. This
+        matches 3DDA's design (diffuser_actor.py:215-216, cond_mask all-zero):
+        current gripper is provided as a feature via the obs conditioning
+        (gripper_state component of cond[0]), but the trajectory itself --
+        including position 0's action -- is freely denoised.
+        '''
+        path_ind, kp_start, kp_end = self.indices[idx]
+        n_kp = int(self.n_keyposes[path_ind])
+        actual_end = min(int(kp_end), n_kp)
+        padding_needed = int(kp_end) - actual_end
+
+        frame_idxs = self.keypose_indices[path_ind, int(kp_start):actual_end]
+        # frame_idxs: (actual_end - kp_start,) int64 demo frame indices in [0, T)
+
+        observations = self.fields.normed_observations[path_ind, frame_idxs]
+        actions = self.fields.normed_actions[path_ind, frame_idxs]
+
+        if self.use_gripper_obs and self.has_gripper_state:
+            gripper_state = self.fields.normed_gripper_state[path_ind, frame_idxs]
+        else:
+            gripper_state = None
+
+        if self.use_bg_obs and self.has_bg_features:
+            bg_features = self.fields.normed_bg_features[path_ind, frame_idxs]
+        else:
+            bg_features = None
+
+        if padding_needed > 0:
+            observations = np.concatenate(
+                [observations] + [observations[-1:]] * padding_needed, axis=0)
+            actions = np.concatenate(
+                [actions] + [actions[-1:]] * padding_needed, axis=0)
+            if gripper_state is not None:
+                gripper_state = np.concatenate(
+                    [gripper_state] + [gripper_state[-1:]] * padding_needed, axis=0)
+            if bg_features is not None:
+                bg_features = np.concatenate(
+                    [bg_features] + [bg_features[-1:]] * padding_needed, axis=0)
+
+        conditions = self.get_conditions(observations, gripper_state, bg_features)
+        # Empty action_conditions -- no action pin in keypose mode (see docstring).
+        action_conditions = {}
+
+        if self.obs_only:
+            trajectories = observations
+        else:
+            traj_parts = [actions]
+            if gripper_state is not None:
+                traj_parts.append(gripper_state)
+            if bg_features is not None:
+                traj_parts.append(bg_features)
+            traj_parts.append(observations)
+            trajectories = np.concatenate(traj_parts, axis=-1)
+        return Batch(trajectories, conditions, action_conditions)
 
     def get_conditions(self, observations, gripper_state=None, bg_features=None):
         '''
@@ -224,6 +361,8 @@ class SequenceDataset(torch.utils.data.Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
+        if self.keypose_mode:
+            return self._getitem_keypose(idx)
         path_ind, start, end = self.indices[idx]
 
         observations = self.fields.normed_observations[path_ind, start:end]
@@ -266,6 +405,8 @@ class GoalDataset(SequenceDataset):
             each index maps to a datapoint.
             max_start = path_length - horizon so every window is fully within bounds.
         '''
+        if self.keypose_mode:
+            return self._make_indices_keypose(horizon)
         indices = []
         for i, path_length in enumerate(path_lengths):
             max_start = max(path_length - horizon, 0)
@@ -277,6 +418,8 @@ class GoalDataset(SequenceDataset):
 
 
     def __getitem__(self, idx):
+        if self.keypose_mode:
+            return self._getitem_keypose(idx)
         path_ind, start, end = self.indices[idx]
         path_length = self.fields.path_lengths[path_ind]
 

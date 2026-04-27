@@ -741,6 +741,17 @@ class Trainer(object):
                 print(f"[eval_rlbench] invalid ECDIFF_EXE_STEPS={_env_exe_steps!r}; ignoring", flush=True)
         exe_steps = max(1, int(exe_steps))
 
+        # Keypose mode: each predicted pose is the next *keypose* target (gripper
+        # state change or stopped point). Force exe_steps=1 so we apply one
+        # keypose, observe, and replan -- matches 3DDA / ParticleSplat receding-
+        # horizon control. The env wrapper's EndEffectorPoseViaPlanning action
+        # mode already handles the multi-step trajectory to reach the target.
+        # Caller should also drop max_steps (~15 keypose attempts is plenty).
+        keypose_mode = bool(getattr(self.dataset, 'keypose_mode', False))
+        if keypose_mode and exe_steps != 1:
+            print(f"[eval_rlbench] keypose_mode=True: forcing exe_steps {exe_steps} -> 1", flush=True)
+            exe_steps = 1
+
         env = make_env_fn()
         policy = make_policy_fn()
 
@@ -833,7 +844,7 @@ class Trainer(object):
         print("=" * 60)
         print(f"[eval_rlbench] task={task_name} n_episodes={n_episodes} max_steps={max_steps}")
         print(f"[eval_rlbench] a_dim={a_dim} gripper_dim={gripper_dim} bg_dim={bg_dim} K={K} D={D}")
-        print(f"[eval_rlbench] action chunking: exe_steps={exe_steps}")
+        print(f"[eval_rlbench] action chunking: exe_steps={exe_steps}  keypose_mode={keypose_mode}")
         print(f"[eval_rlbench] save_gt={_save_gt} save_imagined={_save_imagined}")
         print("=" * 60, flush=True)
 
@@ -928,12 +939,23 @@ class Trainer(object):
                     cond_0 = _torch.cat(parts, dim=-1).to(device)   # (1, gripper+bg+K*D)
                     cond = {0: cond_0}
 
-                    # Proprioception conditioning: pin action[0] = current gripper pose
-                    # (same 10D [pos, rot6d, open] format as actions) in actions-normalized space.
-                    action_cond_raw = gs_np.reshape(1, -1)  # (1, 10) — gripper_state matches action dim
-                    action_cond_normed = self.dataset.normalizer.normalize(action_cond_raw, "actions")
-                    action_cond_tensor = _torch.from_numpy(action_cond_normed).float().to(device)
-                    action_cond = {0: action_cond_tensor}
+                    if keypose_mode:
+                        # In keypose mode we do NOT pin action[0]. Pinning forces
+                        # traj[1] to denoise consistent with a fixed start, which
+                        # combined with the model's smoothness inductive bias
+                        # collapses traj[1] toward action[0] -> jitter. Current
+                        # gripper still flows in via the gripper_state component
+                        # of cond[0] above. Matches 3DDA's design
+                        # (diffuser_actor.py:215-216, cond_mask all-zero).
+                        action_cond = {}
+                    else:
+                        # Dense mode: pin action[0] = current gripper pose
+                        # (same 10D [pos, rot6d, open] format as actions) in
+                        # actions-normalized space.
+                        action_cond_raw = gs_np.reshape(1, -1)  # (1, 10)
+                        action_cond_normed = self.dataset.normalizer.normalize(action_cond_raw, "actions")
+                        action_cond_tensor = _torch.from_numpy(action_cond_normed).float().to(device)
+                        action_cond = {0: action_cond_tensor}
 
                     sample = self.ema_model(cond, lang=lang, lang_mask=lang_mask,
                                             action_cond=action_cond, verbose=False)
