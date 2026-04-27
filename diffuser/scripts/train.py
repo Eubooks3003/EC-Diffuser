@@ -145,6 +145,7 @@ dataset_config = utils.Config(
     action_z_scale=getattr(args, 'action_z_scale', 1.0),
     use_gripper_obs=getattr(args, 'use_gripper_obs', False),
     use_bg_obs=getattr(args, 'use_bg_obs', False),
+    keypose_mode=getattr(args, 'keypose_mode', False),
 )
 
 render_config = utils.Config(

@@ -1043,9 +1043,20 @@ class Trainer(object):
         use_gripper_obs = bool(getattr(self.dataset, "use_gripper_obs", False))
         use_bg_obs = bool(getattr(self.dataset, "use_bg_obs", False))
 
+        # Keypose mode: each predicted pose is the next *keypose* target. Force
+        # exe_steps=1 so we apply one keypose per replan -- matches 3DDA /
+        # ParticleSplat receding-horizon control. The env wrapper's
+        # EndEffectorPoseViaPlanning action mode handles the multi-step
+        # trajectory to reach each target. Caller should drop max_steps
+        # accordingly (~15 keypose attempts is plenty per episode).
+        keypose_mode = bool(getattr(self.dataset, 'keypose_mode', False))
+        if keypose_mode and exe_steps != 1:
+            print(f"[eval_rlbench] keypose_mode=True: forcing exe_steps {exe_steps} -> 1", flush=True)
+            exe_steps = 1
+
         successes, lengths = [], []
         print(f"[eval_rlbench_rollouts] Starting {n_episodes} episodes, "
-              f"max_steps={max_steps}, exe_steps={exe_steps}", flush=True)
+              f"max_steps={max_steps}, exe_steps={exe_steps} keypose_mode={keypose_mode}", flush=True)
 
         for ep in range(n_episodes):
             try:
@@ -1105,8 +1116,14 @@ class Trainer(object):
                     # gripper pose, normalized in actions-space. Requires the
                     # env's gripper_state to have the same dim as action
                     # (true for rot6d-based absolute-action configs).
+                    # In keypose mode we skip the pin -- pinning collapses
+                    # traj[1] toward action[0] -> jitter. Current gripper still
+                    # flows in via cond[0]'s gripper_state component. Matches
+                    # 3DDA's design (diffuser_actor.py:215-216).
                     action_cond = None
-                    if policy is not None and "gripper_state" in obs_dict:
+                    if keypose_mode:
+                        action_cond = {}
+                    elif policy is not None and "gripper_state" in obs_dict:
                         gs_raw = _np.asarray(obs_dict["gripper_state"],
                                              dtype=_np.float32).reshape(1, -1)
                         if gs_raw.shape[-1] == a_dim:

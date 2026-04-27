@@ -207,6 +207,7 @@ def main(argv):
         action_z_scale=getattr(args, "action_z_scale", 1.0),
         use_gripper_obs=getattr(args, "use_gripper_obs", False),
         use_bg_obs=getattr(args, "use_bg_obs", False),
+        keypose_mode=getattr(args, "keypose_mode", False),
     )
     dataset = dataset_config()
     observation_dim = dataset.observation_dim
