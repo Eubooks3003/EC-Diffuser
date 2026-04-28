@@ -205,6 +205,7 @@ model_config = utils.Config(
     gripper_dim=gripper_dim,
     bg_dim=bg_dim,
     lang_dim=getattr(args, 'lang_dim', 0),
+    use_cond_tokens=getattr(args, 'keypose_mode', False),
 )
 
 diffusion_config = utils.Config(
@@ -225,6 +226,7 @@ diffusion_config = utils.Config(
     device=args.device,
     obs_only=args.obs_only,
     action_only=args.action_only,
+    keypose_mode=getattr(args, 'keypose_mode', False),
 )
 
 trainer_config = utils.Config(

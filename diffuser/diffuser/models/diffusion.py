@@ -59,7 +59,7 @@ class GaussianDiffusion(nn.Module):
     def __init__(self, model, horizon, observation_dim, action_dim, n_timesteps=1000,
         loss_type='l1', clip_denoised=False, predict_epsilon=True,
         action_weight=1.0, loss_discount=1.0, loss_weights=None, obs_only=False, action_only=False,
-        gripper_dim=0, bg_dim=0,
+        gripper_dim=0, bg_dim=0, keypose_mode=False,
     ):
         super().__init__()
         self.horizon = horizon
@@ -68,6 +68,10 @@ class GaussianDiffusion(nn.Module):
         self.action_dim = action_dim
         self.gripper_dim = gripper_dim
         self.bg_dim = bg_dim
+        # When True, conditions[0] is consumed by the model as separate context
+        # tokens (use_cond_tokens path) and apply_conditioning skips slot-0 obs
+        # pinning. Slot 0 of the trajectory is the next-keypose prediction.
+        self.keypose_mode = keypose_mode
         # transition_dim includes: actions + gripper_state (optional) + bg_features (optional) + observations
         self.transition_dim = observation_dim + action_dim + gripper_dim + bg_dim
         self.model = model
@@ -143,8 +147,14 @@ class GaussianDiffusion(nn.Module):
         discounts = discounts / discounts.mean()
         loss_weights = torch.einsum('h,t->ht', discounts, dim_weights)
 
-        ## weight executable action indices (skip a0 which is pinned by apply_conditioning)
-        loss_weights[1:, :self.action_dim] = action_weight
+        ## Action loss weighting:
+        ##  - keypose_mode: every slot is a real prediction (no pinned slot 0),
+        ##    so action_weight applies uniformly across all slots.
+        ##  - legacy: slot 0 is pinned by apply_conditioning, so weight only slot 1+.
+        if getattr(self, 'keypose_mode', False):
+            loss_weights[:, :self.action_dim] = action_weight
+        else:
+            loss_weights[1:, :self.action_dim] = action_weight
         return loss_weights
 
     #------------------------------------------ sampling ------------------------------------------#
@@ -173,7 +183,7 @@ class GaussianDiffusion(nn.Module):
 
     def p_mean_variance(self, x, cond, t, lang=None, lang_mask=None, action_cond=None):
         x_recon = self.predict_start_from_noise(x, t=t, noise=self.model(x, cond, t, lang=lang, lang_mask=lang_mask))
-        x_recon = apply_conditioning(x_recon, cond, self.action_dim, action_conditions=action_cond)
+        x_recon = apply_conditioning(x_recon, cond, self.action_dim, action_conditions=action_cond, pin_obs=not self.keypose_mode)
 
         if self.clip_denoised:
             x_recon.clamp_(-1., 1.)
@@ -185,7 +195,7 @@ class GaussianDiffusion(nn.Module):
     def p_mean_variance_return_attn(self, x, cond, t, lang=None, lang_mask=None, action_cond=None):
         noise, att_dict = self.model(x, cond, t, return_attention=True, lang=lang, lang_mask=lang_mask)
         x_recon = self.predict_start_from_noise(x, t=t, noise=noise)
-        x_recon = apply_conditioning(x_recon, cond, self.action_dim, action_conditions=action_cond)
+        x_recon = apply_conditioning(x_recon, cond, self.action_dim, action_conditions=action_cond, pin_obs=not self.keypose_mode)
 
         if self.clip_denoised:
             x_recon.clamp_(-1., 1.)
@@ -200,7 +210,7 @@ class GaussianDiffusion(nn.Module):
 
         batch_size = shape[0]
         x = torch.randn(shape, device=device)
-        x = apply_conditioning(x, cond, self.action_dim, action_conditions=action_cond)
+        x = apply_conditioning(x, cond, self.action_dim, action_conditions=action_cond, pin_obs=not self.keypose_mode)
 
         chain = [x] if return_chain else None
         att_dict = None
@@ -214,7 +224,7 @@ class GaussianDiffusion(nn.Module):
                 x, values, att_dict = sample_fn(self, x, cond, t, lang=lang, lang_mask=lang_mask, action_cond=action_cond, **sample_kwargs)
             else:
                 x, values = sample_fn(self, x, cond, t, lang=lang, lang_mask=lang_mask, action_cond=action_cond, **sample_kwargs)
-            x = apply_conditioning(x, cond, self.action_dim, action_conditions=action_cond)
+            x = apply_conditioning(x, cond, self.action_dim, action_conditions=action_cond, pin_obs=not self.keypose_mode)
 
             progress.update({'t': i, 'vmin': values.min().item(), 'vmax': values.max().item()})
             if return_chain: chain.append(x)
@@ -253,11 +263,11 @@ class GaussianDiffusion(nn.Module):
         noise = torch.randn_like(x_start)
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        x_noisy = apply_conditioning(x_noisy, cond, self.action_dim, action_conditions=action_cond) # a, 0, 1
+        x_noisy = apply_conditioning(x_noisy, cond, self.action_dim, action_conditions=action_cond, pin_obs=not self.keypose_mode) # a, 0, 1
 
         x_recon = self.model(x_noisy, cond, t, lang=lang, lang_mask=lang_mask)  # a' 0' 1'
 
-        x_recon = apply_conditioning(x_recon, cond, self.action_dim, action_conditions=action_cond)
+        x_recon = apply_conditioning(x_recon, cond, self.action_dim, action_conditions=action_cond, pin_obs=not self.keypose_mode)
 
         assert noise.shape == x_recon.shape
 

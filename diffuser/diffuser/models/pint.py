@@ -72,7 +72,7 @@ class AdaLNPINTDenoiser(nn.Module):
                  predict_delta=False, positional_bias=True, max_particles=4,
                  learned_sinusoidal_cond=False, random_fourier_features=False,
                  learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, bg_dim=0,
-                 lang_dim=0, **kwargs):
+                 lang_dim=0, use_cond_tokens=False, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
@@ -80,6 +80,7 @@ class AdaLNPINTDenoiser(nn.Module):
         self.gripper_dim = gripper_dim
         self.bg_dim = bg_dim
         self.lang_dim = lang_dim  # CLIP hidden size (e.g. 512); 0 disables language conditioning
+        self.use_cond_tokens = use_cond_tokens  # 3DDA-style: current-keypose cond as separate context tokens
         self.predict_delta = predict_delta
         self.projection_dim = projection_dim
         self.max_particles = max_particles
@@ -194,6 +195,22 @@ class AdaLNPINTDenoiser(nn.Module):
         # Learnable action encoding.
         self.action_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
 
+        # Conditioning-token encodings: 3DDA-style separate context tokens for the
+        # current keypose. Distinct from the trajectory encodings so the model can
+        # tell "this token is current scene context" vs "this token is the
+        # next-keypose prediction." Reuse projection layers (gripper/bg/particle)
+        # since the modalities are identical.
+        if self.use_cond_tokens:
+            if self.gripper_dim > 0:
+                self.cond_gripper_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            if self.bg_dim > 0:
+                self.cond_bg_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            if self.multiview:
+                self.cond_view1_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+                self.cond_view2_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            else:
+                self.cond_particle_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+
     def forward(self, x, cond, time, return_attention=False, lang=None, lang_mask=None):
         """
         Forward pass for the denoiser.
@@ -203,7 +220,14 @@ class AdaLNPINTDenoiser(nn.Module):
                 - If gripper_dim == 0: [batch_size, T, action_dim + particle_feature_dim]
                 - If gripper_dim > 0:  [batch_size, T, action_dim + gripper_dim + particle_feature_dim]
                 The layout is: [actions, gripper_state (optional), particles]
-            cond: (Unused) Additional conditioning (reserved for future use).
+            cond: Conditioning dict. When use_cond_tokens=True, cond[0] is a
+                concatenated tensor [bs, gripper_dim + bg_dim + n_particles*features_dim]
+                holding the *current* keypose's modalities. The model projects these
+                into separate context tokens (with distinct learnable encodings) and
+                prepends them after lang in the transformer sequence — they are
+                non-denoised cross-attention context, not predicted. When
+                use_cond_tokens=False, cond is unused (legacy visuomotor path uses
+                apply_conditioning to inpaint slot 0 of the trajectory instead).
             time (torch.Tensor): Tensor of time indices with shape [batch_size]. These are embedded via time_mlp.
             return_attention (bool): If True, returns the attention weights along with the output.
             lang (torch.Tensor, optional): CLIP-encoded instruction tokens of shape
@@ -303,6 +327,56 @@ class AdaLNPINTDenoiser(nn.Module):
             bg_token_idx = (bg_token_idx + n_lang) if bg_token_idx is not None else None
             particle_start_token_idx = particle_start_token_idx + n_lang
 
+        # ---------------------------------------------------------------------
+        # Conditioning tokens: 3DDA-style separate context for the *current*
+        # keypose. cond[0] = concat(gripper, bg, particles) at the conditioning
+        # frame. Project each modality through the existing trajectory
+        # projections (weight reuse), tag with cond-specific encodings, broadcast
+        # across T (time-invariant context), and insert between lang and
+        # trajectory tokens. Trajectory queries cross-attend to these via
+        # standard self-attention.
+        n_cond = 0
+        if self.use_cond_tokens and cond is not None and 0 in cond:
+            cond_vec = cond[0]  # [bs, gripper_dim + bg_dim + n_particles*features_dim]
+            cond_pos = 0
+            cond_token_list = []
+
+            if self.gripper_dim > 0:
+                cond_grip = cond_vec[:, cond_pos:cond_pos + self.gripper_dim]
+                cond_pos += self.gripper_dim
+                cond_grip_emb = self.gripper_projection(cond_grip)  # [bs, projection_dim]
+                cond_grip_emb = cond_grip_emb + self.cond_gripper_encoding[:, 0]
+                cond_token_list.append(cond_grip_emb.unsqueeze(1))  # [bs, 1, projection_dim]
+
+            if self.bg_dim > 0:
+                cond_bg = cond_vec[:, cond_pos:cond_pos + self.bg_dim]
+                cond_pos += self.bg_dim
+                cond_bg_emb = self.bg_projection(cond_bg)
+                cond_bg_emb = cond_bg_emb + self.cond_bg_encoding[:, 0]
+                cond_token_list.append(cond_bg_emb.unsqueeze(1))
+
+            cond_particles_flat = cond_vec[:, cond_pos:]  # [bs, n_particles*features_dim]
+            cond_particles = cond_particles_flat.view(bs, -1, self.features_dim)
+            cond_part_emb = self.particle_projection(cond_particles)  # [bs, n_particles, projection_dim]
+            if self.multiview:
+                n_p = cond_part_emb.size(1) // 2
+                cond_part_view1 = cond_part_emb[:, :n_p] + self.cond_view1_encoding[:, 0]
+                cond_part_view2 = cond_part_emb[:, n_p:] + self.cond_view2_encoding[:, 0]
+                cond_part_emb = torch.cat([cond_part_view1, cond_part_view2], dim=1)
+            else:
+                cond_part_emb = cond_part_emb + self.cond_particle_encoding[:, 0]
+            cond_token_list.append(cond_part_emb)
+
+            cond_tokens = torch.cat(cond_token_list, dim=1)  # [bs, n_cond, projection_dim]
+            n_cond = cond_tokens.size(1)
+            cond_tokens = cond_tokens.unsqueeze(1).expand(-1, T, -1, -1)  # [bs, T, n_cond, projection_dim]
+
+            # Insert between lang (positions [0:n_lang]) and trajectory tokens.
+            x_cat = torch.cat([x_cat[:, :, :n_lang], cond_tokens, x_cat[:, :, n_lang:]], dim=2)
+            gripper_token_idx = (gripper_token_idx + n_cond) if gripper_token_idx is not None else None
+            bg_token_idx = (bg_token_idx + n_cond) if bg_token_idx is not None else None
+            particle_start_token_idx = particle_start_token_idx + n_cond
+
         # Build per-token padding mask (B, n_tokens). Lang tokens come first in
         # x_cat, so we pad lang positions with lang_mask validity and mark all
         # non-lang positions as valid (1). Used by the transformer to ignore
@@ -333,8 +407,9 @@ class AdaLNPINTDenoiser(nn.Module):
 
         # ---------------------------------------------------------------------
         # Decode transformer output.
-        # Action token sits right after any language tokens; language tokens are dropped.
-        action_token_idx = n_lang
+        # Token layout: [lang? | cond? | action | gripper? | bg? | particles].
+        # Lang and cond tokens are non-denoised context and are dropped at decode.
+        action_token_idx = n_lang + n_cond
         action_decoder_out = self.action_decoder(particles_trans[:, :, action_token_idx, :])  # [bs, T, action_dim]
 
         particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])

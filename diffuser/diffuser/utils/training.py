@@ -1138,9 +1138,15 @@ class Trainer(object):
                     else:
                         sample = self.ema_model(cond, verbose=False)
                     traj = sample.trajectories[0]  # (H, transition_dim)
-                    # If a[0] was pinned to the current pose, skip it and play
-                    # out a[1..H-1]; otherwise buffer the full H predictions.
-                    if action_cond is not None:
+                    # Buffer slot selection:
+                    #  - keypose_mode (v2): trajectory contains only future keyposes,
+                    #    slot 0 IS the next keypose to execute -> use traj[:].
+                    #  - legacy visuomotor pin: action_cond={0: a0} pins slot 0 to
+                    #    the current pose -> skip slot 0, play out traj[1..H-1].
+                    #  - no pin (action_cond=None): use traj[:].
+                    if keypose_mode:
+                        action_buffer = traj[:, :a_dim].detach().cpu().numpy().astype(_np.float32)
+                    elif action_cond is not None and len(action_cond) > 0:
                         action_buffer = traj[1:, :a_dim].detach().cpu().numpy().astype(_np.float32)
                     else:
                         action_buffer = traj[:, :a_dim].detach().cpu().numpy().astype(_np.float32)
