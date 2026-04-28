@@ -43,7 +43,14 @@ class SequenceDataset(torch.utils.data.Dataset):
         max_demos = kwargs.pop('max_demos', None)
         fields = ReplayBuffer(max_n_episodes, max_path_length, termination_penalty)
         assert dataset_path, 'Dataset path must be provided'
-        fields.load_paths_from_pickle(dataset_path, single_view=single_view and 'kitchen' not in dataset_path)
+        if isinstance(dataset_path, (list, tuple)):
+            # Multi-task: list of per-task pkls; concatenate after padding.
+            fields.load_paths_from_pickles(dataset_path, single_view=single_view)
+        else:
+            fields.load_paths_from_pickle(
+                dataset_path,
+                single_view=single_view and 'kitchen' not in dataset_path,
+            )
         if overfit:
             fields._count = 1
         if max_demos is not None and max_demos < fields._count:

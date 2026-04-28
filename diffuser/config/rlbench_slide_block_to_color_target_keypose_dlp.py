@@ -16,14 +16,14 @@ mode_to_args = {
     'keypose_mode': True,
 
     'dataset': 'slide_block_to_color_target',
-    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_voxel_tokens_with_keyposes/rlbench_slide_block_to_color_target/slide_block_to_color_target.pkl',
+    'override_dataset_path': '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_slide_block_to_color_target/slide_block_to_color_target.pkl',
     'calib_h5_path': None,  # RLBench does not use a robomimic calib HDF5
-    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_voxel_tokens_with_keyposes/rlbench_slide_block_to_color_target/dlp_ckpt.pt',
+    'dlp_ckpt': '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_slide_block_to_color_target/dlp_ckpt.pt',
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_voxel_tokens_with_keyposes/rlbench_slide_block_to_color_target/dlp_config.json',
+    'dlp_cfg': '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_slide_block_to_color_target/dlp_config.json',
     'features_dim': 12,       # z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
-    'use_gripper_obs': False,
+    'use_gripper_obs': True,  # cond-tokens path: current gripper feeds into cond[0]
     'gripper_state_mask_ratio': 0.0,
     'bg_dim': 2,              # learned_bg_feature_dim
     'use_bg_obs': True,
@@ -50,7 +50,7 @@ mode_to_args = {
     'lang_device': 'cpu',
     # -------------------------
     "use_absolute_actions": True,
-    'horizon': 2,    # keypose chunk
+    'horizon': 1,    # predict only the next keypose (3DDA-style); cond is current keypose
     'exe_steps': 1,  # apply 1 keypose, replan
     "random_init": True,
     "random_init_eval": True,
@@ -64,12 +64,12 @@ base = {
         'diffusion': 'models.GaussianDiffusion',
 
         'keypose_mode': True,
-        'horizon': 2,
+        'horizon': 1,
         'features_dim': 7,
         'hidden_dim': 256,
         'projection_dim': 256,
         'n_heads': 8,
-        'n_layers': 6,
+        'n_layers': 12,
         'dropout': 0.0,
 
         'n_diffusion_steps': 100,
