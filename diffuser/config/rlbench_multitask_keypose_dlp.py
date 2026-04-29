@@ -64,7 +64,7 @@ mode_to_args = {
     'max_path_length': 927,   # global max across the 10 tasks (stack_blocks)
     'max_demos': 100,         # per-task; total = 10 * 100 = 1000 episodes
     'eval_freq': 60,
-    'eval_backend': 'rlbench',
+    'eval_backend': 'none',
     # Per-task live eval — each task evaluated separately at eval time.
     'rlbench_eval_episodes': 2,
     'rlbench_eval_max_steps': 20,  # keypose attempts per episode
