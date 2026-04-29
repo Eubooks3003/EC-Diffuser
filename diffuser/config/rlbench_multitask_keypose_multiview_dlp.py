@@ -154,7 +154,7 @@ base = {
         'n_steps_per_epoch': 200,
         'loss_type': 'l1',
         'n_train_steps': 2e6,
-        'batch_size': 32,
+        'batch_size': 128,
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
         'ema_decay': 0.995,
