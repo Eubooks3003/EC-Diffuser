@@ -167,7 +167,7 @@ base = {
         'bucket': None,
         'device': 'cuda:0',
         'seed': 0,
-        'renderer': 'utils.ParticleRenderer3D',
+        'renderer': 'utils.ParticleRenderer',  # 2D renderer (matches per-task 2D configs)
         'predict_epsilon': False,
         'env_config_dir': 'env_config/n_cubes',
 
