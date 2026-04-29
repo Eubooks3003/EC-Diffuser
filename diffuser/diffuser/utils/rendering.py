@@ -205,6 +205,10 @@ class ParticleRenderer3D:
         alpha_thresh=0.05,
         pad=2.0,
         show_axes=True,
+        # Absorb extra kwargs passed by render_config in some train.py versions
+        # (e.g. single_view) so the renderer construction stays loose and
+        # tolerant of upstream changes. ParticleRenderer3D doesn't use these.
+        **kwargs,
     ):
         self.env = env
         self.latent_rep_model = latent_rep_model
