@@ -1,15 +1,19 @@
 """Multi-task keypose v2 config across all 10 RLBench-PerAct tasks.
 
-This config drives a single keypose-mode policy on all tasks jointly (same setup
+Drives a single keypose-mode policy on all tasks jointly (same setup
 as 3DDA / RVT / PerAct headline numbers). Language conditioning disambiguates
 which task per episode.
 
-NOTE: Requires a multi-pkl loader extension in `buffer.py` /
-`SequenceDataset.__init__`. The current loader (`load_paths_from_pickle`)
-accepts a single pkl path; multi-task requires concatenating episode-axis
-across the list of per-task pkls with padding to global (max_path_length,
-max_keyposes). See override_dataset_path below for the list of pkls to
-concatenate.
+Paths default to lambda's remote layout (/home/ubuntu/tal-lpwm-neurips-2026/...).
+For local rollout/dev rewrite the paths to /home/ellina/Desktop/data/... per
+project_remote_data_path memory.
+
+DLP ckpts: each task has its own dlp_ckpt.pt and dlp_config.json under its
+per-task subdir. They are byte-identical today (same multi-task DLP run, copied
+into each task dir; md5 a49c1fa6...), so a single representative ckpt is loaded
+into the model at training time. The full per-task list is exposed below
+(TASK_DLP_CKPTS / TASK_DLP_CFGS) so future per-task eval can pick the correct
+one if the per-task ckpts ever diverge.
 """
 
 from diffuser.utils import watch
@@ -23,20 +27,34 @@ args_to_watch = [
 
 logbase = 'data'
 
+# Lambda root for keypose-aware preprocessed voxel tokens. Rewrite per-machine.
+DATA_ROOT = '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_voxel_tokens_with_keyposes'
+
 # All 10 PerAct keypose tasks. Each pkl has shape (100 episodes, max_path_per_task, ...).
 # Global max_path = 927 (stack_blocks); global max_keyposes = 24 (stack_blocks).
-TASK_PKLS = [
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_close_jar/close_jar.pkl',
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_meat_off_grill/meat_off_grill.pkl',
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_open_drawer/open_drawer.pkl',
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_push_buttons/push_buttons.pkl',
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_put_item_in_drawer/put_item_in_drawer.pkl',
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_reach_and_drag/reach_and_drag.pkl',
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_slide_block_to_color_target/slide_block_to_color_target.pkl',
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_stack_blocks/stack_blocks.pkl',
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_sweep_to_dustpan_of_size/sweep_to_dustpan_of_size.pkl',
-    '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_turn_tap/turn_tap.pkl',
+TASK_NAMES = [
+    'close_jar',
+    'meat_off_grill',
+    'open_drawer',
+    'push_buttons',
+    'put_item_in_drawer',
+    'reach_and_drag',
+    'slide_block_to_color_target',
+    'stack_blocks',
+    'sweep_to_dustpan_of_size',
+    'turn_tap',
 ]
+
+# Per-task data references. The lists are positionally aligned -- index i
+# refers to the same task across pkl / dlp_ckpt / dlp_cfg.
+TASK_PKLS      = [f'{DATA_ROOT}/rlbench_{t}/{t}.pkl'             for t in TASK_NAMES]
+TASK_DLP_CKPTS = [f'{DATA_ROOT}/rlbench_{t}/dlp_ckpt.pt'         for t in TASK_NAMES]
+TASK_DLP_CFGS  = [f'{DATA_ROOT}/rlbench_{t}/dlp_config.json'     for t in TASK_NAMES]
+
+# Representative single-DLP path used at training time. All 10 are byte-identical
+# today, so picking any is equivalent. Per-task eval should index TASK_DLP_CKPTS
+# by task to remain correct if/when per-task ckpts diverge.
+_REP_TASK_IDX = TASK_NAMES.index('meat_off_grill')
 
 # RLBench multitask language-conditioned config (keypose v2).
 # IMPORTANT: key must match mode computed in setup.py: "{num_entity}C_{input_type}"
@@ -44,14 +62,24 @@ mode_to_args = {
   '16C_dlp': {
     'keypose_mode': True,
 
-    # Multi-task: list of pkls to concatenate. The DLP encoder is shared across
-    # all 10 tasks (single ckpt below) since it was trained jointly.
+    # Multi-task: list of pkls to concatenate. The dataset loader detects the
+    # list and concatenates episode-axis after padding to global max_T/max_kp.
     'dataset': 'multitask',
     'override_dataset_path': TASK_PKLS,
     'calib_h5_path': None,
-    'dlp_ckpt': '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_meat_off_grill/dlp_ckpt.pt',
+
+    # Single-DLP path for the model's encoder at training time (representative).
+    'dlp_ckpt': TASK_DLP_CKPTS[_REP_TASK_IDX],
     'dlp_ctor': "voxel_models:DLP",
-    'dlp_cfg': '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes/rlbench_meat_off_grill/dlp_config.json',
+    'dlp_cfg': TASK_DLP_CFGS[_REP_TASK_IDX],
+
+    # Per-task DLP references for downstream per-task eval. Not yet consumed
+    # by the train loop; intended for the multi-task eval extension that swaps
+    # tasks via RLBenchDLPEnv.set_task and (optionally) per-task DLPs.
+    'task_names':     TASK_NAMES,
+    'task_dlp_ckpts': TASK_DLP_CKPTS,
+    'task_dlp_cfgs':  TASK_DLP_CFGS,
+
     'features_dim': 12,       # z(3)+scale(3)+depth(1)+obj_on(1)+feat(4)
     'gripper_dim': 10,        # pos(3)+rot6d(6)+open(1)
     'use_gripper_obs': True,  # cond-tokens path: current gripper feeds into cond[0]
@@ -63,9 +91,13 @@ mode_to_args = {
     'device': 'cuda:0',
     'max_path_length': 927,   # global max across the 10 tasks (stack_blocks)
     'max_demos': 100,         # per-task; total = 10 * 100 = 1000 episodes
+    # In-training eval is gated off (eval_backend='none') because make_env_fn
+    # uses task_name=args.dataset='multitask', which isn't a real RLBench task.
+    # Re-enable once per-task eval-loop is wired (RLBenchDLPEnv.set_task +
+    # iterate over task_names). Run external per-task paper_eval after training
+    # for now.
     'eval_freq': 60,
     'eval_backend': 'none',
-    # Per-task live eval — each task evaluated separately at eval time.
     'rlbench_eval_episodes': 2,
     'rlbench_eval_max_steps': 20,  # keypose attempts per episode
     'rlbench_eval_cams': ['front', 'overhead', 'left_shoulder', 'right_shoulder'],
