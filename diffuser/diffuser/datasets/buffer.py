@@ -118,6 +118,122 @@ class ReplayBuffer:
             self.successful_episode_idxes = np.array([])
         print(f'[ datasets/buffer ] Found {len(self.successful_episode_idxes)} successful episodes')
 
+    def load_paths_from_pickles(self, paths, single_view=False):
+        '''Multi-task variant: load a list of per-task pkls, pad each to global
+        max along time and keypose axes, concatenate along the episode axis.
+
+        Padding rules:
+          - Per-step fields (E, T, ...): pad T-axis with zeros to global max_T.
+            path_lengths and n_keyposes track real lengths; padded steps ignored.
+          - keypose_indices (E, max_kp): pad max_kp-axis with -1 sentinel
+            (existing convention from preprocess) to global max_kp.
+          - language (list[list[str]] of len E): concatenate lists.
+          - per-episode scalars (E,): concatenate.
+        '''
+        _install_numpy_pickle_shim()
+
+        loaded = []
+        for path in paths:
+            with open(path, "rb") as f:
+                loaded.append((path, pickle.load(f)))
+
+        global_max_T = 0
+        global_max_kp = 0
+        for _, d in loaded:
+            if 'observations' in d:
+                global_max_T = max(global_max_T, int(d['observations'].shape[1]))
+            if 'keypose_indices' in d:
+                global_max_kp = max(global_max_kp, int(d['keypose_indices'].shape[1]))
+
+        accumulated = {}
+        keys_seen = []
+        for path, paths_dict in loaded:
+            meta = paths_dict.get('meta', None)
+            if isinstance(meta, dict):
+                K_expected = meta.get('K', None) or meta.get('num_entity', None)
+            else:
+                K_expected = None
+
+            for key, val in paths_dict.items():
+                if key == 'meta':
+                    if 'meta' not in self._dict:
+                        self._dict['meta'] = val
+                    continue
+                if key not in keys_seen:
+                    keys_seen.append(key)
+
+                # Single-view slicing identical to single-pkl loader.
+                if single_view and (key == 'observations' or key == 'goals'):
+                    if isinstance(val, np.ndarray) and val.ndim == 4:
+                        E, T, K, D = val.shape
+                        if K_expected is not None:
+                            if K == 2 * K_expected:
+                                val = val[:, :, :K_expected, :]
+                            elif K == K_expected:
+                                pass
+                            else:
+                                raise ValueError(
+                                    f"[buffer] unexpected particle dim K={K}, expected {K_expected} or {2*K_expected}"
+                                )
+
+                val_padded = self._pad_for_concat(key, val, global_max_T, global_max_kp)
+                accumulated.setdefault(key, []).append(val_padded)
+
+        for key, vals in accumulated.items():
+            if key == 'language':
+                merged = []
+                for v in vals:
+                    merged.extend(list(v))
+                self._dict[key] = merged
+            elif key == 'path_lengths':
+                self._dict[key] = np.concatenate(vals, axis=0).astype(np.int32)
+            elif key == 'variation_number':
+                self._dict[key] = np.concatenate(vals, axis=0).astype(np.int32)
+            elif key in ('keypose_indices', 'n_keyposes'):
+                self._dict[key] = np.concatenate(vals, axis=0).astype(np.int32)
+            else:
+                self._dict[key] = np.concatenate(vals, axis=0).astype(np.float32)
+
+        self._count = self._dict['observations'].shape[0]
+        if 'path_lengths' not in self._dict:
+            self._dict['path_lengths'] = np.array([len(obs) for obs in self._dict['observations']])
+        self.keys = [k for k in keys_seen if k != 'meta']
+
+        if 'gripper_state' in self._dict:
+            gs = self._dict['gripper_state']
+            print(f'[ datasets/buffer ] Found gripper_state: shape={gs.shape}, '
+                  f'range=[{gs.min():.3f}, {gs.max():.3f}]')
+        if 'bg_features' in self._dict:
+            bg = self._dict['bg_features']
+            print(f'[ datasets/buffer ] Found bg_features: shape={bg.shape}, '
+                  f'range=[{bg.min():.3f}, {bg.max():.3f}]')
+        print(f'[ datasets/buffer ] Loaded multi-task: {self._count} episodes from '
+              f'{len(paths)} pkls; global max_T={global_max_T}, max_kp={global_max_kp}')
+
+    @staticmethod
+    def _pad_for_concat(key, val, global_max_T, global_max_kp):
+        '''Pad an array along the relevant axis so per-task tensors line up
+        before episode-axis concat in load_paths_from_pickles.'''
+        if key == 'language':
+            return list(val)
+        if key in ('path_lengths', 'variation_number', 'n_keyposes',
+                   'info_goals_reached', 'info_goal_success_frac'):
+            return val
+        if key == 'keypose_indices':
+            E, K = val.shape
+            if K < global_max_kp:
+                pad = np.full((E, global_max_kp - K), -1, dtype=val.dtype)
+                val = np.concatenate([val, pad], axis=1)
+            return val
+        if isinstance(val, np.ndarray) and val.ndim >= 2:
+            E, T = val.shape[:2]
+            if T < global_max_T:
+                pad_shape = (E, global_max_T - T) + val.shape[2:]
+                pad = np.zeros(pad_shape, dtype=val.dtype)
+                val = np.concatenate([val, pad], axis=1)
+            return val
+        return val
+
     def load_paths_from_pickle(self, path, single_view=False):
         _install_numpy_pickle_shim()
         with open(path, "rb") as f:
