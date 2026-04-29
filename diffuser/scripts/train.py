@@ -272,6 +272,7 @@ model_config = utils.Config(
     prop_rot_dim=getattr(args, 'prop_rot_dim', 6),
     prop_grip_dim=getattr(args, 'prop_grip_dim', 1),
     split_action_tokens=getattr(args, 'split_action_tokens', None),
+    use_cond_tokens=getattr(args, 'keypose_mode', False),
 )
 
 diffusion_config = utils.Config(
@@ -292,6 +293,7 @@ diffusion_config = utils.Config(
     device=args.device,
     obs_only=args.obs_only,
     action_only=args.action_only,
+    keypose_mode=getattr(args, 'keypose_mode', False),
 )
 
 trainer_config = utils.Config(

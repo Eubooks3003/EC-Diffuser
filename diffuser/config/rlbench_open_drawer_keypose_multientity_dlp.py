@@ -16,14 +16,14 @@ mode_to_args = {
     'keypose_mode': True,
 
     'dataset': 'open_drawer',
-    'override_dataset_path': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes/rlbench_open_drawer/rlbench_open_drawer.pkl',
+    'override_dataset_path': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens_with_keyposes/rlbench_open_drawer/rlbench_open_drawer.pkl',
     'calib_h5_path': None,
-    'dlp_ckpt': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes/rlbench_open_drawer/dlp_ckpt.pt',
+    'dlp_ckpt': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens_with_keyposes/rlbench_open_drawer/dlp_ckpt.pt',
     'dlp_ctor': "models:DLP",
-    'dlp_cfg': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes/rlbench_open_drawer/dlp_config.json',
+    'dlp_cfg': '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens_with_keyposes/rlbench_open_drawer/dlp_config.json',
     'features_dim': 10,
     'gripper_dim': 10,
-    'use_gripper_obs': False,
+    'use_gripper_obs': True,  # cond-tokens path: current gripper feeds into cond[0]
     'split_action_tokens': True,  # multi-entity action: decode pos/rot/grip as 3 separate heads
     'gripper_state_mask_ratio': 0.0,
     'bg_dim': 8,              # 2 views x learned_bg_feature_dim(4)
@@ -52,12 +52,12 @@ mode_to_args = {
     'rlbench_max_steps': 400,
     # -------------------------
     "use_absolute_actions": True,
-    'horizon': 2,    # keypose chunk
+    'horizon': 1,    # predict only the next keypose (3DDA-style); cond is current keypose
     'exe_steps': 1,  # apply 1 keypose, replan
     "random_init": True,
     "random_init_eval": True,
     'save_gt_video': True,
-    'demo_dataset_root': '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/rlbench_rgb',
+    'demo_dataset_root': '/home/ellina/Desktop/data/rlbench_rgb',
     'save_imagined': True,
     'save_imagined_recon': True,
   },
@@ -70,12 +70,12 @@ base = {
         'diffusion': 'models.GaussianDiffusion',
 
         'keypose_mode': True,
-        'horizon': 2,
+        'horizon': 1,
         'features_dim': 10,
         'hidden_dim': 256,
         'projection_dim': 256,
         'n_heads': 8,
-        'n_layers': 6,
+        'n_layers': 12,
         'dropout': 0.0,
 
         'n_diffusion_steps': 100,

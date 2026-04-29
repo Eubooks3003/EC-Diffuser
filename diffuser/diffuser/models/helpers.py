@@ -139,9 +139,16 @@ def cosine_beta_schedule(timesteps, s=0.008, dtype=torch.float32):
     betas_clipped = np.clip(betas, a_min=0, a_max=0.999)
     return torch.tensor(betas_clipped, dtype=dtype)
 
-def apply_conditioning(x, conditions, action_dim, action_conditions=None):
-    for t, val in conditions.items():
-        x[:, t, action_dim:] = val.clone()
+def apply_conditioning(x, conditions, action_dim, action_conditions=None, pin_obs=True):
+    """Pin parts of x at specified timesteps.
+
+    `pin_obs=False` skips the obs/gripper/bg pin entirely. Used by keypose-v2
+    mode where conditions[0] is the *current* keypose's modalities passed to
+    the model as separate context tokens, NOT inpainted into trajectory slot 0.
+    """
+    if pin_obs:
+        for t, val in conditions.items():
+            x[:, t, action_dim:] = val.clone()
     if action_conditions is not None:
         for t, val in action_conditions.items():
             x[:, t, :action_dim] = val.clone()

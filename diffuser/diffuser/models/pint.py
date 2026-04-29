@@ -72,7 +72,7 @@ class AdaLNPINTDenoiser(nn.Module):
                  act_pos_dim=3, act_rot_dim=3, act_grip_dim=1,
                  prop_pos_dim=3, prop_rot_dim=6, prop_grip_dim=1,
                  split_action_tokens=None,
-                 lang_dim=0, **kwargs):
+                 lang_dim=0, use_cond_tokens=False, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
@@ -80,6 +80,7 @@ class AdaLNPINTDenoiser(nn.Module):
         self.gripper_dim = gripper_dim
         self.bg_dim = bg_dim
         self.lang_dim = lang_dim  # CLIP hidden size (e.g. 512); 0 disables language conditioning
+        self.use_cond_tokens = use_cond_tokens  # 3DDA-style: current-keypose cond as separate context tokens
         self.predict_delta = predict_delta
         self.projection_dim = projection_dim
         self.max_particles = max_particles
@@ -223,6 +224,24 @@ class AdaLNPINTDenoiser(nn.Module):
             self.bg_decoder = _make_dec(self.bg_dim)
             self.bg_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
 
+        # Conditioning-token encodings: 3DDA-style separate context tokens for the
+        # current keypose. Distinct from trajectory encodings so the model can
+        # tell "current scene context" from "next-keypose prediction." Reuse
+        # projection layers (p_pos/p_rot/p_grip/bg/particle) since modalities
+        # are identical to trajectory tokens.
+        if self.use_cond_tokens:
+            if self.use_proprio:
+                self.cond_p_pos_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+                self.cond_p_rot_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+                self.cond_p_grip_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            if self.bg_dim > 0:
+                self.cond_bg_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            if self.multiview:
+                self.cond_view1_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+                self.cond_view2_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            else:
+                self.cond_particle_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+
     def forward(self, x, cond, time, return_attention=False, lang=None, lang_mask=None):
         """
         Input/output flat layout:
@@ -295,15 +314,67 @@ class AdaLNPINTDenoiser(nn.Module):
         n_action_toks = len(action_tok_list)
         n_proprio_toks = len(proprio_tok_list)
 
-        # Transformer sequence: [action tokens, proprio tokens, (bg?), particles].
-        x_cat = torch.cat([
-            *action_tok_list,
-            *proprio_tok_list,
-            *bg_tok_list,
-            new_state_particles,
-        ], dim=2)
+        # ---------------------------------------------------------------------
+        # Conditioning tokens: 3DDA-style separate context for the *current*
+        # keypose. cond[0] = concat(gripper, bg, particles) at the conditioning
+        # frame; project each modality through the existing trajectory
+        # projections (weight reuse), tag with cond-specific encodings, then
+        # broadcast across T (time-invariant context). Inserted between bg and
+        # particles so particle_start_token_idx shifts cleanly and the existing
+        # particle decoder slice [particle_start_token_idx:] stays correct.
+        n_cond = 0
+        cond_tokens_for_cat = None
+        if self.use_cond_tokens and cond is not None and 0 in cond:
+            cond_vec = cond[0]  # [bs, gripper_dim + bg_dim + n_particles*features_dim]
+            cond_pos_offset = 0
+            cond_token_list = []
+
+            # Proprio cond (3 sub-tokens) -- mirrors trajectory proprio split.
+            if self.use_proprio:
+                cg = cond_vec[:, cond_pos_offset:cond_pos_offset + self.gripper_dim]
+                cond_pos_offset += self.gripper_dim
+                cpp1 = self.prop_pos_dim
+                cpr1 = cpp1 + self.prop_rot_dim
+                cpg1 = cpr1 + self.prop_grip_dim
+                cp_pos = self.p_pos_projection(cg[:, :cpp1]) + self.cond_p_pos_encoding[:, 0]
+                cp_rot = self.p_rot_projection(cg[:, cpp1:cpr1]) + self.cond_p_rot_encoding[:, 0]
+                cp_grip = self.p_grip_projection(cg[:, cpr1:cpg1]) + self.cond_p_grip_encoding[:, 0]
+                cond_token_list.extend([
+                    cp_pos.unsqueeze(1), cp_rot.unsqueeze(1), cp_grip.unsqueeze(1),
+                ])  # each [bs, 1, projection_dim]
+
+            # Bg cond.
+            if self.bg_dim > 0:
+                cbg = cond_vec[:, cond_pos_offset:cond_pos_offset + self.bg_dim]
+                cond_pos_offset += self.bg_dim
+                cbg_tok = self.bg_projection(cbg) + self.cond_bg_encoding[:, 0]
+                cond_token_list.append(cbg_tok.unsqueeze(1))
+
+            # Particles cond.
+            cond_part_flat = cond_vec[:, cond_pos_offset:]
+            cond_particles_in = cond_part_flat.view(bs, -1, self.features_dim)
+            cond_part_emb = self.particle_projection(cond_particles_in)  # [bs, n_part, proj_dim]
+            if self.multiview:
+                n_p = cond_part_emb.size(1) // 2
+                cv1 = cond_part_emb[:, :n_p] + self.cond_view1_encoding[:, 0]
+                cv2 = cond_part_emb[:, n_p:] + self.cond_view2_encoding[:, 0]
+                cond_part_emb = torch.cat([cv1, cv2], dim=1)
+            else:
+                cond_part_emb = cond_part_emb + self.cond_particle_encoding[:, 0]
+            cond_token_list.append(cond_part_emb)
+
+            cond_tokens_2d = torch.cat(cond_token_list, dim=1)  # [bs, n_cond, projection_dim]
+            n_cond = cond_tokens_2d.size(1)
+            cond_tokens_for_cat = cond_tokens_2d.unsqueeze(1).expand(-1, T, -1, -1)  # [bs, T, n_cond, projection_dim]
+
+        # Transformer sequence: [action tokens, proprio tokens, (bg?), (cond?), particles].
+        cat_list = [*action_tok_list, *proprio_tok_list, *bg_tok_list]
+        if cond_tokens_for_cat is not None:
+            cat_list.append(cond_tokens_for_cat)
+        cat_list.append(new_state_particles)
+        x_cat = torch.cat(cat_list, dim=2)
         bg_token_idx = n_action_toks + n_proprio_toks
-        particle_start_token_idx = bg_token_idx + len(bg_tok_list)
+        particle_start_token_idx = bg_token_idx + len(bg_tok_list) + n_cond
 
         # Language conditioning: concatenate projected tokens into the self-attention
         # sequence with shared type encoding. Time embedding added uniformly below.

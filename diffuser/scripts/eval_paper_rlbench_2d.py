@@ -186,6 +186,7 @@ def main(argv):
         prop_rot_dim=getattr(args, "prop_rot_dim", 6),
         prop_grip_dim=getattr(args, "prop_grip_dim", 1),
         split_action_tokens=getattr(args, "split_action_tokens", None),
+        use_cond_tokens=getattr(args, 'keypose_mode', False),
     )
     diffusion_config = utils.Config(
         args.diffusion,
@@ -203,6 +204,7 @@ def main(argv):
         loss_weights=args.loss_weights,
         loss_discount=args.loss_discount,
         device=args.device,
+        keypose_mode=getattr(args, 'keypose_mode', False),
     )
     model = model_config()
     diffusion = diffusion_config(model)

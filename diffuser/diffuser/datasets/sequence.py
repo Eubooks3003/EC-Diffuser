@@ -260,55 +260,73 @@ class SequenceDataset(torch.utils.data.Dataset):
         return indices
 
     def _make_indices_keypose(self, horizon):
-        '''Keypose-anchored windowing. Each sample = `horizon` consecutive keyposes.
+        '''Keypose windowing in cond + next-target framing (3DDA-style).
 
-        Indices store (path_idx, kp_start, kp_end) where kp_start/kp_end are
-        positions in the per-episode keypose array (NOT raw demo frame indices).
-        Demo-frame translation happens in _getitem_keypose via self.keypose_indices.
+        Each sample is interpreted as (current keypose for conditioning, next
+        `horizon` keyposes as prediction targets). Indices store
+        (path_idx, kp_start, kp_end) where:
+          - kp_start    : position of the first *target* keypose
+          - kp_end      : exclusive end of the target range
+          - cond_pos    : kp_start - 1 (the conditioning keypose)
+          - target frames: positions [kp_start, kp_end), padded with the last
+            keypose if kp_end exceeds n_kp.
+        Valid kp_start ∈ [1, n_kp-1] so cond_pos ∈ [0, n_kp-2]. Episodes with
+        n_kp <= 1 are skipped (no transition to learn).
         '''
         indices = []
         for i, n_kp in enumerate(self.n_keyposes):
             n_kp = int(n_kp)
-            if n_kp <= 0:
+            if n_kp <= 1:
                 continue
-            max_start = max(n_kp - horizon, 0)
-            for start in range(max_start + 1):
-                indices.append((i, start, start + horizon))
+            for kp_start in range(1, n_kp):
+                indices.append((i, kp_start, kp_start + horizon))
         return np.array(indices)
 
     def _getitem_keypose(self, idx):
-        '''__getitem__ for keypose mode. Translates keypose-array positions to
-        demo frame indices via self.keypose_indices, then fancy-indexes the
-        normed obs/action/gripper/bg fields. Repeats the last valid keypose
-        when the window extends past the episode's keypose count.
+        '''__getitem__ for keypose mode (cond + next-target framing).
 
-        Critical: in keypose mode we DO NOT pin action[0] (action_conditions={}).
-        Pinning action[0]=current_pose forces traj[1] to denoise consistent with
-        a fixed start, which combined with the model's smoothness inductive bias
-        collapses traj[1] toward action[0] -- causing jitter at eval. This
-        matches 3DDA's design (diffuser_actor.py:215-216, cond_mask all-zero):
-        current gripper is provided as a feature via the obs conditioning
-        (gripper_state component of cond[0]), but the trajectory itself --
-        including position 0's action -- is freely denoised.
+        Sample structure:
+          - cond_pos = kp_start - 1            : current keypose (conditioning)
+          - targets  = positions [kp_start, kp_end) : next H keyposes (predicted)
+
+        Returns a Batch with:
+          - trajectories: H consecutive next-keypose data (action + gripper + bg + obs)
+          - conditions = {0: concat(current gripper, current bg, current particles)},
+            consumed by the model's use_cond_tokens path as separate context
+            tokens. NOT used to inpaint slot 0 of the trajectory (gated off in
+            apply_conditioning when keypose_mode=True).
+          - action_conditions = {}: no slot-0 action pin.
         '''
         path_ind, kp_start, kp_end = self.indices[idx]
         n_kp = int(self.n_keyposes[path_ind])
+        cond_pos = int(kp_start) - 1
         actual_end = min(int(kp_end), n_kp)
         padding_needed = int(kp_end) - actual_end
 
-        frame_idxs = self.keypose_indices[path_ind, int(kp_start):actual_end]
-        # frame_idxs: (actual_end - kp_start,) int64 demo frame indices in [0, T)
+        # Conditioning frame: the current keypose (one position before the first target).
+        cond_frame = int(self.keypose_indices[path_ind, cond_pos])
+        cond_obs = self.fields.normed_observations[path_ind, cond_frame]
+        cond_gripper = (
+            self.fields.normed_gripper_state[path_ind, cond_frame]
+            if (self.use_gripper_obs and self.has_gripper_state) else None
+        )
+        cond_bg = (
+            self.fields.normed_bg_features[path_ind, cond_frame]
+            if (self.use_bg_obs and self.has_bg_features) else None
+        )
 
-        observations = self.fields.normed_observations[path_ind, frame_idxs]
-        actions = self.fields.normed_actions[path_ind, frame_idxs]
+        # Target frames: the next H keyposes.
+        target_frame_idxs = self.keypose_indices[path_ind, int(kp_start):actual_end]
+        observations = self.fields.normed_observations[path_ind, target_frame_idxs]
+        actions = self.fields.normed_actions[path_ind, target_frame_idxs]
 
         if self.use_gripper_obs and self.has_gripper_state:
-            gripper_state = self.fields.normed_gripper_state[path_ind, frame_idxs]
+            gripper_state = self.fields.normed_gripper_state[path_ind, target_frame_idxs]
         else:
             gripper_state = None
 
         if self.use_bg_obs and self.has_bg_features:
-            bg_features = self.fields.normed_bg_features[path_ind, frame_idxs]
+            bg_features = self.fields.normed_bg_features[path_ind, target_frame_idxs]
         else:
             bg_features = None
 
@@ -324,8 +342,18 @@ class SequenceDataset(torch.utils.data.Dataset):
                 bg_features = np.concatenate(
                     [bg_features] + [bg_features[-1:]] * padding_needed, axis=0)
 
-        conditions = self.get_conditions(observations, gripper_state, bg_features)
-        # Empty action_conditions -- no action pin in keypose mode (see docstring).
+        # Build conditioning vector from the current keypose. Concatenation order
+        # mirrors the trajectory's [gripper, bg, particles] suffix layout so the
+        # model can slice cond[0] using the same dim offsets.
+        cond_parts = []
+        if cond_gripper is not None:
+            cond_parts.append(cond_gripper)
+        if cond_bg is not None:
+            cond_parts.append(cond_bg)
+        cond_parts.append(cond_obs)
+        conditions = {0: np.concatenate(cond_parts, axis=-1)}
+
+        # Empty action_conditions: no slot-0 pin (this framing has no current-pose slot).
         action_conditions = {}
 
         if self.obs_only:

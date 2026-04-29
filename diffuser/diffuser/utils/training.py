@@ -960,8 +960,14 @@ class Trainer(object):
                     sample = self.ema_model(cond, lang=lang, lang_mask=lang_mask,
                                             action_cond=action_cond, verbose=False)
                     traj = sample.trajectories[0]                   # (H, a_dim + gripper + bg + K*D)
-                    # Skip a[0] (pinned to current gripper pose); buffer a[1..H-1].
-                    action_buffer = traj[1:, :a_dim].detach().cpu().numpy().astype(np.float32)
+                    # Buffer slot selection:
+                    #  - keypose_mode (v2): trajectory contains only future keyposes,
+                    #    slot 0 IS the next keypose to execute -> use traj[:].
+                    #  - dense mode: action_cond pins slot 0 to current pose, skip it.
+                    if keypose_mode:
+                        action_buffer = traj[:, :a_dim].detach().cpu().numpy().astype(np.float32)
+                    else:
+                        action_buffer = traj[1:, :a_dim].detach().cpu().numpy().astype(np.float32)
                     chunk_idx = 0
                     last_traj = traj
                     last_gs_np = gs_np
