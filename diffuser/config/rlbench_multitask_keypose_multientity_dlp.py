@@ -62,8 +62,8 @@ mode_to_args = {
     'use_gripper_obs': True,  # cond-tokens path: current gripper feeds into cond[0]
     'gripper_state_mask_ratio': 0.0,
     'split_action_tokens': True,  # multientity: action decoded as pos/rot/grip sub-tokens
-    'bg_dim': 0,
-    'use_bg_obs': False,
+    'bg_dim': 8,              # 2 views x learned_bg_feature_dim(4)
+    'use_bg_obs': True,
     'max_particles': 40,      # 2 views x n_kp_enc=20
     'multiview': True,
     'use_views': [0, 1],      # 0=front, 1=overhead
