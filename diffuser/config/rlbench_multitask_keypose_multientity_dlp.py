@@ -50,7 +50,7 @@ mode_to_args = {
     'calib_h5_path': None,
 
     'dlp_ckpt': TASK_DLP_CKPTS[_REP_TASK_IDX],
-    'dlp_ctor': "voxel_models:DLP",
+    'dlp_ctor': "models:DLP",
     'dlp_cfg': TASK_DLP_CFGS[_REP_TASK_IDX],
 
     'task_names':     TASK_NAMES,
