@@ -114,7 +114,40 @@ def load_dlp_lpwm(dlp_cfg_path: str, dlp_ckpt_path: str, device: str):
 # -----------------------------------------------------------------------------#
 
 args = ArgsParser().parse_args("diffusion")
-set_global_device(args.device)
+
+# -----------------------------------------------------------------------------#
+#                          (optional) Accelerate / DDP                          #
+# -----------------------------------------------------------------------------#
+# When launched with `accelerate launch --num_processes=N scripts/train.py ...`
+# (or `torchrun --nproc_per_node=N`), HF Accelerate sets LOCAL_RANK / WORLD_SIZE
+# in the environment. We detect that and instantiate an Accelerator so the
+# Trainer wraps model/optimizer/dataloader in DDP. Plain `python scripts/train.py
+# ...` keeps the single-GPU path untouched (accelerator stays None).
+accelerator = None
+_is_distributed = (
+    "LOCAL_RANK" in os.environ
+    or int(os.environ.get("WORLD_SIZE", "1")) > 1
+)
+if _is_distributed:
+    from accelerate import Accelerator
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulate_every,
+    )
+    # Each rank owns one GPU (cuda:LOCAL_RANK). Override args.device so the
+    # model/diffusion configs (which use args.device for `.to(device)`) build
+    # on the right physical GPU per rank.
+    args.device = str(accelerator.device)
+    set_global_device(accelerator.device)
+    print(
+        f"[train] Accelerate: num_processes={accelerator.num_processes} "
+        f"process_index={accelerator.process_index} "
+        f"is_main={accelerator.is_main_process} device={accelerator.device}",
+        flush=True,
+    )
+else:
+    set_global_device(args.device)
+
+_is_main_process = accelerator is None or accelerator.is_main_process
 
 eval_backend = getattr(args, "eval_backend", "none")   # "none" | "mimicgen" | "isaac"
 eval_freq = int(getattr(args, "eval_freq", 0) or 0)
@@ -205,6 +238,13 @@ model_config = utils.Config(
     gripper_dim=gripper_dim,
     bg_dim=bg_dim,
     lang_dim=getattr(args, 'lang_dim', 0),
+    act_pos_dim=getattr(args, 'act_pos_dim', 3),
+    act_rot_dim=getattr(args, 'act_rot_dim', 6),
+    act_grip_dim=getattr(args, 'act_grip_dim', 1),
+    prop_pos_dim=getattr(args, 'prop_pos_dim', 3),
+    prop_rot_dim=getattr(args, 'prop_rot_dim', 6),
+    prop_grip_dim=getattr(args, 'prop_grip_dim', 1),
+    split_action_tokens=getattr(args, 'split_action_tokens', None),
     use_cond_tokens=getattr(args, 'keypose_mode', False),
 )
 
@@ -247,33 +287,47 @@ trainer_config = utils.Config(
 
 model = model_config()
 diffusion = diffusion_config(model)
-trainer = trainer_config(diffusion, dataset, renderer)
+# Pass the Accelerator at call time (not via Config) so it doesn't end up in
+# the pickled `trainer_config.pkl` -- Accelerator instances aren't picklable.
+trainer = trainer_config(diffusion, dataset, renderer, accelerator=accelerator)
 
 
 # -----------------------------------------------------------------------------#
 #                         test forward & backward pass                          #
 # -----------------------------------------------------------------------------#
 
-print("Testing forward...", end=" ", flush=True)
-batch = utils.batchify(dataset[0])
-loss, _ = diffusion.loss(*batch)
-loss.backward()
-print("✓", flush=True)
+# Skip the sanity forward/backward when running under DDP -- DDP's gradient
+# sync hooks fire only when going through the wrapped module's __call__, and
+# leaving stray grads from this test would interfere with the first real step.
+# Single-GPU mode keeps the existing test.
+if accelerator is None:
+    print("Testing forward...", end=" ", flush=True)
+    batch = utils.batchify(dataset[0])
+    loss, _ = diffusion.loss(*batch)
+    loss.backward()
+    print("✓", flush=True)
 
 
 # -----------------------------------------------------------------------------#
 #                                    wandb                                     #
 # -----------------------------------------------------------------------------#
 
-wandb_run = wandb.init(
-    entity=args.wandb_entity,
-    project=args.wandb_project,
-    group=args.wandb_group_name,
-    config=args,
-    sync_tensorboard=False,
-    settings=wandb.Settings(start_method="fork"),
-)
-wandb_run.name = f"{args.dataset}_H{args.horizon}_exe{getattr(args, 'exe_steps', 1)}"
+# Only the main process talks to wandb. Other ranks would either duplicate the
+# run or trip wandb's lockfile.
+if _is_main_process:
+    wandb_run = wandb.init(
+        entity=args.wandb_entity,
+        project=args.wandb_project,
+        group=args.wandb_group_name,
+        config=args,
+        sync_tensorboard=False,
+        settings=wandb.Settings(start_method="fork"),
+    )
+    wandb_run.name = f"{args.dataset}_H{args.horizon}_exe{getattr(args, 'exe_steps', 1)}"
+else:
+    # Disable wandb on non-main ranks so any stray `wandb.log(...)` is a no-op.
+    os.environ["WANDB_MODE"] = "disabled"
+    wandb_run = None
 
 
 # -----------------------------------------------------------------------------#
@@ -404,8 +458,18 @@ for i in range(start_epoch, n_epochs):
     print(f"Epoch {i} / {n_epochs} | {args.savepath}", flush=True)
     trainer.train(n_train_steps=args.n_steps_per_epoch)
 
-    # eval AFTER each epoch; with eval_freq=1 it runs every epoch
-    if do_eval and ((i + 1) % eval_freq == 0):
+    # Sync ranks before main-only eval. RLBench rollouts use CoppeliaSim
+    # (single-process, GPU-agnostic) so they only run on rank 0; other ranks
+    # would try to launch a second sim and stall. Wait here so non-main ranks
+    # don't race ahead into the next training epoch while rank 0 is still
+    # rolling out.
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+
+    # eval AFTER each epoch; with eval_freq=1 it runs every epoch.
+    # Eval rollouts only run on the main process; non-main ranks fall through
+    # and the wait_for_everyone above resyncs them at the next epoch.
+    if do_eval and _is_main_process and ((i + 1) % eval_freq == 0):
         # Save checkpoint before eval (synced with eval_freq)
         trainer.save(i)
         print(f"[eval] starting {eval_backend} eval at epoch={i} step={trainer.step}", flush=True)

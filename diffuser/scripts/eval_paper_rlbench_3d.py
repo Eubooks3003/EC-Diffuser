@@ -19,11 +19,67 @@ Usage:
 import argparse
 import json
 import os
+import pickle
 import sys
 from datetime import datetime
 
 import numpy as np
 import torch
+
+CACHE_FILENAME = "eval_cache.pkl"
+
+
+class _CachedEvalDataset(torch.utils.data.Dataset):
+    """Thin stand-in for the training dataset used only during paper-eval.
+
+    Eval code reads `.normalizer`, a few dim ints, and a few flags off the
+    dataset object; it never iterates. We build this from the pickle written by
+    prepare_eval_cache.py so each worker skips the ~3-min, ~6-GB normalizer fit.
+
+    DataLoader gets constructed (Trainer.__init__ does so unconditionally) but
+    we never call next() on it during eval, so __getitem__ is intentionally
+    not implemented.
+    """
+
+    def __init__(self, payload):
+        super().__init__()
+        self.normalizer       = payload["normalizer"]
+        self.observation_dim  = int(payload["observation_dim"])
+        self.action_dim       = int(payload["action_dim"])
+        self.gripper_dim      = int(payload["gripper_dim"])
+        self.bg_dim           = int(payload["bg_dim"])
+        self.horizon          = int(payload["horizon"])
+        self.action_z_scale   = float(payload["action_z_scale"])
+        self.use_gripper_obs  = bool(payload["use_gripper_obs"])
+        self.use_bg_obs       = bool(payload["use_bg_obs"])
+        self.keypose_mode     = bool(payload["keypose_mode"])
+        self._cache_meta = {
+            "version":       payload.get("version"),
+            "created":       payload.get("created"),
+            "config":        payload.get("config"),
+            "dataset_name":  payload.get("dataset_name"),
+            "dataset_paths": payload.get("dataset_paths"),
+        }
+
+    def __len__(self):
+        # 1 (not 0) so torch.utils.data.RandomSampler can be constructed without
+        # complaint by Trainer.__init__; we never actually iterate.
+        return 1
+
+    def __getitem__(self, idx):
+        raise NotImplementedError(
+            "_CachedEvalDataset is for paper-eval only; iterating it is a bug. "
+            "If you need real samples, drop --use_cached_dataset (or pass --no_cache)."
+        )
+
+
+def _try_load_eval_cache(savepath):
+    """Return the unpickled payload at <savepath>/eval_cache.pkl, or None."""
+    path = os.path.join(savepath, CACHE_FILENAME)
+    if not os.path.isfile(path):
+        return None, path
+    with open(path, "rb") as f:
+        return pickle.load(f), path
 
 # Make lpwm-dev importable (same strategy as train.py).
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +182,17 @@ def _build_args(raw_argv):
     pre.add_argument("--output_dir", type=str, default=None,
                      help="Where to write eval_results.json (default: "
                           "<savepath>/paper_eval/)")
+    pre.add_argument("--eval_task", type=str, default=None,
+                     help="Real RLBench task name to spin up in the env (e.g. "
+                          "'close_jar'). Defaults to args.dataset. Required when "
+                          "args.dataset is a meta-name like 'multitask' that is "
+                          "not a real RLBench task.")
+    pre.add_argument("--use_cached_dataset", action="store_true",
+                     help="Force use of <savepath>/" + CACHE_FILENAME +
+                          " (skip the heavy dataset_config build).")
+    pre.add_argument("--no_cache", action="store_true",
+                     help="Force the full dataset build even if a cache exists. "
+                          "Default is auto: use the cache when present.")
     ours, rest = pre.parse_known_args(raw_argv)
 
     from diffuser.utils.args import ArgsParser
@@ -139,6 +206,9 @@ def _build_args(raw_argv):
     args._video_episodes = ours.video_episodes
     args._video_fps = ours.video_fps
     args._output_dir = ours.output_dir
+    args._eval_task = ours.eval_task or args.dataset
+    args._use_cached_dataset = bool(ours.use_cached_dataset)
+    args._no_cache = bool(ours.no_cache)
     return args
 
 
@@ -183,33 +253,57 @@ def _trim_videos(video_dir, keep_first_n):
 def main(argv):
     args = _build_args(argv)
     print(f"[paper_eval_rlbench_3d] savepath = {args.savepath}", flush=True)
+    print(f"[paper_eval_rlbench_3d] eval_task = {args._eval_task} "
+          f"(dataset={args.dataset})", flush=True)
     print(f"[paper_eval_rlbench_3d] seeds={args._seeds} "
           f"n_rollouts/seed={args._n_rollouts} "
           f"max_steps={args._max_steps} "
           f"video_episodes={args._video_episodes}", flush=True)
 
     # ---- dataset ----------------------------------------------------------
-    dataset_config = utils.Config(
-        args.loader,
-        savepath=(args.savepath, "dataset_config.pkl"),
-        dataset_path=args.override_dataset_path,
-        dataset_name=args.dataset,
-        horizon=args.horizon,
-        obs_only=args.obs_only,
-        action_only=args.action_only,
-        normalizer=args.normalizer,
-        particle_normalizer=args.particle_normalizer,
-        preprocess_fns=args.preprocess_fns,
-        use_padding=args.use_padding,
-        max_path_length=args.max_path_length,
-        overfit=getattr(args, "overfit", False),
-        single_view=(args.input_type == "dlp" and not args.multiview),
-        action_z_scale=getattr(args, "action_z_scale", 1.0),
-        use_gripper_obs=getattr(args, "use_gripper_obs", False),
-        use_bg_obs=getattr(args, "use_bg_obs", False),
-        keypose_mode=getattr(args, "keypose_mode", False),
-    )
-    dataset = dataset_config()
+    # Try the eval cache first (unless --no_cache). The cache is written by
+    # diffuser/scripts/prepare_eval_cache.py and skips the multi-minute,
+    # multi-GB normalizer fit that dominates per-worker startup.
+    cache_payload, cache_path = (None, os.path.join(args.savepath, CACHE_FILENAME))
+    if not args._no_cache:
+        cache_payload, cache_path = _try_load_eval_cache(args.savepath)
+
+    if args._use_cached_dataset and cache_payload is None:
+        raise RuntimeError(
+            f"--use_cached_dataset was set but no cache found at {cache_path}. "
+            f"Run: python diffuser/scripts/prepare_eval_cache.py "
+            f"--config {args.config} --dataset {args.dataset} ..."
+        )
+
+    if cache_payload is not None:
+        dataset = _CachedEvalDataset(cache_payload)
+        meta = dataset._cache_meta
+        print(f"[paper_eval_rlbench_3d] using cached dataset: {cache_path}  "
+              f"(created={meta.get('created')}, version={meta.get('version')})",
+              flush=True)
+    else:
+        dataset_config = utils.Config(
+            args.loader,
+            savepath=(args.savepath, "dataset_config.pkl"),
+            dataset_path=args.override_dataset_path,
+            dataset_name=args.dataset,
+            horizon=args.horizon,
+            obs_only=args.obs_only,
+            action_only=args.action_only,
+            normalizer=args.normalizer,
+            particle_normalizer=args.particle_normalizer,
+            preprocess_fns=args.preprocess_fns,
+            use_padding=args.use_padding,
+            max_path_length=args.max_path_length,
+            overfit=getattr(args, "overfit", False),
+            single_view=(args.input_type == "dlp" and not args.multiview),
+            action_z_scale=getattr(args, "action_z_scale", 1.0),
+            use_gripper_obs=getattr(args, "use_gripper_obs", False),
+            use_bg_obs=getattr(args, "use_bg_obs", False),
+            keypose_mode=getattr(args, "keypose_mode", False),
+        )
+        dataset = dataset_config()
+
     observation_dim = dataset.observation_dim
     action_dim = dataset.action_dim
     gripper_dim = getattr(dataset, "gripper_dim", 0)
@@ -236,6 +330,13 @@ def main(argv):
         gripper_dim=gripper_dim,
         bg_dim=bg_dim,
         lang_dim=getattr(args, "lang_dim", 0),
+        act_pos_dim=getattr(args, "act_pos_dim", 3),
+        act_rot_dim=getattr(args, "act_rot_dim", 6),
+        act_grip_dim=getattr(args, "act_grip_dim", 1),
+        prop_pos_dim=getattr(args, "prop_pos_dim", 3),
+        prop_rot_dim=getattr(args, "prop_rot_dim", 6),
+        prop_grip_dim=getattr(args, "prop_grip_dim", 1),
+        split_action_tokens=getattr(args, "split_action_tokens", None),
         use_cond_tokens=getattr(args, 'keypose_mode', False),
     )
     diffusion_config = utils.Config(
@@ -337,7 +438,7 @@ def main(argv):
             return _env_cache["env"]
         from diffuser.envs.rlbench_dlp_wrapper import RLBenchDLPEnv
         env = RLBenchDLPEnv(
-            task_name=args.dataset,
+            task_name=args._eval_task,
             dlp_model=dlp_model,
             dlp_cfg=dlp_cfg,
             cams=getattr(args, "rlbench_eval_cams",
@@ -378,6 +479,7 @@ def main(argv):
         payload = {
             "status": status,
             "dataset": args.dataset,
+            "eval_task": args._eval_task,
             "ckpt_path": ckpt_path,
             "ckpt_step": ckpt_step,
             "n_rollouts_per_seed": args._n_rollouts,
@@ -413,8 +515,10 @@ def main(argv):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-        # Route this seed's videos to eval_results/seed_{S}/
-        video_dir = os.path.join(args.savepath, "eval_results", f"seed_{seed}")
+        # Route this seed's videos under --output_dir (when set) so parallel
+        # multitask workers don't collide on a shared <savepath>/eval_results/.
+        video_root = args._output_dir or os.path.join(args.savepath, "eval_results")
+        video_dir = os.path.join(video_root, f"seed_{seed}")
 
         sim_stats = trainer.eval_rlbench_rollouts(
             make_env_fn=make_env_fn,

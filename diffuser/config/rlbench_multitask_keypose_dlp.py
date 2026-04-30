@@ -28,7 +28,7 @@ args_to_watch = [
 logbase = 'data'
 
 # Lambda root for keypose-aware preprocessed voxel tokens. Rewrite per-machine.
-DATA_ROOT = '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_voxel_tokens_with_keyposes'
+DATA_ROOT = '/home/ellina/Desktop/data/preprocessed_voxel_tokens_with_keyposes'
 
 # All 10 PerAct keypose tasks. Each pkl has shape (100 episodes, max_path_per_task, ...).
 # Global max_path = 927 (stack_blocks); global max_keyposes = 24 (stack_blocks).

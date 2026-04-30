@@ -5,7 +5,7 @@ import torch
 import einops
 import pdb
 
-from .arrays import batch_to_device, to_np, to_device, apply_dict
+from .arrays import batch_to_device, set_global_device, to_np, to_device, apply_dict
 from .timer import Timer
 from .cloud import sync_logs
 import wandb
@@ -55,10 +55,13 @@ class Trainer(object):
         results_folder='./results',
         n_reference=8,
         bucket=None,
+        accelerator=None,
     ):
         super().__init__()
         self.model = diffusion_model
         self.ema = EMA(ema_decay)
+        # EMA model lives on the local device only; keep it on rank-0's GPU
+        # since rendering / RLBench eval rollouts only run on the main process.
         self.ema_model = copy.deepcopy(self.model)
         self.update_ema_every = update_ema_every
 
@@ -72,15 +75,36 @@ class Trainer(object):
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
 
+        self.accelerator = accelerator
         self.dataset = dataset
-        self.dataloader = cycle(torch.utils.data.DataLoader(
+        # Build a raw DataLoader. Under Accelerate we need to pass the raw
+        # DataLoader (not a `cycle` generator) to `accelerator.prepare`, then
+        # cycle it after prepare returns the wrapped (DistributedSampler-aware)
+        # version.
+        raw_dl = torch.utils.data.DataLoader(
             self.dataset, batch_size=train_batch_size, num_workers=1, shuffle=True, pin_memory=True
-        ))
+        )
         self.dataloader_vis = cycle(torch.utils.data.DataLoader(
             self.dataset, batch_size=1, num_workers=0, shuffle=True, pin_memory=True
         ))
         self.renderer = renderer
         self.optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=train_lr)
+
+        if self.accelerator is not None:
+            # `prepare` wraps model in DDP, makes the optimizer device-aware,
+            # and swaps the dataloader's sampler for a DistributedSampler so
+            # each rank sees a disjoint shard of the dataset per epoch.
+            self.model, self.optimizer, raw_dl = self.accelerator.prepare(
+                self.model, self.optimizer, raw_dl
+            )
+            # Each rank uses its own GPU (cuda:LOCAL_RANK). Push the global
+            # DEVICE pointer so `to_device`/`batch_to_device` follow.
+            self.device = self.accelerator.device
+            set_global_device(self.device)
+        else:
+            self.device = next(diffusion_model.parameters()).device
+
+        self.dataloader = cycle(raw_dl)
 
         self.logdir = results_folder
         self.bucket = bucket
@@ -89,14 +113,24 @@ class Trainer(object):
         self.reset_parameters()
         self.step = 0
 
+    def _unwrap(self, model):
+        """Return the underlying model, stripping the DDP wrapper if present."""
+        if self.accelerator is not None:
+            return self.accelerator.unwrap_model(model)
+        return model
+
+    @property
+    def is_main_process(self):
+        return True if self.accelerator is None else self.accelerator.is_main_process
+
     def reset_parameters(self):
-        self.ema_model.load_state_dict(self.model.state_dict())
+        self.ema_model.load_state_dict(self._unwrap(self.model).state_dict())
 
     def step_ema(self):
         if self.step < self.step_start_ema:
             self.reset_parameters()
             return
-        self.ema.update_model_average(self.ema_model, self.model)
+        self.ema.update_model_average(self.ema_model, self._unwrap(self.model))
 
     #-----------------------------------------------------------------------------#
     #------------------------------------ api ------------------------------------#
@@ -104,47 +138,55 @@ class Trainer(object):
 
     def train(self, n_train_steps, front_bg=None, side_bg=None, latent_rep_model=None):
         timer = Timer()
+        # Resolve the loss callable through the unwrapped model so that DDP's
+        # forward/backward hooks still fire (they're attached to __call__ /
+        # forward, not to .loss). `accelerator.accumulate(self.model)` below
+        # is what gates gradient sync to the final accumulation micro-step.
+        model_loss = self._unwrap(self.model).loss
+
         for step in range(int(n_train_steps)):
             for i in range(self.gradient_accumulate_every):
                 batch = next(self.dataloader)
                 batch = batch_to_device(batch)
 
-                loss, infos = self.model.loss(*batch)
-                loss = loss / self.gradient_accumulate_every
-                loss.backward()
+                if self.accelerator is not None:
+                    # The accumulate context skips DDP gradient sync on all
+                    # but the final micro-step, then steps the optimizer on
+                    # that final step. Loss scaling by 1/N is also handled.
+                    with self.accelerator.accumulate(self.model):
+                        loss, infos = model_loss(*batch)
+                        self.accelerator.backward(loss)
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+                else:
+                    loss, infos = self.model.loss(*batch)
+                    loss = loss / self.gradient_accumulate_every
+                    loss.backward()
 
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+            if self.accelerator is None:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
-            if self.step % self.update_ema_every == 0:
-                self.step_ema()
+            # Side effects (EMA update, save, log, render) only on the main
+            # process. EMA lives on rank 0's GPU; all ranks already see the
+            # same gradients post-DDP-sync so the model state is identical.
+            if self.is_main_process:
+                if self.step % self.update_ema_every == 0:
+                    self.step_ema()
 
-            if self.step % self.save_freq == 0:
-                label = self.step // self.label_freq * self.label_freq
-                self.save(label)
+                if self.step % self.save_freq == 0:
+                    label = self.step // self.label_freq * self.label_freq
+                    self.save(label)
 
-            if self.step % self.log_freq == 0:
-                infos_str = ' | '.join([f'{key}: {val:8.4f}' for key, val in infos.items()])
-                print(f'{self.step}: {loss:8.4f} | {infos_str} | t: {timer():8.4f}', flush=True)
+                if self.step % self.log_freq == 0:
+                    infos_str = ' | '.join([f'{key}: {val:8.4f}' for key, val in infos.items()])
+                    print(f'{self.step}: {loss:8.4f} | {infos_str} | t: {timer():8.4f}', flush=True)
 
-                log_dict = {'step': self.step, 'loss': loss, **infos}
+                    log_dict = {'step': self.step, 'loss': loss, **infos}
+                    wandb.log(log_dict)
 
-                # lightweight offline eval every log
-                # eval_stats = self.eval_offline_goal_metrics(
-                #     n_batches=5,     # keep small so it’s cheap
-                #     goal_tau=2.0
-                # )
-                # print("eval_stats: ", eval_stats  )
-                # log_dict.update(eval_stats)
-
-                wandb.log(log_dict)
-
-
-            if self.step == 0 and self.sample_freq:
-                self.render_reference(self.n_reference, front_bg=front_bg, side_bg=side_bg)
-
-            # if self.sample_freq and self.step % self.sample_freq == 0:
-            #     self.render_samples(front_bg=front_bg, side_bg=side_bg)
+                if self.step == 0 and self.sample_freq:
+                    self.render_reference(self.n_reference, front_bg=front_bg, side_bg=side_bg)
 
             self.step += 1
 
@@ -175,9 +217,14 @@ class Trainer(object):
             saves model and ema to disk;
             syncs to storage bucket if a bucket is specified
         '''
+        # Only the main process writes ckpts. Other ranks would clobber the file.
+        if not self.is_main_process:
+            return
         data = {
             'step': self.step,
-            'model': self.model.state_dict(),
+            # Strip the DDP wrapper so the saved state_dict has the original
+            # parameter names (single-GPU and multi-GPU ckpts stay compatible).
+            'model': self._unwrap(self.model).state_dict(),
             'ema': self.ema_model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
         }
@@ -215,7 +262,9 @@ class Trainer(object):
         print(f'[ utils/training ] Loaded model from {loadpath}', flush=True)
 
         self.step = data['step']
-        self.model.load_state_dict(data['model'])
+        # Load into the unwrapped module so the DDP-wrapped parent stays
+        # consistent (DDP shares the same parameter tensors).
+        self._unwrap(self.model).load_state_dict(data['model'])
         self.ema_model.load_state_dict(data['ema'])
         if 'optimizer' in data:
             self.optimizer.load_state_dict(data['optimizer'])
@@ -240,7 +289,7 @@ class Trainer(object):
         print(f'[ utils/training ] Resuming from {latest}', flush=True)
 
         self.step = data['step']
-        self.model.load_state_dict(data['model'])
+        self._unwrap(self.model).load_state_dict(data['model'])
         self.ema_model.load_state_dict(data['ema'])
         if 'optimizer' in data:
             self.optimizer.load_state_dict(data['optimizer'])

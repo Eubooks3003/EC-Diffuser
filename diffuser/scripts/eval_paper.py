@@ -575,6 +575,15 @@ def main():
         device=cfg.device,
         gripper_dim=gripper_dim,
         bg_dim=bg_dim,
+        lang_dim=getattr(cfg, "lang_dim", 0),
+        act_pos_dim=getattr(cfg, "act_pos_dim", 3),
+        act_rot_dim=getattr(cfg, "act_rot_dim", 6),
+        act_grip_dim=getattr(cfg, "act_grip_dim", 1),
+        prop_pos_dim=getattr(cfg, "prop_pos_dim", 3),
+        prop_rot_dim=getattr(cfg, "prop_rot_dim", 6),
+        prop_grip_dim=getattr(cfg, "prop_grip_dim", 1),
+        split_action_tokens=getattr(cfg, "split_action_tokens", None),
+        use_cond_tokens=getattr(cfg, 'keypose_mode', False),
     )
 
     diffusion_config = utils.Config(
