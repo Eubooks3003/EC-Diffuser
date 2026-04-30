@@ -62,7 +62,8 @@ class AdaLNPINTDenoiser(nn.Module):
                  learned_sinusoidal_cond=False, random_fourier_features=False,
                  learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, bg_dim=0,
                  act_pos_dim=3, act_rot_dim=3, act_grip_dim=1,
-                 prop_pos_dim=3, prop_rot_dim=6, prop_grip_dim=1, **kwargs):
+                 prop_pos_dim=3, prop_rot_dim=6, prop_grip_dim=1,
+                 n_tasks=1, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
@@ -110,6 +111,15 @@ class AdaLNPINTDenoiser(nn.Module):
             nn.GELU(),
             nn.Linear(time_dim, projection_dim)
         )
+
+        # Task-ID embedding (multitask). When n_tasks <= 1 the lookup is a no-op
+        # zero vector and the per-token output is unchanged.
+        self.n_tasks = int(n_tasks)
+        if self.n_tasks > 1:
+            self.task_embedding = nn.Embedding(self.n_tasks, projection_dim)
+            nn.init.normal_(self.task_embedding.weight, std=0.02)
+        else:
+            self.task_embedding = None
 
         # Particle feature projection network.
         self.particle_projection = nn.Sequential(
@@ -185,7 +195,7 @@ class AdaLNPINTDenoiser(nn.Module):
         else:
             self.particle_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
 
-    def forward(self, x, cond, time, return_attention=False):
+    def forward(self, x, cond, time, task_id=None, return_attention=False):
         """
         Input/output flat layout (both paths):
             [action(action_dim), gripper(gripper_dim), bg(bg_dim), particles(K*features_dim)]
@@ -219,6 +229,13 @@ class AdaLNPINTDenoiser(nn.Module):
             new_state_particles = state_particles + self.particle_encoding.repeat(bs, T, state_particles.size(2), 1)
 
         t_embed = self.time_mlp(time)  # [bs, projection_dim]
+
+        # Add task embedding to the diffusion-time embedding before AdaLN
+        # gating. Both are summed into every token below.
+        if self.task_embedding is not None and task_id is not None:
+            task_id_long = task_id.to(dtype=torch.long, device=t_embed.device).view(-1)
+            task_embed = self.task_embedding(task_id_long)  # [bs, projection_dim]
+            t_embed = t_embed + task_embed
 
         if self.split_robot_tokens:
             # Slice action into (pos, rot, grip) and gripper_state into (pos, rot, grip).

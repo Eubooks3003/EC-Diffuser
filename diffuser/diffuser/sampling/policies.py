@@ -23,7 +23,7 @@ class GoalConditionedPolicy:
         self.sample_kwargs = sample_kwargs
 
     def __call__(self, conditions, batch_size=1, verbose=True, return_attention=False,
-                 gripper_state=None):
+                 gripper_state=None, task_id=None):
         """
         Args:
             conditions: dict with observation conditions (e.g., {0: initial_obs, horizon-1: goal_obs})
@@ -55,11 +55,21 @@ class GoalConditionedPolicy:
         conditions = self._format_conditions(conditions, batch_size, multi_input=multi_input,
                                              gripper_state=gripper_state)
 
+        # Build a (B,) long tensor for task_id when scalar/array given.
+        task_id_tensor = None
+        if task_id is not None:
+            if isinstance(task_id, torch.Tensor):
+                task_id_tensor = task_id.to(self.device).long().view(-1)
+            else:
+                task_id_tensor = torch.as_tensor(task_id, dtype=torch.long, device=self.device).view(-1)
+            if task_id_tensor.numel() == 1 and batch_size > 1:
+                task_id_tensor = task_id_tensor.expand(batch_size)
+
         if return_attention:
-            samples, att_dict = self.diffusion_model(conditions, verbose=verbose, sort_by_value=False, return_attention=return_attention, **self.sample_kwargs)
+            samples, att_dict = self.diffusion_model(conditions, verbose=verbose, sort_by_value=False, return_attention=return_attention, task_id=task_id_tensor, **self.sample_kwargs)
             att_dict = {k: utils.to_np(v) for k, v in att_dict.items()}
         else:
-            samples = self.diffusion_model(conditions, verbose=verbose, sort_by_value=False, return_attention=return_attention, **self.sample_kwargs)
+            samples = self.diffusion_model(conditions, verbose=verbose, sort_by_value=False, return_attention=return_attention, task_id=task_id_tensor, **self.sample_kwargs)
         trajectories = utils.to_np(samples.trajectories)
 
         # Extract components from trajectory: [actions, gripper_state (optional), observations]

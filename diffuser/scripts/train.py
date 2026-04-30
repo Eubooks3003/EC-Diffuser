@@ -194,6 +194,8 @@ dataset_config = utils.Config(
     action_z_scale=getattr(args, 'action_z_scale', 1.0),
     use_gripper_obs=getattr(args, 'use_gripper_obs', False),
     use_bg_obs=getattr(args, 'use_bg_obs', False),
+    task_entries=getattr(args, 'task_entries', None),
+    max_demos_per_task=getattr(args, 'max_demos_per_task', None),
 )
 
 render_config = utils.Config(
@@ -254,6 +256,7 @@ model_config = utils.Config(
     device=args.device,
     gripper_dim=gripper_dim,
     bg_dim=bg_dim,
+    n_tasks=getattr(args, 'n_tasks', 1),
 )
 
 diffusion_config = utils.Config(
@@ -334,6 +337,28 @@ calib_h5_path = None
 goal_provider = None  # NEW: for dataset-based goal conditioning
 
 if do_eval and eval_backend == "mimicgen":
+    # Multitask: pick the per-task DLP/calib paths from the matching task entry.
+    multitask_task_id = None
+    if getattr(args, "multitask", False):
+        eval_task_name = getattr(args, "eval_task", "") or ""
+        if not eval_task_name:
+            raise RuntimeError(
+                "eval_backend='mimicgen' with multitask config requires --eval_task <name>"
+            )
+        task_entries = getattr(args, "task_entries", []) or []
+        match = next((e for e in task_entries if e["name"] == eval_task_name), None)
+        if match is None:
+            available = [e["name"] for e in task_entries]
+            raise RuntimeError(f"--eval_task='{eval_task_name}' not in task_entries (available: {available})")
+        # Override args so downstream code reads task-specific paths.
+        args.calib_h5_path = match["calib_h5"]
+        args.dlp_ckpt = match["dlp_ckpt"]
+        args.dlp_cfg = match["dlp_cfg"]
+        # Use this task's pkl as the goal provider source so init_states + goal tokens match.
+        args.dataset_path = match["pkl"]
+        multitask_task_id = int(match["task_id"])
+        print(f"[mimicgen eval] multitask: --eval_task={eval_task_name} -> task_id={multitask_task_id}")
+
     calib_h5_path = getattr(args, "calib_h5_path", None)
     dlp_ckpt = getattr(args, "dlp_ckpt", None)
     dlp_cfg_path = getattr(args, "dlp_cfg", None)
@@ -419,6 +444,7 @@ for i in range(start_epoch, n_epochs):
                 task=mimicgen_task,  # Task name for task-specific voxel bounds
                 renderer_3d=renderer,
                 exe_steps=getattr(args, "exe_steps", 1),  # ACTION CHUNKING: how many actions to execute per plan
+                task_id=multitask_task_id,  # Multitask: pin the task id used for policy conditioning
             )
 
             # avoid double-prefix if eval returns sim/... already

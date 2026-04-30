@@ -384,6 +384,7 @@ class Trainer(object):
         goal_provider=None,         # NEW: DatasetGoalProvider for init_state + goal pairing
         random_init=False,          # If True, use random env reset instead of dataset init states
         task=None,                  # Task name for task-specific voxel bounds (e.g., "threading", "hammer_cleanup")
+        task_id=None,               # Multitask: integer task id passed to the policy each rollout step
 
         save_videos=True,
         video_dir=None,
@@ -618,7 +619,12 @@ class Trainer(object):
                         print(f"  cond_0 shape: {cond_0.shape}")
 
                     # Sample new trajectory from diffusion model
-                    sample = self.ema_model(cond, verbose=False)
+                    if task_id is not None:
+                        bs = cond[0].shape[0] if hasattr(cond[0], 'shape') else 1
+                        tid_tensor = torch.as_tensor([int(task_id)] * bs, dtype=torch.long, device=device)
+                        sample = self.ema_model(cond, verbose=False, task_id=tid_tensor)
+                    else:
+                        sample = self.ema_model(cond, verbose=False)
                     traj = sample.trajectories[0]  # (H, action_dim + obs_dim)
                     action_buffer = traj[:, :a_dim].detach().cpu().numpy().astype(np.float32)  # (H, a_dim)
                     action_idx = 0
