@@ -320,6 +320,7 @@ def run_eval_rollouts(
     video_dir=None,
     video_episodes=5,
     video_fps=20,
+    task_id=None,
 ):
     """
     Run evaluation rollouts (simplified version of eval_mimicgen_rollouts).
@@ -352,7 +353,13 @@ def run_eval_rollouts(
             print("[WARNING] imageio not installed, disabling video saving")
             save_videos = False
 
-    print(f"[eval] seed={seed}, {n_episodes} eps, max_steps={max_steps}")
+    # Multitask conditioning: build a (1,) long tensor once per rollout loop.
+    task_id_tensor = None
+    if task_id is not None:
+        task_id_tensor = torch.tensor([int(task_id)], dtype=torch.long, device=device)
+
+    print(f"[eval] seed={seed}, {n_episodes} eps, max_steps={max_steps}"
+          + (f", task_id={int(task_id)}" if task_id is not None else ""))
 
     # Create env and wrapper once, reuse across episodes
     env = make_env_fn()
@@ -471,7 +478,10 @@ def run_eval_rollouts(
                 }
 
                 # Sample trajectory from diffusion model
-                sample = trainer.ema_model(cond, verbose=False)
+                if task_id_tensor is not None:
+                    sample = trainer.ema_model(cond, verbose=False, task_id=task_id_tensor)
+                else:
+                    sample = trainer.ema_model(cond, verbose=False)
                 traj = sample.trajectories[0]  # (H, action_dim + obs_dim)
                 action_buffer = traj[:, :a_dim].detach().cpu().numpy()
                 action_idx = 0
@@ -574,6 +584,10 @@ def main():
                         help="Number of episodes to save videos for per seed (default: 5)")
     parser.add_argument("--video_fps", type=int, default=20,
                         help="Video FPS (default: 20)")
+    parser.add_argument("--eval_task", type=str, default=None,
+                        help="For multitask configs: select which task entry to "
+                             "evaluate (overrides dlp_ckpt/dlp_cfg/calib_h5_path/"
+                             "dataset_path). Required when config has multitask=True.")
     args = parser.parse_args()
 
     # Parse seeds
@@ -619,6 +633,61 @@ def main():
     if args.max_steps is not None:
         cfg.mimicgen_max_steps = args.max_steps
 
+    # Multitask: pick the matching task entry and override per-task paths.
+    multitask_task_id = None
+    if getattr(cfg, "multitask", False):
+        if not args.eval_task:
+            raise RuntimeError(
+                "Config has multitask=True; --eval_task <name> is required."
+            )
+        task_entries = getattr(cfg, "task_entries", []) or []
+        match = next((e for e in task_entries if e["name"] == args.eval_task), None)
+        if match is None:
+            available = [e["name"] for e in task_entries]
+            raise RuntimeError(
+                f"--eval_task='{args.eval_task}' not in task_entries (available: {available})"
+            )
+        cfg.calib_h5_path = match["calib_h5"]
+        cfg.dlp_ckpt = match["dlp_ckpt"]
+        cfg.dlp_cfg = match["dlp_cfg"]
+        cfg.override_dataset_path = match["pkl"]
+        multitask_task_id = int(match["task_id"])
+        print(f"[multitask] eval_task={args.eval_task} -> task_id={multitask_task_id}")
+        print(f"[multitask]   pkl     = {match['pkl']}")
+        print(f"[multitask]   calib   = {match['calib_h5']}")
+        print(f"[multitask]   dlp_ckpt= {match['dlp_ckpt']}")
+
+        # Per-task rollout horizon (from match['max_steps'], originally sourced
+        # from each task's standalone mimicgen_<task>_dlp.py config). The
+        # multitask config's global mimicgen_max_steps=600 truncates 6 of 12
+        # tasks (coffee_preparation needs 1200, kitchen/mug_cleanup/pick_place/
+        # three_piece_assembly need 1000, nut_assembly 700). Skip when --max_steps
+        # was given on the CLI so that flag still wins.
+        if args.max_steps is None and "max_steps" in match:
+            old = getattr(cfg, "mimicgen_max_steps", None)
+            cfg.mimicgen_max_steps = int(match["max_steps"])
+            print(f"[multitask]   max_steps: {old} -> {cfg.mimicgen_max_steps} "
+                  f"(per-task override)")
+
+        # Per-task camera override: pick_place_d0 has no 'sideview' camera in
+        # its robosuite env, so it was preprocessed with ('agentview',
+        # 'frontview'). Read meta['cameras'] from the task pkl and apply it
+        # so eval rollouts use the same cameras the DLP was trained on.
+        try:
+            import pickle as _pickle
+            with open(match["pkl"], "rb") as _fh:
+                _meta = _pickle.load(_fh).get("meta", {})
+            _task_cams = _meta.get("cameras", None)
+            if _task_cams:
+                _task_cams = list(_task_cams)
+                _cfg_cams = list(getattr(cfg, "mimicgen_cams", []))
+                if _task_cams != _cfg_cams:
+                    print(f"[multitask] cam override: {_cfg_cams} -> {_task_cams} "
+                          f"(from {os.path.basename(match['pkl'])} meta)")
+                    cfg.mimicgen_cams = _task_cams
+        except Exception as _e:
+            print(f"[multitask] WARNING: could not read meta cameras from {match['pkl']}: {_e}")
+
     # Get paths from config
     dataset_path = getattr(cfg, 'override_dataset_path', None)
     calib_h5_path = getattr(cfg, 'calib_h5_path', None)
@@ -651,30 +720,67 @@ def main():
         print(f"[2D DLP] Overriding camera resolution to 84x84 (matching preprocessing)")
 
     # Load dataset
-    print("Loading dataset...")
     cfg.dataset_path = dataset_path
     cfg.savepath = os.path.dirname(args.ckpt_path).replace("/ckpt", "")
 
-    dataset_config = utils.Config(
-        cfg.loader,
-        savepath=None,
-        dataset_path=cfg.dataset_path,
-        dataset_name=cfg.dataset,
-        horizon=cfg.horizon,
-        obs_only=getattr(cfg, 'obs_only', False),
-        action_only=getattr(cfg, 'action_only', False),
-        normalizer=cfg.normalizer,
-        particle_normalizer=cfg.particle_normalizer,
-        preprocess_fns=cfg.preprocess_fns,
-        use_padding=cfg.use_padding,
-        max_path_length=cfg.max_path_length,
-        overfit=False,
-        single_view=(getattr(cfg, 'input_type', 'dlp') == "dlp" and not cfg.multiview),
-        action_z_scale=getattr(cfg, 'action_z_scale', 1.0),
-        use_gripper_obs=getattr(cfg, 'use_gripper_obs', False),
-        use_bg_obs=getattr(cfg, 'use_bg_obs', False),
-    )
-    dataset = dataset_config()
+    # If <savepath>/eval_cache.pkl exists, use the cached normalizer + dims
+    # (built once by prepare_eval_cache_mimicgen.py). Avoids re-fitting the
+    # ~10 GB multitask normalizer in every parallel worker.
+    _cache_path = os.path.join(cfg.savepath, "eval_cache.pkl")
+    if os.path.isfile(_cache_path):
+        import pickle as _pkl
+        print(f"Loading dataset from cache: {_cache_path}")
+        with open(_cache_path, "rb") as _fh:
+            _cache = _pkl.load(_fh)
+
+        class _CachedEvalDataset(torch.utils.data.Dataset):
+            """Lightweight stand-in for MultitaskGoalDataset during paper eval.
+
+            Carries only the fields run_eval_rollouts / Trainer constructor
+            actually read at eval time: normalizer, *_dim, horizon. No buffer,
+            no episodes - iterating its DataLoader will raise.
+            """
+            def __init__(self, payload):
+                self.normalizer       = payload["normalizer"]
+                self.observation_dim  = int(payload["observation_dim"])
+                self.action_dim       = int(payload["action_dim"])
+                self.gripper_dim      = int(payload["gripper_dim"])
+                self.bg_dim           = int(payload["bg_dim"])
+                self.particle_dim     = int(payload.get("particle_dim", 10))
+                self.horizon          = int(payload.get("horizon", cfg.horizon))
+                self.action_z_scale   = float(payload.get("action_z_scale", 1.0))
+                self.max_path_length  = int(payload.get("max_path_length", cfg.max_path_length))
+            def __len__(self): return 1
+            def __getitem__(self, idx):
+                raise NotImplementedError("eval-only stub dataset; do not iterate")
+
+        dataset = _CachedEvalDataset(_cache)
+        print(f"[cached] observation_dim={dataset.observation_dim} action_dim={dataset.action_dim} "
+              f"gripper_dim={dataset.gripper_dim} bg_dim={dataset.bg_dim}")
+    else:
+        print("Loading dataset (no eval_cache.pkl present; full build)...")
+        dataset_config = utils.Config(
+            cfg.loader,
+            savepath=None,
+            dataset_path=cfg.dataset_path,
+            dataset_name=cfg.dataset,
+            horizon=cfg.horizon,
+            obs_only=getattr(cfg, 'obs_only', False),
+            action_only=getattr(cfg, 'action_only', False),
+            normalizer=cfg.normalizer,
+            particle_normalizer=cfg.particle_normalizer,
+            preprocess_fns=cfg.preprocess_fns,
+            use_padding=cfg.use_padding,
+            max_path_length=cfg.max_path_length,
+            overfit=False,
+            single_view=(getattr(cfg, 'input_type', 'dlp') == "dlp" and not cfg.multiview),
+            action_z_scale=getattr(cfg, 'action_z_scale', 1.0),
+            use_gripper_obs=getattr(cfg, 'use_gripper_obs', False),
+            use_bg_obs=getattr(cfg, 'use_bg_obs', False),
+            task_entries=getattr(cfg, 'task_entries', None),
+            max_demos_per_task=getattr(cfg, 'max_demos_per_task', None),
+        )
+        dataset = dataset_config()
 
     # Build models
     print("Building diffusion model...")
@@ -711,6 +817,7 @@ def main():
         device=cfg.device,
         gripper_dim=gripper_dim,
         bg_dim=bg_dim,
+        n_tasks=getattr(cfg, 'n_tasks', 1),
     )
 
     diffusion_config = utils.Config(
@@ -831,6 +938,7 @@ def main():
             video_dir=video_dir,
             video_episodes=args.video_episodes,
             video_fps=args.video_fps,
+            task_id=multitask_task_id,
         )
         all_results.append(result)
 
@@ -865,6 +973,8 @@ def main():
         "n_rollouts_per_seed": args.n_rollouts,
         "seeds": seeds,
         "task": task,
+        "eval_task": args.eval_task,
+        "task_id": multitask_task_id,
         "max_steps": max_steps,
         "exe_steps": exe_steps,
         "random_init": True,

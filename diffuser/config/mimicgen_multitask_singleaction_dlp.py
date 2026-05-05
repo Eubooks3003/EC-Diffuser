@@ -1,14 +1,16 @@
 """
-Multitask multiview multi-entity mimicgen config.
+Multitask multiview mimicgen — single-action-token + split proprio.
 
-12 d0 tasks share the same token shape (K=40, Dtok=10, A=7, G=10, BG=8) but
-have different per-task DLPs and per-task max episode lengths. This config
-trains one diffusion policy on all 12 tasks with task-ID conditioning; eval
-is per-task at rollout time (each task brings its own DLP/calib).
+Mirrors mimicgen_multitask_dlp.py but flips `split_action_tokens=False` so
+pint.py emits one transformer token for the full action_dim=7 vector
+(action_projection + action_encoding) while proprio stays split into
+[p_pos, p_rot, p_grip] (gripper_dim=10, has_proprio=True). Token sequence:
 
-Key in mode_to_args follows the existing `{num_entity}C_{input_type}` convention
-(`num_entity` is reused as a "task count" indicator here; `C` has no
-cube-specific meaning — it's just the lookup string).
+    [action, p_pos, p_rot, p_grip, particle_1..K]
+
+`split_action_tokens` is appended to args_to_watch so the experiment name
+self-documents the flag, and `prefix` is bumped so savepaths never collide
+with the multi-entity multitask runs.
 """
 
 import os
@@ -20,11 +22,11 @@ args_to_watch = [
     ('horizon', 'H'),
     ('n_diffusion_steps', 'T'),
     ('seed', 'seed'),
+    ('split_action_tokens', 'split'),
 ]
 
 logbase = 'data'
 
-# 12 d0 tasks, alphabetical → stable integer task IDs (0..11)
 TASK_NAMES = [
     'coffee',
     'coffee_preparation',
@@ -41,12 +43,6 @@ TASK_NAMES = [
 ]
 TASK_NAME_TO_ID = {name: i for i, name in enumerate(TASK_NAMES)}
 
-# Per-task rollout horizon. Sourced from each task's standalone config
-# (diffuser/config/mimicgen_<task>_dlp.py 'mimicgen_max_steps' field). The
-# multitask training config keeps one global default for backwards-compat
-# (mode_to_args['12C_dlp']['mimicgen_max_steps']), but eval_paper.py reads
-# this map via task_entries when --eval_task is set so each task gets its
-# own horizon.
 TASK_MAX_STEPS = {
     'coffee':                600,
     'coffee_preparation':   1200,
@@ -64,7 +60,6 @@ TASK_MAX_STEPS = {
 
 
 def _resolve_data_root():
-    """Pick lambda (remote training) or local desktop (rollout) based on which exists."""
     candidates = [
         '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_multiview_tokens',
         '/home/ellina/Desktop/data/preprocessed_multiview_tokens',
@@ -91,7 +86,6 @@ CALIB_ROOT = _resolve_calib_root()
 
 
 def _build_task_entries():
-    """One entry per task: pkl, calib h5, per-task DLP ckpt + cfg + max_steps."""
     entries = []
     for name in TASK_NAMES:
         task_dir = f'{name}_d0'
@@ -115,16 +109,13 @@ TASK_ENTRIES = _build_task_entries()
 mode_to_args = {
     '12C_dlp': {
         'dataset': 'multitask',
-        'multitask': True,                  # signals multitask path in dataset
+        'multitask': True,
         'task_entries': TASK_ENTRIES,
         'task_names': TASK_NAMES,
         'n_tasks': len(TASK_NAMES),
         'max_demos_per_task': 200,
 
-        # Sentinel so setup.py's dataset-path resolver does not raise; the
-        # multitask dataset ignores this and uses `task_entries` instead.
         'override_dataset_path': TASK_ENTRIES[0]['pkl'],
-        # Renderer/eval default DLP if no --eval_task is given (used only for reference renders).
         'dlp_ckpt': TASK_ENTRIES[0]['dlp_ckpt'],
         'dlp_cfg':  TASK_ENTRIES[0]['dlp_cfg'],
         'dlp_ctor': 'models:DLP',
@@ -132,26 +123,22 @@ mode_to_args = {
 
         # Shapes confirmed from per-task pkl meta (all 12 agree):
         # E=200, K=40 (20/view × 2 views), Dtok=10, A=7, G=10, BG=8 (4/view × 2 views)
-        # Path lengths vary: pick_place_d0 max=798 (longest), stack_d0 min=81.
         'features_dim': 10,
         'gripper_dim': 10,
         'use_gripper_obs': True,
         'gripper_state_mask_ratio': 0.0,
         'bg_dim': 8,
         'use_bg_obs': True,
-        'max_particles': 48,                # covers K=40
+        'max_particles': 48,
         'multiview': True,
         'device': 'cuda:0',
 
-        # max_path_length must cover the longest task (pick_place_d0=798).
-        # Set generously so per-episode `path_lengths` does the trimming.
         'max_path_length': 800,
 
-        'eval_freq': 0,                     # eval per-task; not in inner loop yet
+        'eval_freq': 0,
         'eval_backend': 'none',
         'n_steps_per_epoch': 500,
 
-        # mimicgen rollout knobs (used only when --eval_task is set)
         'mimicgen_cams': ['agentview', 'sideview'],
         'mimicgen_camera_width': 256,
         'mimicgen_camera_height': 256,
@@ -159,11 +146,15 @@ mode_to_args = {
         'mimicgen_pixel_stride': 1,
         'use_absolute_actions': False,
 
-        # diffusion knobs
         'horizon': 16,
         'exe_steps': 8,
         'random_init': True,
         'random_init_eval': True,
+
+        # Single-action-token mode: pint.py uses one action_projection over
+        # the full action_dim (7) instead of three (a_pos/a_rot/a_grip) heads.
+        # Proprio stays split because gripper_dim > 0.
+        'split_action_tokens': False,
     },
 }
 
@@ -188,11 +179,9 @@ base = {
         'positional_bias': False,
         'multiview': True,
 
-        # multitask flags (defaults; overridden by mode_to_args)
         'multitask': False,
         'n_tasks': 1,
 
-        # dataset
         'loader': 'datasets.MultitaskGoalDataset',
         'normalizer': 'GaussianNormalizer',
         'particle_normalizer': 'ParticleGaussianNormalizer',
@@ -205,12 +194,10 @@ base = {
         'action_z_scale': 1.0,
         'gripper_state_mask_ratio': 0.0,
 
-        # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_multitask/',
+        'prefix': 'diffusion/mimicgen_multitask_singleaction/',
         'exp_name': watch(args_to_watch),
 
-        # training
         'n_steps_per_epoch': 200,
         'loss_type': 'l1',
         'n_train_steps': 2e6,
@@ -248,7 +235,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_multitask/',
+        'prefix': 'plans/mimicgen_multitask_singleaction/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

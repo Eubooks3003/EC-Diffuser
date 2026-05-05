@@ -530,6 +530,27 @@ def setup_mimicgen_env(args, use_absolute_actions=True):
             use_image_obs=True,
             use_depth_obs=True
         )
+
+        # robosuite 1.4.1 + mujoco 2.3.2: vopt.geomgroup[i] = v assignments in
+        # base.py:_reset_internal don't persist (binding quirk), so the renderer
+        # leaves group 0 visible — and group-0 collision geoms render as
+        # rgba=[0,0.5,0,1] (green-noise) on top of the visual mesh. Monkey-patch
+        # the underlying robosuite env to install a fresh MjvOption after each
+        # reset, with default flags (which renders only the visual meshes).
+        _under = env.env if hasattr(env, "env") else env
+        if getattr(_under, "has_offscreen_renderer", False):
+            import mujoco
+            _orig_reset_internal = _under._reset_internal
+            def _reset_internal_with_clean_vopt():
+                _orig_reset_internal()
+                ctx = _under.sim._render_context_offscreen
+                if ctx is not None:
+                    new_opt = mujoco.MjvOption()
+                    mujoco.mjv_defaultOption(new_opt)
+                    new_opt.geomgroup[0] = 0
+                    ctx.vopt = new_opt
+            _under._reset_internal = _reset_internal_with_clean_vopt
+
         o = env.reset()
         print([k for k in sorted(o.keys()) if "image" in k or "depth" in k])
         for cn in cam_names:

@@ -257,6 +257,7 @@ model_config = utils.Config(
     gripper_dim=gripper_dim,
     bg_dim=bg_dim,
     n_tasks=getattr(args, 'n_tasks', 1),
+    split_action_tokens=getattr(args, 'split_action_tokens', None),
 )
 
 diffusion_config = utils.Config(
