@@ -17,7 +17,7 @@ args_to_watch = [
 
 logbase = 'data'
 
-DATA_ROOT = '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes'
+DATA_ROOT = '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens_with_keyposes'
 
 TASK_NAMES = [
     'close_jar',
@@ -65,6 +65,7 @@ mode_to_args = {
     'multiview': False,
     'use_views': [0],         # 0=front
     'num_source_views': 4,
+    'rlbench_cams': ['front'],   # paper-eval env cams; must match use_views
     'device': 'cuda:0',
     'max_path_length': 1000,
     'max_demos': 100,

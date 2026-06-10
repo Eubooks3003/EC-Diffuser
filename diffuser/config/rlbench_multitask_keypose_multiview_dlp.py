@@ -27,7 +27,7 @@ args_to_watch = [
 logbase = 'data'
 
 # Lambda root for the 2D multiview tokens + keyposes preprocessing output.
-DATA_ROOT = '/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench/preprocessed_multiview_tokens_with_keyposes'
+DATA_ROOT = '/home/ellina/Desktop/data/rlbench_preprocessed_multiview_tokens_with_keyposes'
 
 TASK_NAMES = [
     'close_jar',
@@ -79,6 +79,7 @@ mode_to_args = {
     'multiview': True,
     'use_views': [0, 1],      # 0=front, 1=overhead
     'num_source_views': 4,    # total views in the multiview pkl
+    'rlbench_cams': ['front', 'overhead'],   # paper-eval env cams; must match use_views
     'device': 'cuda:0',
     'max_path_length': 1000,  # global max across tasks (stack_blocks may reach 1000)
     'max_demos': 100,         # per-task; total = 10 * 100 = 1000 episodes
