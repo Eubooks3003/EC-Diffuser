@@ -144,10 +144,11 @@ mode_to_args = {
         # Set generously so per-episode `path_lengths` does the trimming.
         'max_path_length': 800,
 
-        # In-training eval: every 100 epochs run 1 rollout for EACH of the 12 tasks,
-        # with DLP keypoints overlaid on the rollout video (logged to wandb).
-        'eval_freq': 100,
-        'eval_backend': 'mimicgen',
+        # In-training rollout eval DISABLED: the remote is not configured for sim
+        # rollouts (no render/env there). Evaluate offline from checkpoints via
+        # scripts/eval_paper_mimicgen_multitask.py. Matches the singleaction run.
+        'eval_freq': 0,
+        'eval_backend': 'none',
         'mimicgen_eval_episodes': 1,
         'n_steps_per_epoch': 500,
 

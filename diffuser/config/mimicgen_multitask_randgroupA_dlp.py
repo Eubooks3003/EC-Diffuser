@@ -144,10 +144,11 @@ mode_to_args = {
         # Set generously so per-episode `path_lengths` does the trimming.
         'max_path_length': 800,
 
-        # In-training eval: every 100 epochs run 1 rollout for EACH of the 12 tasks,
-        # with DLP keypoints overlaid on the rollout video (logged to wandb).
-        'eval_freq': 100,
-        'eval_backend': 'mimicgen',
+        # In-training rollout eval DISABLED: the remote is not configured for sim
+        # rollouts (no render/env there). Evaluate offline from checkpoints via
+        # scripts/eval_paper_mimicgen_multitask.py. Matches the singleaction run.
+        'eval_freq': 0,
+        'eval_backend': 'none',
         'mimicgen_eval_episodes': 1,
         'n_steps_per_epoch': 500,
 
@@ -188,9 +189,9 @@ base = {
         'positional_bias': False,
         'multiview': True,
 
-        # Per-dimension action/proprio tokenization: one token per scalar dim.
-        # 'per_dim' expands to [1]*action_dim and [1]*gripper_dim at build time,
-        # so the same value stays uniform with the RLBench policy.
+        # Token grouping (see pint.py grouped_tokens): each group is one
+        # transformer token with its own projection/type-encoding/decoder.
+        # [n]=one token spanning n dims; [1,1,...]/'per_dim'=one token per scalar.
         'action_token_groups': [2, 1, 3, 1],
         'proprio_token_groups': [4, 1, 2, 3],
 
