@@ -22,8 +22,10 @@ declare -A CONFIGS=(
   [randgroupA]="config.mimicgen_multitask_randgroupA_dlp"            # action [2,1,3,1] / proprio [4,1,2,3]
   [randgroupB]="config.mimicgen_multitask_randgroupB_dlp"            # action [3,1,1,2] / proprio [2,3,1,4]
   [noproprio]="config.mimicgen_multitask_noproprio_dlp"             # per-dim action, NO proprio
-  [singleaction_tokenprop]="config.mimicgen_multitask_singleaction_tokenprop_dlp"  # 1 action token, per-dim proprio
-  [tokenaction_singleprop]="config.mimicgen_multitask_tokenaction_singleprop_dlp"  # per-dim action, 1 proprio token
+  [tokenaction_singleprop]="config.mimicgen_multitask_tokenaction_singleprop_dlp"  # [3,3,1] action, 1 proprio token
+  # NOTE: singleaction_tokenprop (1 action token + [3,6,1] proprio) is intentionally
+  # omitted -- it is token-for-token identical to the already-trained `singleaction`
+  # run (config.mimicgen_multitask_singleaction_dlp). Cite that run instead of re-training.
 )
 
 if [[ $# -eq 0 ]]; then
