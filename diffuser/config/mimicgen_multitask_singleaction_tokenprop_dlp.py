@@ -1,13 +1,15 @@
 """
-Multitask multiview mimicgen — single-entity action + token-based proprio.
+Multitask multiview mimicgen — single-entity action + pos/rot/grip proprio.
 
 action_token_groups=[7] emits ONE token for the whole action_dim=7 vector,
-while proprio is per-dim (10 tokens). Token sequence:
+while proprio is split semantically into pos/rot/grip = [3,6,1] (3 tokens).
+Token sequence:
 
-    [action, p_0..p_9, particle_1..K]
+    [action, p_pos, p_rot, p_grip, particle_1..K]
 
-Differs from mimicgen_multitask_singleaction_dlp.py (which splits proprio
-into pos/rot/grip = [3,6,1]); here proprio is fully per-dim.
+Same token structure as mimicgen_multitask_singleaction_dlp.py
+(split_action_tokens=False + default [3,6,1] proprio), reached here via
+explicit token groups so the whole ablation family shares one mechanism.
 """
 
 import os
@@ -194,7 +196,7 @@ base = {
         # 'per_dim' expands to [1]*action_dim and [1]*gripper_dim at build time,
         # so the same value stays uniform with the RLBench policy.
         'action_token_groups': [7],
-        'proprio_token_groups': 'per_dim',
+        'proprio_token_groups': [3, 6, 1],
 
         # multitask flags (defaults; overridden by mode_to_args)
         'multitask': False,
