@@ -1,14 +1,11 @@
 """
-Multitask multiview multi-entity mimicgen config.
+Multitask multiview mimicgen — actions WITHOUT proprioception.
 
-12 d0 tasks share the same token shape (K=40, Dtok=10, A=7, G=10, BG=8) but
-have different per-task DLPs and per-task max episode lengths. This config
-trains one diffusion policy on all 12 tasks with task-ID conditioning; eval
-is per-task at rollout time (each task brings its own DLP/calib).
-
-Key in mode_to_args follows the existing `{num_entity}C_{input_type}` convention
-(`num_entity` is reused as a "task count" indicator here; `C` has no
-cube-specific meaning — it's just the lookup string).
+use_gripper_obs=False -> dataset gripper_dim=0 -> pint.py has_proprio=False,
+so no proprio tokens enter the sequence at all. Action stays uniform
+per-dim (7 tokens), matching the uniform baseline, so this is a clean
+"remove proprio" ablation. proprio_token_groups is ignored when there is
+no proprio.
 """
 
 import os
@@ -134,8 +131,8 @@ mode_to_args = {
         # E=200, K=40 (20/view × 2 views), Dtok=10, A=7, G=10, BG=8 (4/view × 2 views)
         # Path lengths vary: pick_place_d0 max=798 (longest), stack_d0 min=81.
         'features_dim': 10,
-        'gripper_dim': 10,
-        'use_gripper_obs': True,
+        'gripper_dim': 0,
+        'use_gripper_obs': False,
         'gripper_state_mask_ratio': 0.0,
         'bg_dim': 8,
         'use_bg_obs': True,
@@ -216,7 +213,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_multitask/',
+        'prefix': 'diffusion/mimicgen_multitask_noproprio/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -257,7 +254,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_multitask/',
+        'prefix': 'plans/mimicgen_multitask_noproprio/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

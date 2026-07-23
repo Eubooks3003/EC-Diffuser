@@ -483,6 +483,21 @@ def setup_mimicgen_env(args, use_absolute_actions=True):
 
     # --- force the cameras you want ---
     cam_names = list(cams) if cams is not None else ["agentview", "sideview"]
+
+    # Per-task camera override: PickPlace uses BinsArena, which has NO
+    # 'sideview' camera. With 'sideview' requested, robosuite tries to build a
+    # sideview_image observable on an arena that can't render it, and
+    # _check_sensor_validity raises "Current sensor for observable
+    # sideview_image is invalid", aborting env setup. The pick_place DLP was
+    # preprocessed with 'agentview' only, so drop 'sideview' here to match.
+    # (Standalone eval_paper.py does the equivalent via per-task meta['cameras'].)
+    _env_name = str(env_meta.get("env_name") or env_meta.get("env") or "")
+    if "pickplace" in _env_name.replace("_", "").lower() and "sideview" in cam_names:
+        _orig_cams = list(cam_names)
+        cam_names = [c for c in cam_names if c != "sideview"] or ["agentview"]
+        print(f"[setup_mimicgen_env] pick_place camera override: {_orig_cams} -> "
+              f"{cam_names} (BinsArena has no 'sideview' camera)")
+
     env_kwargs["camera_names"] = cam_names
 
     # --- force depth ON (you need this for pointcloud reconstruction) ---

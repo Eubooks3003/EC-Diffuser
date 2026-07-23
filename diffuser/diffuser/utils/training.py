@@ -398,6 +398,9 @@ class Trainer(object):
         log_imagined_states=True,  # NEW: decode and log diffuser's predicted future states
         log_imagined_episode=0,  # which episode to log imagined states for
         log_imagined_plan_idx=0,  # which plan (replan) within the episode to log
+        overlay_keypoints=True,  # NEW: draw DLP keypoints on the rollout video frames
+        wandb_run=None,          # NEW: if given, log the (kp-overlaid) rollout video to wandb
+        video_tag="eval",        # NEW: wandb key prefix for this task's video
     ):
         """
         True success eval by stepping MimicGen.
@@ -437,13 +440,37 @@ class Trainer(object):
                     img = np.clip(img, 0, 255).astype(np.uint8)
             return img
 
+        def _overlay_kps(frame_hwc, cam):
+            """Overlay this view's DLP keypoints (z = first 2 token dims, in [-1,1])
+            onto the raw camera frame. No-op if overlay disabled or tokens absent."""
+            if not overlay_keypoints:
+                return frame_hwc
+            try:
+                from utils.util_func import plot_keypoints_on_image
+            except Exception:
+                return frame_hwc
+            toks = getattr(envw, "last_toks", None)
+            cams_list = list(getattr(envw, "cams", []))
+            if toks is None or cam not in cams_list:
+                return frame_hwc
+            toks = np.asarray(toks)
+            K = toks.shape[0] // max(len(cams_list), 1)
+            vi = cams_list.index(cam)
+            kp = np.asarray(toks[vi * K:(vi + 1) * K, :2], dtype=np.float32)  # (K,2) in [-1,1]
+            img_chw = torch.from_numpy(frame_hwc.astype(np.float32) / 255.0).permute(2, 0, 1)
+            out = plot_keypoints_on_image(
+                torch.from_numpy(kp), img_chw,
+                radius=2, thickness=1, kp_range=(-1, 1), plot_numbers=False,
+            )
+            return np.asarray(out, dtype=np.uint8)
+
         def _frame_from_raw_obs(raw_obs, cams_to_use):
             frames = []
             for cam in cams_to_use:
                 k = f"{cam}_image"
                 if k not in raw_obs:
                     continue
-                frames.append(_to_uint8(raw_obs[k]))
+                frames.append(_overlay_kps(_to_uint8(raw_obs[k]), cam))
             if not frames:
                 return None
             # concat multi-view horizontally
@@ -682,12 +709,24 @@ class Trainer(object):
                         print(f"[EVAL] Episode succeeded at t={t}, stopping early")
                     break
 
-            # ---- new: write video ----
+            # ---- new: write video (with DLP keypoints overlaid) ----
             if save_videos and len(frames) > 0:
                 out_path = os.path.join(video_dir, f"ep_{ep:03d}.mp4")
                 # macro_block_size=None avoids ffmpeg issues with non-multiple-of-16 sizes
                 imageio.mimsave(out_path, frames, fps=int(video_fps), macro_block_size=None)
                 print(f"[mimicgen eval] wrote video: {out_path}", flush=True)
+                if wandb_run is not None:
+                    try:
+                        import wandb as _wandb
+                        # (T, H, W, C) uint8 -> (T, C, H, W) for wandb.Video
+                        vid = np.stack(frames, axis=0).transpose(0, 3, 1, 2)
+                        wandb_run.log({
+                            f"{video_tag}/rollout_ep{ep}": _wandb.Video(
+                                vid, fps=int(video_fps), format="mp4"),
+                            "step": self.step,
+                        })
+                    except Exception as _e:
+                        print(f"[mimicgen eval] wandb video log failed: {_e}", flush=True)
             # success flag (wrapper tries common info keys; may be None)
             success = bool(info.get("success", False)) if isinstance(info, dict) else False
             successes.append(success)

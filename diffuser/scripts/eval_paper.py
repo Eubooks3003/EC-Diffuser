@@ -818,6 +818,9 @@ def main():
         gripper_dim=gripper_dim,
         bg_dim=bg_dim,
         n_tasks=getattr(cfg, 'n_tasks', 1),
+        split_action_tokens=getattr(cfg, 'split_action_tokens', None),
+        action_token_groups=getattr(cfg, 'action_token_groups', None),
+        proprio_token_groups=getattr(cfg, 'proprio_token_groups', None),
     )
 
     diffusion_config = utils.Config(

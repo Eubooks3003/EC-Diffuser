@@ -391,6 +391,27 @@ def main(argv):
         if isinstance(r, dict) and c["exit_code"] == 0 and "overall_success_rate" in r:
             rates_per_task.append(r["overall_success_rate"])
 
+    # Pivot: {seed -> [per-task success_rate]} so we can show per-seed across-task means.
+    per_seed_rates = {}
+    per_task_seed_results = {}
+    for c in completed:
+        r = c["result"] or {}
+        if not (c["exit_code"] == 0 and isinstance(r, dict) and "per_seed_results" in r):
+            continue
+        per_task_seed_results[c["task"]] = r["per_seed_results"]
+        for ps in r["per_seed_results"]:
+            seed = int(ps["seed"])
+            per_seed_rates.setdefault(seed, []).append(float(ps["success_rate"]))
+
+    across_task_per_seed = {
+        seed: {
+            "mean": float(np.mean(rates)),
+            "std":  float(np.std(rates, ddof=0)),
+            "n_tasks": len(rates),
+        }
+        for seed, rates in per_seed_rates.items()
+    }
+
     n_complete = sum(1 for c in completed
                      if c["exit_code"] == 0 and isinstance(c["result"], dict)
                      and "overall_success_rate" in c["result"])
@@ -401,6 +422,8 @@ def main(argv):
     summary["n_tasks_failed"] = n_failed
     summary["across_task_mean_success_rate"] = float(np.mean(rates_per_task)) if rates_per_task else 0.0
     summary["across_task_std_success_rate"] = float(np.std(rates_per_task, ddof=0)) if rates_per_task else 0.0
+    summary["per_task_seed_results"] = per_task_seed_results
+    summary["across_task_per_seed"] = across_task_per_seed
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2,
                   default=lambda x: x.tolist() if isinstance(x, np.ndarray) else str(x))
@@ -413,9 +436,21 @@ def main(argv):
         sr = r.get("overall_success_rate", 0.0) if isinstance(r, dict) else 0.0
         ok = (c["exit_code"] == 0 and isinstance(r, dict) and "overall_success_rate" in r)
         flag = "  " if ok else "!!"
+        # Per-seed breakdown for this task (mean +/- std across the 3 seeds, plus each seed's rate).
+        seed_str = ""
+        if isinstance(r, dict) and "per_seed_results" in r:
+            psr = r["per_seed_results"]
+            rates = [float(ps["success_rate"]) for ps in psr]
+            mean_s = float(np.mean(rates)) if rates else 0.0
+            std_s = float(np.std(rates, ddof=0)) if rates else 0.0
+            per_s = "  ".join(f"s{int(ps['seed'])}={float(ps['success_rate'])*100:5.1f}%"
+                              for ps in psr)
+            seed_str = (f"  mean={mean_s*100:5.1f}% +/- {std_s*100:4.1f}%  "
+                        f"[{per_s}]")
         print(f"  {flag} {c['task']:<24} "
               f"rc={c['exit_code']:>3}  "
-              f"sr={sr*100:5.1f}%  "
+              f"sr={sr*100:5.1f}%"
+              f"{seed_str}  "
               f"t={c['elapsed_sec']:6.1f}s  "
               f"gpu={c['gpu']}",
               flush=True)
@@ -423,6 +458,13 @@ def main(argv):
           f"{summary['across_task_mean_success_rate']*100:5.1f}% "
           f"+/- {summary['across_task_std_success_rate']*100:.1f}%  "
           f"({n_complete}/{len(completed)} tasks complete)", flush=True)
+    if across_task_per_seed:
+        per_seed_pretty = "  ".join(
+            f"s{seed}={across_task_per_seed[seed]['mean']*100:5.1f}% "
+            f"+/- {across_task_per_seed[seed]['std']*100:4.1f}%"
+            for seed in sorted(across_task_per_seed.keys())
+        )
+        print(f"  per-seed across-task: {per_seed_pretty}", flush=True)
     print(f"  summary: {summary_path}", flush=True)
     print("=" * 76, flush=True)
 

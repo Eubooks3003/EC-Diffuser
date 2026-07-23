@@ -258,6 +258,8 @@ model_config = utils.Config(
     bg_dim=bg_dim,
     n_tasks=getattr(args, 'n_tasks', 1),
     split_action_tokens=getattr(args, 'split_action_tokens', None),
+    action_token_groups=getattr(args, 'action_token_groups', None),
+    proprio_token_groups=getattr(args, 'proprio_token_groups', None),
 )
 
 diffusion_config = utils.Config(
@@ -331,79 +333,71 @@ wandb_run.name = f"{args.dataset}_H{args.horizon}_exe{getattr(args, 'exe_steps',
 #                               mimicgen eval wiring                            #
 # -----------------------------------------------------------------------------#
 
-dlp_model = None
-dlp_cfg = None
-make_env_fn = None
-calib_h5_path = None
-goal_provider = None  # NEW: for dataset-based goal conditioning
+# Multitask in-training eval: build one eval context per task (every eval_freq
+# epochs we run 1 rollout for EACH task, with DLP keypoints overlaid on the video).
+# Each context caches that task's DLP (loaded once) + goal provider + env factory.
+eval_contexts = []
+use_absolute_actions = getattr(args, "use_absolute_actions", True)
 
 if do_eval and eval_backend == "mimicgen":
-    # Multitask: pick the per-task DLP/calib paths from the matching task entry.
-    multitask_task_id = None
-    if getattr(args, "multitask", False):
-        eval_task_name = getattr(args, "eval_task", "") or ""
-        if not eval_task_name:
-            raise RuntimeError(
-                "eval_backend='mimicgen' with multitask config requires --eval_task <name>"
-            )
-        task_entries = getattr(args, "task_entries", []) or []
-        match = next((e for e in task_entries if e["name"] == eval_task_name), None)
-        if match is None:
-            available = [e["name"] for e in task_entries]
-            raise RuntimeError(f"--eval_task='{eval_task_name}' not in task_entries (available: {available})")
-        # Override args so downstream code reads task-specific paths.
-        args.calib_h5_path = match["calib_h5"]
-        args.dlp_ckpt = match["dlp_ckpt"]
-        args.dlp_cfg = match["dlp_cfg"]
-        # Use this task's pkl as the goal provider source so init_states + goal tokens match.
-        args.dataset_path = match["pkl"]
-        multitask_task_id = int(match["task_id"])
-        print(f"[mimicgen eval] multitask: --eval_task={eval_task_name} -> task_id={multitask_task_id}")
-
-    calib_h5_path = getattr(args, "calib_h5_path", None)
-    dlp_ckpt = getattr(args, "dlp_ckpt", None)
-    dlp_cfg_path = getattr(args, "dlp_cfg", None)
-
-    if calib_h5_path is None:
-        raise RuntimeError("eval_backend='mimicgen' requires --calib_h5_path")
-    if dlp_ckpt is None:
-        raise RuntimeError("eval_backend='mimicgen' requires --dlp_ckpt")
-    if dlp_cfg_path is None:
-        raise RuntimeError("eval_backend='mimicgen' requires --dlp_cfg (LPWM cfg used to build DLP)")
-
-    print(f"[mimicgen eval] loading DLP from cfg={dlp_cfg_path} ckpt={dlp_ckpt}", flush=True)
-    _dlp_ctor_eval = getattr(args, "dlp_ctor", "voxel_models:DLP")
-    dlp_model, dlp_cfg = load_dlp_lpwm(dlp_cfg_path, dlp_ckpt, args.device, dlp_ctor=_dlp_ctor_eval)
-
-    renderer.latent_rep_model = dlp_model
-
-    # NEW: Set up goal provider from dataset for init_state + goal pairing
-    # This ensures eval uses the same (init_state, goal) pairs as training
     from diffuser.envs.mimicgen_dlp_wrapper import DatasetGoalProvider
-    print("=" * 60)
-    print("[mimicgen eval] Setting up DatasetGoalProvider for goal conditioning")
-    print(f"[mimicgen eval]   Loading from: {args.dataset_path}")
-    goal_provider = DatasetGoalProvider(args.dataset_path, shuffle=True)
-    print("[mimicgen eval] ✓ Goal provider ready - will use paired (init_state, goal_tokens)")
-    print("=" * 60, flush=True)
+    from diffuser.eval_utils import setup_mimicgen_env, extract_mimicgen_task_name
 
-    # NEW: Check if using absolute actions (control_delta=False)
-    use_absolute_actions = getattr(args, "use_absolute_actions", True)
+    _dlp_ctor_eval = getattr(args, "dlp_ctor", "voxel_models:DLP")
     print(f"[mimicgen eval] use_absolute_actions = {use_absolute_actions}", flush=True)
 
-    # Extract task name from HDF5 for task-specific voxel bounds
-    from diffuser.eval_utils import extract_mimicgen_task_name
-    mimicgen_task = getattr(args, "mimicgen_task", None)  # Allow config override
-    if mimicgen_task is None:
-        mimicgen_task = extract_mimicgen_task_name(calib_h5_path)
-    if mimicgen_task is not None:
-        print(f"[mimicgen eval] Using task-specific bounds for task: '{mimicgen_task}'")
+    # Decide which task entries to evaluate.
+    if getattr(args, "multitask", False):
+        _task_entries = list(getattr(args, "task_entries", []) or [])
+        _only = getattr(args, "eval_task", "") or ""   # optional: restrict to one task
+        if _only:
+            _task_entries = [e for e in _task_entries if e["name"] == _only]
+            if not _task_entries:
+                raise RuntimeError(f"--eval_task='{_only}' not in task_entries")
     else:
-        print(f"[mimicgen eval] WARNING: Could not determine task name, using default bounds")
+        # single-task config: synthesize one entry from args
+        _task_entries = [{
+            "name": getattr(args, "dataset", "task"),
+            "task_id": None,
+            "calib_h5": getattr(args, "calib_h5_path", None),
+            "dlp_ckpt": getattr(args, "dlp_ckpt", None),
+            "dlp_cfg": getattr(args, "dlp_cfg", None),
+            "pkl": getattr(args, "dataset_path", None),
+            "max_steps": getattr(args, "mimicgen_max_steps", 600),
+        }]
 
-    def make_env_fn():
-        from diffuser.eval_utils import setup_mimicgen_env
-        return setup_mimicgen_env(args, use_absolute_actions=use_absolute_actions)
+    print(f"[mimicgen eval] evaluating {len(_task_entries)} task(s): "
+          f"{[e['name'] for e in _task_entries]}", flush=True)
+
+    for _e in _task_entries:
+        for _k in ("calib_h5", "dlp_ckpt", "dlp_cfg", "pkl"):
+            if _e.get(_k) is None:
+                raise RuntimeError(f"mimicgen eval: task '{_e['name']}' missing '{_k}'")
+        print(f"[mimicgen eval] loading DLP for '{_e['name']}': cfg={_e['dlp_cfg']}", flush=True)
+        _task_dlp, _ = load_dlp_lpwm(_e["dlp_cfg"], _e["dlp_ckpt"], args.device, dlp_ctor=_dlp_ctor_eval)
+        _goal_prov = DatasetGoalProvider(_e["pkl"], shuffle=True)
+        _mg_task = getattr(args, "mimicgen_task", None) or extract_mimicgen_task_name(_e["calib_h5"])
+
+        def _make_env_fn(_calib=_e["calib_h5"]):
+            def _fn():
+                args.calib_h5_path = _calib  # setup_mimicgen_env reads task metadata from this h5
+                return setup_mimicgen_env(args, use_absolute_actions=use_absolute_actions)
+            return _fn
+
+        eval_contexts.append({
+            "name": _e["name"],
+            "task_id": (int(_e["task_id"]) if _e.get("task_id") is not None else None),
+            "calib_h5": _e["calib_h5"],
+            "dlp_model": _task_dlp,
+            "goal_provider": _goal_prov,
+            "mimicgen_task": _mg_task,
+            "make_env_fn": _make_env_fn(),
+            "max_steps": int(_e.get("max_steps", getattr(args, "mimicgen_max_steps", 600))),
+        })
+
+    # Default renderer DLP = first task's (used for training reference renders too).
+    if eval_contexts:
+        renderer.latent_rep_model = eval_contexts[0]["dlp_model"]
 
 
 # -----------------------------------------------------------------------------#
@@ -429,29 +423,56 @@ for i in range(start_epoch, n_epochs):
         print(f"[eval] starting {eval_backend} eval at epoch={i} step={trainer.step}", flush=True)
 
         if eval_backend == "mimicgen":
-            sim_stats = trainer.eval_mimicgen_rollouts(
-                make_env_fn=make_env_fn,
-                dlp_model=dlp_model,
-                calib_h5_path=calib_h5_path,
-                n_episodes=getattr(args, "mimicgen_eval_episodes", 5),
-                max_steps=getattr(args, "mimicgen_max_steps", 50),
-                bounds_xyz=getattr(args, "mimicgen_bounds_xyz", ((-2, 2), (-2, 2), (-0.2, 2.5))),
-                grid_dhw=getattr(args, "mimicgen_grid_dhw", (128, 128, 128)),
-                cams=getattr(args, "mimicgen_cams", ("agentview", "sideview")),
-                pixel_stride=getattr(args, "mimicgen_pixel_stride", 2),
-                goal_from_env_fn=getattr(args, "goal_from_env_fn", None),
-                goal_provider=goal_provider,  # NEW: dataset-based goal provider
-                random_init=getattr(args, "random_init_eval", False),  # NEW: random vs dataset init
-                task=mimicgen_task,  # Task name for task-specific voxel bounds
-                renderer_3d=renderer,
-                exe_steps=getattr(args, "exe_steps", 1),  # ACTION CHUNKING: how many actions to execute per plan
-                task_id=multitask_task_id,  # Multitask: pin the task id used for policy conditioning
-            )
+            # Run 1 rollout per task, each with DLP keypoints overlaid on the video.
+            per_task_sr = {}
+            for ctx in eval_contexts:
+                print(f"[mimicgen eval] >>> task '{ctx['name']}' "
+                      f"(task_id={ctx['task_id']}, max_steps={ctx['max_steps']})", flush=True)
+                try:
+                    renderer.latent_rep_model = ctx["dlp_model"]
+                    sim_stats = trainer.eval_mimicgen_rollouts(
+                        make_env_fn=ctx["make_env_fn"],
+                        dlp_model=ctx["dlp_model"],
+                        calib_h5_path=ctx["calib_h5"],
+                        n_episodes=getattr(args, "mimicgen_eval_episodes", 1),
+                        max_steps=ctx["max_steps"],
+                        bounds_xyz=getattr(args, "mimicgen_bounds_xyz", ((-2, 2), (-2, 2), (-0.2, 2.5))),
+                        grid_dhw=getattr(args, "mimicgen_grid_dhw", (128, 128, 128)),
+                        cams=getattr(args, "mimicgen_cams", ("agentview", "sideview")),
+                        pixel_stride=getattr(args, "mimicgen_pixel_stride", 2),
+                        goal_from_env_fn=getattr(args, "goal_from_env_fn", None),
+                        goal_provider=ctx["goal_provider"],
+                        random_init=getattr(args, "random_init_eval", False),
+                        task=ctx["mimicgen_task"],
+                        renderer_3d=renderer,
+                        exe_steps=getattr(args, "exe_steps", 1),
+                        task_id=ctx["task_id"],
+                        video_cams=getattr(args, "mimicgen_cams", ("agentview", "sideview")),
+                        overlay_keypoints=True,        # NEW: kps on the rollout video
+                        wandb_run=wandb_run,           # NEW: log video to wandb
+                        video_tag=f"eval/{ctx['name']}",
+                    )
+                except Exception as _eval_err:
+                    # Don't let one task's eval (e.g. an env-setup/render failure)
+                    # abort the whole training run — log it and move on.
+                    import traceback
+                    print(f"[mimicgen eval] task={ctx['name']} FAILED, skipping: "
+                          f"{_eval_err}", flush=True)
+                    traceback.print_exc()
+                    continue
+                sr = float(sim_stats.get("sim/success_rate", 0.0))
+                per_task_sr[ctx["name"]] = sr
+                wandb.log({
+                    "step": trainer.step,
+                    f"sim/{ctx['name']}/success_rate": sr,
+                    f"sim/{ctx['name']}/avg_len": float(sim_stats.get("sim/avg_len", 0.0)),
+                })
+                print(f"[mimicgen eval] task={ctx['name']} :: {sim_stats}", flush=True)
 
-            # avoid double-prefix if eval returns sim/... already
-            log_stats = {k if k.startswith("sim/") else f"sim/{k}": v for k, v in sim_stats.items()}
-            wandb.log({"step": trainer.step, **log_stats})
-            print(f"[mimicgen eval] epoch={i} :: {sim_stats}", flush=True)
+            if per_task_sr:
+                mean_sr = sum(per_task_sr.values()) / len(per_task_sr)
+                wandb.log({"step": trainer.step, "sim/mean_success_rate": mean_sr})
+                print(f"[mimicgen eval] epoch={i} mean_success_rate={mean_sr:.3f} :: {per_task_sr}", flush=True)
 
         else:
             raise RuntimeError(

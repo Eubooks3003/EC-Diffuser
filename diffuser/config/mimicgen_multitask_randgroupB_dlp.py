@@ -1,14 +1,8 @@
 """
-Multitask multiview multi-entity mimicgen config.
+Multitask multiview mimicgen — RANDOM token grouping B.
 
-12 d0 tasks share the same token shape (K=40, Dtok=10, A=7, G=10, BG=8) but
-have different per-task DLPs and per-task max episode lengths. This config
-trains one diffusion policy on all 12 tasks with task-ID conditioning; eval
-is per-task at rollout time (each task brings its own DLP/calib).
-
-Key in mode_to_args follows the existing `{num_entity}C_{input_type}` convention
-(`num_entity` is reused as a "task count" indicator here; `C` has no
-cube-specific meaning — it's just the lookup string).
+Second fixed random partition: action_dim=7 -> [3,1,1,2],
+proprio (gripper_dim=10) -> [2,3,1,4]. See randgroupA for the mechanism.
 """
 
 import os
@@ -194,8 +188,8 @@ base = {
         # Per-dimension action/proprio tokenization: one token per scalar dim.
         # 'per_dim' expands to [1]*action_dim and [1]*gripper_dim at build time,
         # so the same value stays uniform with the RLBench policy.
-        'action_token_groups': 'per_dim',
-        'proprio_token_groups': 'per_dim',
+        'action_token_groups': [3, 1, 1, 2],
+        'proprio_token_groups': [2, 3, 1, 4],
 
         # multitask flags (defaults; overridden by mode_to_args)
         'multitask': False,
@@ -216,7 +210,7 @@ base = {
 
         # serialization
         'logbase': logbase,
-        'prefix': 'diffusion/mimicgen_multitask/',
+        'prefix': 'diffusion/mimicgen_multitask_randgroupB/',
         'exp_name': watch(args_to_watch),
 
         # training
@@ -257,7 +251,7 @@ base = {
 
         'loadbase': None,
         'logbase': logbase,
-        'prefix': 'plans/mimicgen_multitask/',
+        'prefix': 'plans/mimicgen_multitask_randgroupB/',
         'exp_name': watch(args_to_watch),
         'vis_freq': 10,
         'max_render': 8,

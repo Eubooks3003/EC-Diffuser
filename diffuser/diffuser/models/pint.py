@@ -71,7 +71,8 @@ class AdaLNPINTDenoiser(nn.Module):
                  learned_sinusoidal_dim=16, multiview=False, gripper_dim=0, bg_dim=0,
                  act_pos_dim=3, act_rot_dim=3, act_grip_dim=1,
                  prop_pos_dim=3, prop_rot_dim=6, prop_grip_dim=1,
-                 n_tasks=1, split_action_tokens=None, **kwargs):
+                 n_tasks=1, split_action_tokens=None,
+                 action_token_groups=None, proprio_token_groups=None, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
@@ -105,6 +106,36 @@ class AdaLNPINTDenoiser(nn.Module):
             assert prop_pos_dim + prop_rot_dim + prop_grip_dim == gripper_dim, (
                 f"proprio sub-dims {prop_pos_dim}+{prop_rot_dim}+{prop_grip_dim} "
                 f"must sum to gripper_dim={gripper_dim}")
+
+        # Generalized per-group token splitting. When *_token_groups are given
+        # (lists of sub-dims summing to action_dim / gripper_dim), each group is
+        # its own token with its own projection, type-encoding and decoder head.
+        # Generalizes split_action_tokens: [3,6,1] reproduces pos/rot/grip,
+        # [1,1,...,1] gives one token per scalar dimension. Opt-in: both None ->
+        # legacy named-module path runs unchanged (preserves checkpoints).
+        self.grouped_tokens = (action_token_groups is not None) or (proprio_token_groups is not None)
+        if self.grouped_tokens:
+            # 'per_dim' is a dim-agnostic sentinel: one token per scalar dimension.
+            # The same config value works across policies with different action_dim
+            # (e.g. MimicGen rot3 vs RLBench rot6d) -> truly uniform tokenization.
+            if action_token_groups == 'per_dim':
+                action_token_groups = [1] * action_dim
+            elif action_token_groups is None:
+                action_token_groups = ([act_pos_dim, act_rot_dim, act_grip_dim]
+                                       if self.split_action_tokens else [action_dim])
+            self.action_token_groups = [int(d) for d in action_token_groups]
+            assert sum(self.action_token_groups) == action_dim, (
+                f"action_token_groups {self.action_token_groups} must sum to action_dim={action_dim}")
+            if self.has_proprio:
+                if proprio_token_groups == 'per_dim':
+                    proprio_token_groups = [1] * gripper_dim
+                elif proprio_token_groups is None:
+                    proprio_token_groups = [prop_pos_dim, prop_rot_dim, prop_grip_dim]
+                self.proprio_token_groups = [int(d) for d in proprio_token_groups]
+                assert sum(self.proprio_token_groups) == gripper_dim, (
+                    f"proprio_token_groups {self.proprio_token_groups} must sum to gripper_dim={gripper_dim}")
+            else:
+                self.proprio_token_groups = []
         # block_size is the time horizon
 
         # Define an intermediate time embedding dimension.
@@ -151,7 +182,17 @@ class AdaLNPINTDenoiser(nn.Module):
                 nn.Linear(hidden_dim, self.projection_dim),
             )
 
-        if self.split_action_tokens:
+        def _make_group_encodings(n):
+            return nn.ParameterList(
+                [nn.Parameter(0.02 * torch.randn(1, 1, projection_dim)) for _ in range(n)])
+
+        if self.grouped_tokens:
+            self.a_group_projections = nn.ModuleList([_make_proj(d) for d in self.action_token_groups])
+            self.a_group_encodings = _make_group_encodings(len(self.action_token_groups))
+            if self.has_proprio:
+                self.p_group_projections = nn.ModuleList([_make_proj(d) for d in self.proprio_token_groups])
+                self.p_group_encodings = _make_group_encodings(len(self.proprio_token_groups))
+        elif self.split_action_tokens:
             self.a_pos_projection = _make_proj(act_pos_dim)
             self.a_rot_projection = _make_proj(act_rot_dim)
             self.a_grip_projection = _make_proj(act_grip_dim)
@@ -162,7 +203,7 @@ class AdaLNPINTDenoiser(nn.Module):
             self.action_projection = _make_proj(action_dim)
             self.action_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
 
-        if self.has_proprio:
+        if self.has_proprio and not self.grouped_tokens:
             self.p_pos_projection = _make_proj(prop_pos_dim)
             self.p_rot_projection = _make_proj(prop_rot_dim)
             self.p_grip_projection = _make_proj(prop_grip_dim)
@@ -193,14 +234,18 @@ class AdaLNPINTDenoiser(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-        if self.split_action_tokens:
+        if self.grouped_tokens:
+            self.a_group_decoders = nn.ModuleList([_make_dec(d) for d in self.action_token_groups])
+            if self.has_proprio:
+                self.p_group_decoders = nn.ModuleList([_make_dec(d) for d in self.proprio_token_groups])
+        elif self.split_action_tokens:
             self.a_pos_decoder = _make_dec(act_pos_dim)
             self.a_rot_decoder = _make_dec(act_rot_dim)
             self.a_grip_decoder = _make_dec(act_grip_dim)
         else:
             self.action_decoder = _make_dec(action_dim)
 
-        if self.has_proprio:
+        if self.has_proprio and not self.grouped_tokens:
             self.p_pos_decoder = _make_dec(prop_pos_dim)
             self.p_rot_decoder = _make_dec(prop_rot_dim)
             self.p_grip_decoder = _make_dec(prop_grip_dim)
@@ -256,7 +301,19 @@ class AdaLNPINTDenoiser(nn.Module):
 
         # Build robot tokens piecewise: action side first, then proprio side.
         robot_tokens = []
-        if self.split_action_tokens:
+        if self.grouped_tokens:
+            action_slice = x[:, :, :self.action_dim]
+            anchor_pool = []  # leading position dims form the spatial AdaLN anchor
+            off = 0
+            for d, proj, enc in zip(self.action_token_groups,
+                                    self.a_group_projections, self.a_group_encodings):
+                tok = proj(action_slice[:, :, off:off + d]) + enc.repeat(bs, T, 1)
+                robot_tokens.append(tok)
+                if off + d <= self.act_pos_dim:
+                    anchor_pool.append(tok)
+                off += d
+            anchor = torch.stack(anchor_pool, dim=0).mean(0) if anchor_pool else robot_tokens[0]
+        elif self.split_action_tokens:
             ap0 = 0
             ap1 = ap0 + self.act_pos_dim
             ar1 = ap1 + self.act_rot_dim
@@ -276,17 +333,25 @@ class AdaLNPINTDenoiser(nn.Module):
             anchor = action_tok
 
         if self.has_proprio:
-            pp0 = self.action_dim
-            pp1 = pp0 + self.prop_pos_dim
-            pr1 = pp1 + self.prop_rot_dim
-            pg1 = pr1 + self.prop_grip_dim  # == action_dim + gripper_dim
-            p_pos = x[:, :, pp0:pp1]
-            p_rot = x[:, :, pp1:pr1]
-            p_grip = x[:, :, pr1:pg1]
-            p_pos_tok = self.p_pos_projection(p_pos) + self.p_pos_encoding.repeat(bs, T, 1)
-            p_rot_tok = self.p_rot_projection(p_rot) + self.p_rot_encoding.repeat(bs, T, 1)
-            p_grip_tok = self.p_grip_projection(p_grip) + self.p_grip_encoding.repeat(bs, T, 1)
-            robot_tokens.extend([p_pos_tok, p_rot_tok, p_grip_tok])
+            if self.grouped_tokens:
+                off = self.action_dim
+                for d, proj, enc in zip(self.proprio_token_groups,
+                                        self.p_group_projections, self.p_group_encodings):
+                    tok = proj(x[:, :, off:off + d]) + enc.repeat(bs, T, 1)
+                    robot_tokens.append(tok)
+                    off += d
+            else:
+                pp0 = self.action_dim
+                pp1 = pp0 + self.prop_pos_dim
+                pr1 = pp1 + self.prop_rot_dim
+                pg1 = pr1 + self.prop_grip_dim  # == action_dim + gripper_dim
+                p_pos = x[:, :, pp0:pp1]
+                p_rot = x[:, :, pp1:pr1]
+                p_grip = x[:, :, pr1:pg1]
+                p_pos_tok = self.p_pos_projection(p_pos) + self.p_pos_encoding.repeat(bs, T, 1)
+                p_rot_tok = self.p_rot_projection(p_rot) + self.p_rot_encoding.repeat(bs, T, 1)
+                p_grip_tok = self.p_grip_projection(p_grip) + self.p_grip_encoding.repeat(bs, T, 1)
+                robot_tokens.extend([p_pos_tok, p_rot_tok, p_grip_tok])
 
         x_cat = torch.cat(
             [tok.unsqueeze(2) for tok in robot_tokens] + [new_state_particles],
@@ -314,7 +379,10 @@ class AdaLNPINTDenoiser(nn.Module):
 
         parts = []
         idx = 0
-        if self.split_action_tokens:
+        if self.grouped_tokens:
+            for dec in self.a_group_decoders:
+                parts.append(dec(particles_trans[:, :, idx, :])); idx += 1
+        elif self.split_action_tokens:
             parts.append(self.a_pos_decoder(particles_trans[:, :, idx, :])); idx += 1
             parts.append(self.a_rot_decoder(particles_trans[:, :, idx, :])); idx += 1
             parts.append(self.a_grip_decoder(particles_trans[:, :, idx, :])); idx += 1
@@ -322,9 +390,13 @@ class AdaLNPINTDenoiser(nn.Module):
             parts.append(self.action_decoder(particles_trans[:, :, idx, :])); idx += 1
 
         if self.has_proprio:
-            parts.append(self.p_pos_decoder(particles_trans[:, :, idx, :])); idx += 1
-            parts.append(self.p_rot_decoder(particles_trans[:, :, idx, :])); idx += 1
-            parts.append(self.p_grip_decoder(particles_trans[:, :, idx, :])); idx += 1
+            if self.grouped_tokens:
+                for dec in self.p_group_decoders:
+                    parts.append(dec(particles_trans[:, :, idx, :])); idx += 1
+            else:
+                parts.append(self.p_pos_decoder(particles_trans[:, :, idx, :])); idx += 1
+                parts.append(self.p_rot_decoder(particles_trans[:, :, idx, :])); idx += 1
+                parts.append(self.p_grip_decoder(particles_trans[:, :, idx, :])); idx += 1
 
         if self.bg_dim > 0 and bg_features is not None:
             parts.append(bg_features)
