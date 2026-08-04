@@ -57,7 +57,7 @@ class GaussianDiffusion(nn.Module):
     def __init__(self, model, horizon, observation_dim, action_dim, n_timesteps=1000,
         loss_type='l1', clip_denoised=False, predict_epsilon=True,
         action_weight=1.0, loss_discount=1.0, loss_weights=None, obs_only=False, action_only=False,
-        gripper_dim=0, bg_dim=0,
+        gripper_dim=0, bg_dim=0, aux_action_loss_weight=1.0,
     ):
         super().__init__()
         self.horizon = horizon
@@ -106,6 +106,13 @@ class GaussianDiffusion(nn.Module):
         if action_only:
             loss_weights = {i: 0.0 for i in range(self.transition_dim - self.action_dim)}
 
+        # Auxiliary action tokenizations (see pint.py). Each aux branch decodes
+        # the whole action from a different partition of the SAME noisy action
+        # slice, and is trained against the SAME target as the primary head.
+        self.aux_action_loss_weight = float(aux_action_loss_weight)
+        self.aux_action_branches = len(getattr(model, 'aux_action_token_groups', []) or [])
+        self.has_aux_action = self.aux_action_branches > 0 and self.aux_action_loss_weight > 0
+
         if self.obs_only:
             self.loss_fn = nn.L1Loss()
 
@@ -115,6 +122,18 @@ class GaussianDiffusion(nn.Module):
                     # get loss coefficients and initialize objective
             loss_weights = self.get_loss_weights(action_weight, loss_discount, loss_weights)
             self.loss_fn = Losses[loss_type](loss_weights, self.action_dim)
+
+        if self.has_aux_action:
+            assert not self.obs_only and loss_type in ['l1', 'l2'], (
+                "aux action heads require loss_type l1/l2 and obs_only=False "
+                f"(got loss_type={loss_type}, obs_only={self.obs_only})")
+            self.aux_loss_type = loss_type
+            # Same per-(timestep, dim) weighting the primary head gets on its
+            # action slice, so the aux gradient sits at a comparable scale
+            # (this carries the action_weight boost on the first timestep).
+            # Registered only when aux is active -> old checkpoints still load.
+            self.register_buffer('aux_action_weights',
+                                 loss_weights[:, :self.action_dim].clone())
 
     def get_loss_weights(self, action_weight, discount, weights_dict):
         '''
@@ -245,30 +264,64 @@ class GaussianDiffusion(nn.Module):
 
         return sample
 
+    def _aux_action_loss(self, aux_preds, target_action):
+        '''
+            aux_preds     : list of [ batch_size x horizon x action_dim ]
+            target_action : [ batch_size x horizon x action_dim ]
+
+            The primary head's action error is averaged over the FULL
+            transition_dim (its action columns sit alongside proprio/bg/particle
+            columns), so each action element carries weight 1/transition_dim.
+            Averaging the aux error over action_dim alone would weight it
+            transition_dim/action_dim (~60x) more heavily. Rescaling by
+            action_dim/transition_dim puts both heads at the same per-element
+            weight, so `aux_action_loss_weight=1.0` means "the aux head counts
+            exactly as much as the primary action head" and the primary/aux
+            assignment becomes a pure inference-time choice.
+        '''
+        scale = self.action_dim / self.transition_dim
+        losses = []
+        for pred in aux_preds:
+            if self.aux_loss_type == 'l1':
+                elementwise = torch.abs(pred - target_action)
+            else:
+                elementwise = (pred - target_action) ** 2
+            losses.append((elementwise * self.aux_action_weights).mean() * scale)
+        return losses
+
     def p_losses(self, x_start, cond, t, task_id=None):
         noise = torch.randn_like(x_start)
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         x_noisy = apply_conditioning(x_noisy, cond, self.action_dim) # a, 0, 1
 
-        x_recon = self.model(x_noisy, cond, t, task_id=task_id)  # a' 0' 1'
+        if self.has_aux_action:
+            # Aux branches read the same action slice of `x_noisy` -> the
+            # diffusion noise is shared across representations by construction.
+            x_recon, aux_preds = self.model(x_noisy, cond, t, task_id=task_id, return_aux=True)
+        else:
+            x_recon = self.model(x_noisy, cond, t, task_id=task_id)  # a' 0' 1'
+            aux_preds = []
 
         x_recon = apply_conditioning(x_recon, cond, self.action_dim)
 
         assert noise.shape == x_recon.shape
 
-        if self.predict_epsilon:
-            if self.obs_only:
-                loss = self.loss_fn(x_recon, noise)
-                info = {}
-            else:
-                loss, info = self.loss_fn(x_recon, noise)
+        target = noise if self.predict_epsilon else x_start
+        if self.obs_only:
+            loss = self.loss_fn(x_recon, target)
+            info = {}
         else:
-            if self.obs_only:
-                loss = self.loss_fn(x_recon, x_start)
-                info = {}
-            else:
-                loss, info = self.loss_fn(x_recon, x_start)
+            loss, info = self.loss_fn(x_recon, target)
+
+        if aux_preds:
+            aux_losses = self._aux_action_loss(aux_preds, target[:, :, :self.action_dim])
+            aux_loss = torch.stack(aux_losses).mean()
+            loss = loss + self.aux_action_loss_weight * aux_loss
+            info['aux_action_loss'] = aux_loss.detach()
+            if len(aux_losses) > 1:
+                for i, l in enumerate(aux_losses):
+                    info[f'aux_action_loss_{i}'] = l.detach()
 
         return loss, info
 

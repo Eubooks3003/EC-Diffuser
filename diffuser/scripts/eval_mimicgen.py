@@ -277,6 +277,7 @@ def main():
         split_action_tokens=getattr(args, "split_action_tokens", None),
         action_token_groups=getattr(args, "action_token_groups", None),
         proprio_token_groups=getattr(args, "proprio_token_groups", None),
+        aux_action_token_groups=getattr(args, "aux_action_token_groups", None),
     )
     diffusion_config = utils.Config(
         args.diffusion,
@@ -296,6 +297,7 @@ def main():
         device=args.device,
         obs_only=args.obs_only,
         action_only=args.action_only,
+        aux_action_loss_weight=getattr(args, "aux_action_loss_weight", 1.0),
     )
     trainer_config = utils.Config(
         utils.Trainer,

@@ -177,12 +177,32 @@ def load_dlp_lpwm(dlp_cfg_path: str, dlp_ckpt_path: str, device: str,
       - "voxel_models:DLP"  -> 3D DLP from lpwm-dev
       - "models:DLP"        -> 2D DLP from lpwm-copy
     """
+    dev = torch.device(device)
+    is_2d = "voxel" not in dlp_ctor.lower()
+
+    # lpwm-copy (2D) and lpwm-dev (3D) BOTH define top-level `models`, `modules`
+    # and `utils` packages. Whichever sibling sits first on sys.path wins for
+    # those names, so a global append order silently resolves the 2D `models`
+    # import to lpwm-dev's 3D (conv3d) code. Prepend the correct checkout for
+    # this ctor and evict any conflicting modules already cached from the other
+    # checkout so the right code is imported regardless of prior state.
+    _prefer = "lpwm-copy" if is_2d else "lpwm-dev"
+    _sib_parent = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    _pref_dir = os.path.join(_sib_parent, _prefer)
+    if os.path.isdir(_pref_dir):
+        if sys.path[0] != _pref_dir:
+            sys.path.insert(0, _pref_dir)
+        for _name in list(sys.modules):
+            if _name == "models" or _name == "modules" or _name == "utils" \
+               or _name.startswith("modules.") or _name.startswith("utils."):
+                _mod = sys.modules.get(_name)
+                _f = getattr(_mod, "__file__", None) or ""
+                if _f and (os.sep + _prefer + os.sep) not in _f:
+                    del sys.modules[_name]
+
     from utils.util_func import get_config
 
-    dev = torch.device(device)
     cfg = get_config(dlp_cfg_path)
-
-    is_2d = "voxel" not in dlp_ctor.lower()
 
     if is_2d:
         from models import DLP as DLPClass
@@ -821,6 +841,7 @@ def main():
         split_action_tokens=getattr(cfg, 'split_action_tokens', None),
         action_token_groups=getattr(cfg, 'action_token_groups', None),
         proprio_token_groups=getattr(cfg, 'proprio_token_groups', None),
+        aux_action_token_groups=getattr(cfg, 'aux_action_token_groups', None),
     )
 
     diffusion_config = utils.Config(
@@ -841,6 +862,7 @@ def main():
         device=cfg.device,
         obs_only=getattr(cfg, 'obs_only', False),
         action_only=getattr(cfg, 'action_only', False),
+        aux_action_loss_weight=getattr(cfg, 'aux_action_loss_weight', 1.0),
     )
 
     # Renderer is optional for evaluation (only needed for visualization during training)

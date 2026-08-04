@@ -20,12 +20,48 @@ logging.basicConfig(level=logging.WARNING, force=True)
 # -----------------------------------------------------------------------------#
 
 # train.py is usually at:  EC-Diffuser/diffuser/scripts/train.py
-# lpwm-dev and lpwm-copy are siblings of EC-Diffuser
+# lpwm-dev and lpwm-copy live near it, but how near depends on the checkout:
+# they may be siblings of EC-Diffuser (../../..) or of its parent (../../../..).
+# The old code only tried the latter, so on a sibling-of-EC-Diffuser layout the
+# DLP import died with "No module named 'utils'".
 _SCRIPT_DIR = os.path.dirname(__file__)
-for _sibling in ("lpwm-dev", "lpwm-copy"):
-    _p = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", _sibling))
-    if os.path.isdir(_p) and _p not in sys.path:
-        sys.path.append(_p)
+_LPWM_UPS = ("..", "../..", "../../..", "../../../..")
+
+
+def _find_lpwm_root(name):
+    """Locate an lpwm checkout: $LPWM_COPY/$LPWM_DEV wins, else search upward."""
+    env = os.environ.get(name.replace("-", "_").upper())  # LPWM_COPY / LPWM_DEV
+    if env and os.path.isdir(env):
+        return os.path.abspath(env)
+    for _up in _LPWM_UPS:
+        _p = os.path.abspath(os.path.join(_SCRIPT_DIR, _up, name))
+        if os.path.isdir(_p):
+            return _p
+    return None
+
+
+def ensure_lpwm_on_path(dlp_ctor):
+    """Put the correct lpwm checkout FIRST on sys.path for this dlp_ctor.
+
+    Both checkouts ship a top-level models.py defining DLP, and a `utils`
+    namespace package that merges across them. Order therefore decides which
+    model class you get, silently:
+      - "models:DLP" (2D)       -> lpwm-copy must win
+      - "voxel_models:DLP" (3D) -> lpwm-dev must win; voxel_models needs
+        lpwm-dev's utils.loss_functions (lpwm-copy's lacks bce_logits_weighted)
+    """
+    prefer_2d = "voxel" not in str(dlp_ctor).lower()
+    order = ("lpwm-copy", "lpwm-dev") if prefer_2d else ("lpwm-dev", "lpwm-copy")
+    roots = [r for r in (_find_lpwm_root(n) for n in order) if r]
+    if not roots:
+        raise RuntimeError(
+            f"Could not locate lpwm-copy / lpwm-dev near {_SCRIPT_DIR}. "
+            f"Set LPWM_COPY (and LPWM_DEV) to their absolute paths.")
+    for _p in reversed(roots):          # insert in reverse -> roots[0] ends up first
+        if _p in sys.path:
+            sys.path.remove(_p)
+        sys.path.insert(0, _p)
+    print(f"[lpwm] sys.path order for dlp_ctor={dlp_ctor}: {roots}", flush=True)
 
 
 # -----------------------------------------------------------------------------#
@@ -135,6 +171,7 @@ def load_dlp_lpwm(dlp_cfg_path: str, dlp_ckpt_path: str, device: str,
       - "voxel_models:DLP"  -> 3D DLP from lpwm-dev
       - "models:DLP"        -> 2D DLP from lpwm-copy
     """
+    ensure_lpwm_on_path(dlp_ctor)
     from utils.util_func import get_config
 
     dev = torch.device(device)
@@ -260,6 +297,7 @@ model_config = utils.Config(
     split_action_tokens=getattr(args, 'split_action_tokens', None),
     action_token_groups=getattr(args, 'action_token_groups', None),
     proprio_token_groups=getattr(args, 'proprio_token_groups', None),
+    aux_action_token_groups=getattr(args, 'aux_action_token_groups', None),
 )
 
 diffusion_config = utils.Config(
@@ -280,6 +318,7 @@ diffusion_config = utils.Config(
     device=args.device,
     obs_only=args.obs_only,
     action_only=args.action_only,
+    aux_action_loss_weight=getattr(args, 'aux_action_loss_weight', 1.0),
 )
 
 trainer_config = utils.Config(
@@ -378,9 +417,29 @@ if do_eval and eval_backend == "mimicgen":
         _goal_prov = DatasetGoalProvider(_e["pkl"], shuffle=True)
         _mg_task = getattr(args, "mimicgen_task", None) or extract_mimicgen_task_name(_e["calib_h5"])
 
-        def _make_env_fn(_calib=_e["calib_h5"]):
+        # Per-task cameras: pick_place_d0's arena (BinsArena) has no 'sideview',
+        # so it was preprocessed with ('agentview', 'frontview'). Read the
+        # cameras the DLP was actually trained on from the task pkl's meta,
+        # exactly as scripts/eval_paper.py does — requesting the wrong second
+        # camera raises KeyError('sideview_depth') during env calibration.
+        _task_cams = list(getattr(args, "mimicgen_cams", ["agentview", "sideview"]))
+        try:
+            import pickle as _pickle
+            with open(_e["pkl"], "rb") as _fh:
+                _meta = _pickle.load(_fh).get("meta", {})
+            _meta_cams = _meta.get("cameras", None)
+            if _meta_cams and list(_meta_cams) != _task_cams:
+                print(f"[mimicgen eval] '{_e['name']}' cam override: {_task_cams} -> "
+                      f"{list(_meta_cams)} (from pkl meta)", flush=True)
+                _task_cams = list(_meta_cams)
+        except Exception as _cam_err:
+            print(f"[mimicgen eval] WARNING: could not read meta cameras for "
+                  f"'{_e['name']}': {_cam_err}", flush=True)
+
+        def _make_env_fn(_calib=_e["calib_h5"], _cams=_task_cams):
             def _fn():
                 args.calib_h5_path = _calib  # setup_mimicgen_env reads task metadata from this h5
+                args.mimicgen_cams = _cams   # and reads the camera list off args
                 return setup_mimicgen_env(args, use_absolute_actions=use_absolute_actions)
             return _fn
 
@@ -392,6 +451,7 @@ if do_eval and eval_backend == "mimicgen":
             "goal_provider": _goal_prov,
             "mimicgen_task": _mg_task,
             "make_env_fn": _make_env_fn(),
+            "cams": _task_cams,
             "max_steps": int(_e.get("max_steps", getattr(args, "mimicgen_max_steps", 600))),
         })
 
@@ -438,7 +498,7 @@ for i in range(start_epoch, n_epochs):
                         max_steps=ctx["max_steps"],
                         bounds_xyz=getattr(args, "mimicgen_bounds_xyz", ((-2, 2), (-2, 2), (-0.2, 2.5))),
                         grid_dhw=getattr(args, "mimicgen_grid_dhw", (128, 128, 128)),
-                        cams=getattr(args, "mimicgen_cams", ("agentview", "sideview")),
+                        cams=ctx["cams"],
                         pixel_stride=getattr(args, "mimicgen_pixel_stride", 2),
                         goal_from_env_fn=getattr(args, "goal_from_env_fn", None),
                         goal_provider=ctx["goal_provider"],
@@ -447,10 +507,15 @@ for i in range(start_epoch, n_epochs):
                         renderer_3d=renderer,
                         exe_steps=getattr(args, "exe_steps", 1),
                         task_id=ctx["task_id"],
-                        video_cams=getattr(args, "mimicgen_cams", ("agentview", "sideview")),
+                        video_cams=ctx["cams"],
                         overlay_keypoints=True,        # NEW: kps on the rollout video
                         wandb_run=wandb_run,           # NEW: log video to wandb
                         video_tag=f"eval/{ctx['name']}",
+                        # Per-task subdir: without this every task writes
+                        # ep_000.mp4 into the same step_<N>/ dir and each one
+                        # overwrites the last, leaving only the final task.
+                        video_dir=os.path.join(args.savepath, "eval_videos",
+                                               f"step_{trainer.step}", ctx["name"]),
                     )
                 except Exception as _eval_err:
                     # Don't let one task's eval (e.g. an env-setup/render failure)

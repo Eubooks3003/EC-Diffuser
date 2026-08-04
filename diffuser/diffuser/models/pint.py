@@ -20,6 +20,27 @@ piecewise: action side first, then proprio side (if any), then particles.
 `split_action_tokens=None` (default) preserves the historical behaviour:
 auto-derive to `gripper_dim > 0`, so old configs/ckpts load unchanged.
 
+Auxiliary action tokenizations (`aux_action_token_groups`)
+----------------------------------------------------------
+The action slice can additionally be re-tokenized by one or more *auxiliary*
+branches, each with its own projections / type-encodings / decoder heads.
+Every branch reads the SAME `x[:, :, :action_dim]` values as the primary
+branch — there is no second action slice and no second noise draw, so the
+diffusion corruption is shared across representations by construction.
+
+    action_token_groups=[3,3,1], aux_action_token_groups=[[7]]  → 4 action tokens:
+        [a_pos, a_rot, a_grip, p_pos, p_rot, p_grip, AUX(a_all), particle_1..K]
+
+Auxiliary tokens are appended after the proprio tokens (i.e. immediately
+before the particles) so primary token indices are identical to a run
+without them. They always participate in attention — including at sampling
+time — but their decoders only run when `return_aux=True`, and their output
+never enters `x_out`. The executed action is always the primary decode.
+
+NOTE: token *ordering* is only irrelevant because `positional_bias=False` in
+these configs. With positional_bias enabled, the relative-position bias is
+indexed over the token axis and `max_particles` bounds the TOTAL token count.
+
 Default component sizes (single-arm Panda OSC_POSE, gripper_state format
 [pos(3), rot6d(6), open(1)]):
     action_dim=7:  act_pos_dim=3, act_rot_dim=3, act_grip_dim=1
@@ -36,6 +57,36 @@ from diffuser.models.transformer_modules import (
     SinusoidalPosEmb,
     RandomOrLearnedSinusoidalPosEmb,
 )
+
+def _normalize_aux_action_groups(spec, action_dim):
+    """Normalize `aux_action_token_groups` into a list of branches.
+
+    Each branch is a list of sub-dims summing to `action_dim`. Accepted forms:
+        None            -> []                    (no auxiliary branches)
+        'per_dim'       -> [[1]*action_dim]      (one uniform branch)
+        [7]             -> [[7]]                 (flat list = a single branch)
+        [[7]]           -> [[7]]
+        [[3,3,1], 'per_dim'] -> two branches
+    """
+    if spec is None:
+        return []
+    if isinstance(spec, str):
+        spec = [spec]
+    elif len(spec) == 0:
+        return []
+    elif all(isinstance(g, (int, float)) for g in spec):
+        spec = [spec]  # flat list of sub-dims == one branch
+
+    branches = []
+    for branch in spec:
+        if branch == 'per_dim':
+            branch = [1] * action_dim
+        branch = [int(d) for d in branch]
+        assert sum(branch) == action_dim, (
+            f"aux action branch {branch} must sum to action_dim={action_dim}")
+        branches.append(branch)
+    return branches
+
 
 class AdaLNPINTDenoiser(nn.Module):
     """
@@ -72,7 +123,8 @@ class AdaLNPINTDenoiser(nn.Module):
                  act_pos_dim=3, act_rot_dim=3, act_grip_dim=1,
                  prop_pos_dim=3, prop_rot_dim=6, prop_grip_dim=1,
                  n_tasks=1, split_action_tokens=None,
-                 action_token_groups=None, proprio_token_groups=None, **kwargs):
+                 action_token_groups=None, proprio_token_groups=None,
+                 aux_action_token_groups=None, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
@@ -136,6 +188,11 @@ class AdaLNPINTDenoiser(nn.Module):
                     f"proprio_token_groups {self.proprio_token_groups} must sum to gripper_dim={gripper_dim}")
             else:
                 self.proprio_token_groups = []
+
+        # Auxiliary action tokenizations. Opt-in; `None` leaves the module's
+        # state_dict byte-identical to a run without this feature.
+        self.aux_action_token_groups = _normalize_aux_action_groups(
+            aux_action_token_groups, action_dim)
         # block_size is the time horizon
 
         # Define an intermediate time embedding dimension.
@@ -211,6 +268,14 @@ class AdaLNPINTDenoiser(nn.Module):
             self.p_rot_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
             self.p_grip_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
 
+        if self.aux_action_token_groups:
+            self.aux_a_projections = nn.ModuleList(
+                [nn.ModuleList([_make_proj(d) for d in groups])
+                 for groups in self.aux_action_token_groups])
+            self.aux_a_encodings = nn.ModuleList(
+                [_make_group_encodings(len(groups))
+                 for groups in self.aux_action_token_groups])
+
         # Instantiate the AdaLN Particle Transformer.
         self.particle_transformer = AdaLNParticleTransformer(
             self.projection_dim, n_head, n_layer, block_size, self.projection_dim,
@@ -250,6 +315,11 @@ class AdaLNPINTDenoiser(nn.Module):
             self.p_rot_decoder = _make_dec(prop_rot_dim)
             self.p_grip_decoder = _make_dec(prop_grip_dim)
 
+        if self.aux_action_token_groups:
+            self.aux_a_decoders = nn.ModuleList(
+                [nn.ModuleList([_make_dec(d) for d in groups])
+                 for groups in self.aux_action_token_groups])
+
         # Particle encoding: either shared or view-specific for multi-view inputs.
         if self.multiview:
             self.view1_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
@@ -257,7 +327,8 @@ class AdaLNPINTDenoiser(nn.Module):
         else:
             self.particle_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
 
-    def forward(self, x, cond, time, task_id=None, return_attention=False):
+    def forward(self, x, cond, time, task_id=None, return_attention=False,
+                return_aux=False):
         """
         Input/output flat layout (both paths):
             [action(action_dim), gripper(gripper_dim), bg(bg_dim), particles(K*features_dim)]
@@ -266,6 +337,10 @@ class AdaLNPINTDenoiser(nn.Module):
         sub-components (pos, rot, grip) and enter the transformer as six
         separate tokens followed by the K particle tokens. The output is
         reassembled into the original flat layout.
+
+        `return_aux=True` additionally returns the auxiliary action branches'
+        decodes as a list of [bs, T, action_dim] tensors (training only —
+        `x_out` is always the primary branch's decode).
         """
         # ---------------------------------------------------------------------
         # Flat input layout: [action(action_dim), gripper(gripper_dim), bg(bg_dim), particles]
@@ -353,6 +428,22 @@ class AdaLNPINTDenoiser(nn.Module):
                 p_grip_tok = self.p_grip_projection(p_grip) + self.p_grip_encoding.repeat(bs, T, 1)
                 robot_tokens.extend([p_pos_tok, p_rot_tok, p_grip_tok])
 
+        # Auxiliary action branches: re-tokenize the SAME action slice. Appended
+        # last so the primary token indices match a run without them. Always
+        # built (they are part of the attended token set at sampling time too);
+        # only their decoders are conditional on `return_aux`.
+        n_primary_tokens = len(robot_tokens)
+        if self.aux_action_token_groups:
+            action_slice = x[:, :, :self.action_dim]
+            for groups, projs, encs in zip(self.aux_action_token_groups,
+                                           self.aux_a_projections,
+                                           self.aux_a_encodings):
+                off = 0
+                for d, proj, enc in zip(groups, projs, encs):
+                    robot_tokens.append(
+                        proj(action_slice[:, :, off:off + d]) + enc.repeat(bs, T, 1))
+                    off += d
+
         x_cat = torch.cat(
             [tok.unsqueeze(2) for tok in robot_tokens] + [new_state_particles],
             dim=2,
@@ -403,10 +494,23 @@ class AdaLNPINTDenoiser(nn.Module):
         parts.append(particle_decoder_out)
         x_out = torch.cat(parts, dim=-1)
 
+        aux_preds = []
+        if return_aux and self.aux_action_token_groups:
+            aux_idx = n_primary_tokens
+            for decs in self.aux_a_decoders:
+                branch_parts = []
+                for dec in decs:
+                    branch_parts.append(dec(particles_trans[:, :, aux_idx, :]))
+                    aux_idx += 1
+                aux_preds.append(torch.cat(branch_parts, dim=-1))
+
+        if return_attention and return_aux:
+            return x_out, attention_dict, aux_preds
         if return_attention:
             return x_out, attention_dict
-        else:
-            return x_out
+        if return_aux:
+            return x_out, aux_preds
+        return x_out
 
 # ------------------------------------------------------------------------------
 # Test block

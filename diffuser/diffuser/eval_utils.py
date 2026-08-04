@@ -488,15 +488,20 @@ def setup_mimicgen_env(args, use_absolute_actions=True):
     # 'sideview' camera. With 'sideview' requested, robosuite tries to build a
     # sideview_image observable on an arena that can't render it, and
     # _check_sensor_validity raises "Current sensor for observable
-    # sideview_image is invalid", aborting env setup. The pick_place DLP was
-    # preprocessed with 'agentview' only, so drop 'sideview' here to match.
-    # (Standalone eval_paper.py does the equivalent via per-task meta['cameras'].)
+    # sideview_image is invalid", aborting env setup.
+    #
+    # pick_place_d0 was preprocessed with ('agentview', 'frontview') -- see
+    # meta['cameras'] in its pkl -- so REMAP sideview->frontview rather than
+    # dropping it. Dropping leaves one camera, which yields K=20 tokens where
+    # the policy expects K=40, and the wrapper then fails on 'sideview_depth'.
+    # Callers that already resolve per-task cameras from meta (scripts/train.py,
+    # scripts/eval_paper.py) never hit this branch; it is a safety net.
     _env_name = str(env_meta.get("env_name") or env_meta.get("env") or "")
     if "pickplace" in _env_name.replace("_", "").lower() and "sideview" in cam_names:
         _orig_cams = list(cam_names)
-        cam_names = [c for c in cam_names if c != "sideview"] or ["agentview"]
+        cam_names = ["frontview" if c == "sideview" else c for c in cam_names]
         print(f"[setup_mimicgen_env] pick_place camera override: {_orig_cams} -> "
-              f"{cam_names} (BinsArena has no 'sideview' camera)")
+              f"{cam_names} (BinsArena has no 'sideview'; DLP used 'frontview')")
 
     env_kwargs["camera_names"] = cam_names
 
