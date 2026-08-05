@@ -339,7 +339,7 @@ def run_eval_rollouts(
     save_videos=False,
     video_dir=None,
     video_episodes=5,
-    plot_head_delta=False,
+    plot_head_delta=True,
     head_delta_dir=None,
     video_fps=20,
     task_id=None,
@@ -404,6 +404,9 @@ def run_eval_rollouts(
     gripper_dim = getattr(trainer.dataset, 'gripper_dim', 0)
     bg_dim = getattr(trainer.dataset, 'bg_dim', 0)
 
+    # only meaningful when the model actually has a second head
+    plot_head_delta = bool(plot_head_delta) and bool(
+        getattr(getattr(trainer.ema_model, 'model', None), 'aux_action_token_groups', None))
     head_delta_log = []
     pbar = tqdm(range(n_episodes), desc=f"Seed {seed}", unit="ep")
     for ep in pbar:
@@ -669,8 +672,8 @@ def main():
     parser.add_argument("--execute_aux", type=int, default=None,
                         help="Execute auxiliary branch N's decode instead of the primary "
                              "head (no retraining; both decoders exist in the ckpt)")
-    parser.add_argument("--plot_head_delta", action="store_true",
-                        help="Record |a_primary - a_aux| per replan and save plot+npz")
+    parser.add_argument("--no_head_delta", action="store_true",
+                        help="Disable the head-delta recording (on by default for aux models)")
     parser.add_argument("--video_episodes", type=int, default=5,
                         help="Number of episodes to save videos for per seed (default: 5)")
     parser.add_argument("--video_fps", type=int, default=20,
@@ -1038,7 +1041,7 @@ def main():
             save_videos=args.save_videos,
             video_dir=video_dir,
             video_episodes=args.video_episodes,
-            plot_head_delta=args.plot_head_delta,
+            plot_head_delta=not args.no_head_delta,
             head_delta_dir=os.path.join(args.output_dir, 'head_delta') if args.output_dir else None,
             video_fps=args.video_fps,
             task_id=multitask_task_id,
