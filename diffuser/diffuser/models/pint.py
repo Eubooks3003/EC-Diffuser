@@ -193,6 +193,12 @@ class AdaLNPINTDenoiser(nn.Module):
         # state_dict byte-identical to a run without this feature.
         self.aux_action_token_groups = _normalize_aux_action_groups(
             aux_action_token_groups, action_dim)
+        # Which head's decode goes into x_out (i.e. what actually gets executed
+        # at rollout). None = the primary branch; an int selects that auxiliary
+        # branch instead. Runtime-only, adds no parameters, so it can be flipped
+        # on an already-trained checkpoint to ask "what if we ran the other
+        # tokenization's head?" without retraining.
+        self.execute_aux_branch = None
         # block_size is the time horizon
 
         # Define an intermediate time embedding dimension.
@@ -468,6 +474,16 @@ class AdaLNPINTDenoiser(nn.Module):
         particle_decoder_out = self.particle_decoder(particles_trans[:, :, particle_start_token_idx:, :])
         particle_decoder_out = particle_decoder_out.view(bs, T, -1)
 
+        # decode the auxiliary branches first when one of them is to be executed
+        _aux_decoded = []
+        if (self.execute_aux_branch is not None) and self.aux_action_token_groups:
+            _ai = n_primary_tokens
+            for _decs in self.aux_a_decoders:
+                _bp = []
+                for _dec in _decs:
+                    _bp.append(_dec(particles_trans[:, :, _ai, :])); _ai += 1
+                _aux_decoded.append(torch.cat(_bp, dim=-1))
+
         parts = []
         idx = 0
         if self.grouped_tokens:
@@ -479,6 +495,13 @@ class AdaLNPINTDenoiser(nn.Module):
             parts.append(self.a_grip_decoder(particles_trans[:, :, idx, :])); idx += 1
         else:
             parts.append(self.action_decoder(particles_trans[:, :, idx, :])); idx += 1
+
+        # swap the executed action for the chosen auxiliary head's decode
+        if _aux_decoded:
+            k = int(self.execute_aux_branch)
+            assert 0 <= k < len(_aux_decoded), (
+                f"execute_aux_branch={k} out of range (have {len(_aux_decoded)} aux branches)")
+            parts = [_aux_decoded[k]]
 
         if self.has_proprio:
             if self.grouped_tokens:
@@ -496,13 +519,16 @@ class AdaLNPINTDenoiser(nn.Module):
 
         aux_preds = []
         if return_aux and self.aux_action_token_groups:
-            aux_idx = n_primary_tokens
-            for decs in self.aux_a_decoders:
-                branch_parts = []
-                for dec in decs:
-                    branch_parts.append(dec(particles_trans[:, :, aux_idx, :]))
-                    aux_idx += 1
-                aux_preds.append(torch.cat(branch_parts, dim=-1))
+            if _aux_decoded:
+                aux_preds = _aux_decoded
+            else:
+                aux_idx = n_primary_tokens
+                for decs in self.aux_a_decoders:
+                    branch_parts = []
+                    for dec in decs:
+                        branch_parts.append(dec(particles_trans[:, :, aux_idx, :]))
+                        aux_idx += 1
+                    aux_preds.append(torch.cat(branch_parts, dim=-1))
 
         if return_attention and return_aux:
             return x_out, attention_dict, aux_preds

@@ -316,7 +316,13 @@ class GaussianDiffusion(nn.Module):
 
         if aux_preds:
             aux_losses = self._aux_action_loss(aux_preds, target[:, :, :self.action_dim])
-            aux_loss = torch.stack(aux_losses).mean()
+            # SUM, not mean: each branch is already scaled to the primary action
+            # head's per-element weight, so summing keeps every head at parity.
+            # Averaging would give N branches 1/N of the primary's weight each,
+            # silently weakening every head as more tokenizations are added.
+            # Consequence: total action gradient grows with the number of heads;
+            # set aux_action_loss_weight=1/N to hold it constant instead.
+            aux_loss = torch.stack(aux_losses).sum()
             loss = loss + self.aux_action_loss_weight * aux_loss
             info['aux_action_loss'] = aux_loss.detach()
             if len(aux_losses) > 1:
