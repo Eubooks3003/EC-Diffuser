@@ -348,7 +348,15 @@ class GaussianDiffusion(nn.Module):
         if not getattr(self.model, 'aux_action_token_groups', None):
             out = self.model(x, cond, t, task_id=task_id)
             return out[:, :, :self.action_dim], []
-        out, aux = self.model(x, cond, t, task_id=task_id, return_aux=True)
+        # Force the PRIMARY decode into x_out for this diagnostic call. Without
+        # this, an --execute_aux run would read the aux decode out of x_out and
+        # compare that head against itself, reporting a delta of exactly zero.
+        _prev = getattr(self.model, 'execute_aux_branch', None)
+        try:
+            self.model.execute_aux_branch = None
+            out, aux = self.model(x, cond, t, task_id=task_id, return_aux=True)
+        finally:
+            self.model.execute_aux_branch = _prev
         return out[:, :, :self.action_dim], aux
 
     def loss(self, x, cond, task_id=None):
