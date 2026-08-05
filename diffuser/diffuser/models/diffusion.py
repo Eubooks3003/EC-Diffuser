@@ -325,6 +325,26 @@ class GaussianDiffusion(nn.Module):
 
         return loss, info
 
+    @torch.no_grad()
+    def predict_heads(self, x, cond, task_id=None):
+        '''
+            Diagnostic: what does EACH action head predict for the same state?
+
+            Runs one extra forward on an already-denoised trajectory at t=0 and
+            returns every head's decoded action, regardless of which one is
+            actually executed. Purely observational — it does not touch the
+            sampling loop or the executed trajectory.
+
+            Returns (primary_action, [aux_action, ...]) each [batch, horizon, action_dim],
+            or (primary_action, []) when the model has no aux heads.
+        '''
+        t = torch.zeros(len(x), device=x.device, dtype=torch.long)
+        if not getattr(self.model, 'aux_action_token_groups', None):
+            out = self.model(x, cond, t, task_id=task_id)
+            return out[:, :, :self.action_dim], []
+        out, aux = self.model(x, cond, t, task_id=task_id, return_aux=True)
+        return out[:, :, :self.action_dim], aux
+
     def loss(self, x, cond, task_id=None):
         batch_size = len(x)
         t = torch.randint(0, self.n_timesteps, (batch_size,), device=x.device).long()

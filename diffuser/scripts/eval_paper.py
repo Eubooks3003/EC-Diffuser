@@ -339,6 +339,8 @@ def run_eval_rollouts(
     save_videos=False,
     video_dir=None,
     video_episodes=5,
+    plot_head_delta=False,
+    head_delta_dir=None,
     video_fps=20,
     task_id=None,
 ):
@@ -402,6 +404,7 @@ def run_eval_rollouts(
     gripper_dim = getattr(trainer.dataset, 'gripper_dim', 0)
     bg_dim = getattr(trainer.dataset, 'bg_dim', 0)
 
+    head_delta_log = []
     pbar = tqdm(range(n_episodes), desc=f"Seed {seed}", unit="ep")
     for ep in pbar:
         obs_vec = envw.reset()
@@ -413,6 +416,7 @@ def run_eval_rollouts(
         # Record ALL cams (not just video_cams) so we get every training view
         rec_cams = list(cams)
         frames_per_cam = {cam: [] for cam in rec_cams} if record_this_episode else None
+        hd_steps, hd_delta, hd_per_dim = [], [], []   # head-delta trace for this episode
 
         # Determine n_kp_per_view for multiview 2D DLP
         n_kp_per_view = None
@@ -506,6 +510,17 @@ def run_eval_rollouts(
                 action_buffer = traj[:, :a_dim].detach().cpu().numpy()
                 action_idx = 0
 
+                # --- head-delta diagnostic (observational; executed action unchanged)
+                if plot_head_delta:
+                    _p, _aux = trainer.ema_model.predict_heads(
+                        sample.trajectories[:1], cond,
+                        task_id=task_id_tensor[:1] if task_id_tensor is not None else None)
+                    if len(_aux):
+                        _d = (_p - _aux[0]).abs()[0].detach().cpu().numpy()   # (H, a_dim)
+                        hd_steps.append(t)
+                        hd_delta.append(float(_d[:exe_steps].mean()))
+                        hd_per_dim.append(_d[:exe_steps].mean(axis=0))
+
             # Execute action
             a_norm = action_buffer[action_idx]
             a = trainer.dataset.normalizer.unnormalize(a_norm[None], "actions")[0]
@@ -549,6 +564,10 @@ def run_eval_rollouts(
         pbar.set_postfix(sr=f"{np.mean(successes)*100:.0f}%", succ=sum(successes))
 
         # Save one kp-overlay video per camera
+        if plot_head_delta and len(hd_steps):
+            head_delta_log.append(dict(ep=ep, success=bool(success), steps=np.array(hd_steps),
+                                       delta=np.array(hd_delta), per_dim=np.array(hd_per_dim)))
+
         if record_this_episode and video_dir is not None:
             import imageio
             status = "success" if success else "fail"
@@ -560,6 +579,53 @@ def run_eval_rollouts(
                         imageio.mimsave(vpath, cam_frames, fps=video_fps)
                     except Exception:
                         pass
+
+    # ---- head-delta diagnostic: raw arrays + plot -------------------------
+    hd_dir = video_dir if video_dir is not None else (
+        head_delta_dir if plot_head_delta else None)
+    if plot_head_delta and head_delta_log and hd_dir is not None:
+        os.makedirs(hd_dir, exist_ok=True)
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            np.savez_compressed(
+                os.path.join(hd_dir, f"head_delta_seed{seed}.npz"),
+                **{f"ep{d['ep']}_{k}": d[k] for d in head_delta_log
+                   for k in ("steps", "delta", "per_dim")},
+                success=np.array([d["success"] for d in head_delta_log]))
+
+            fig, ax = plt.subplots(1, 2, figsize=(13, 4.2))
+            for d in head_delta_log:
+                ax[0].plot(d["steps"], d["delta"], lw=1.0, alpha=0.75,
+                           color=("tab:green" if d["success"] else "tab:red"))
+            ax[0].set_xlabel("env timestep"); ax[0].set_ylabel("|a_primary - a_aux|  (mean abs)")
+            ax[0].set_title(f"head disagreement over time  (seed {seed})\n"
+                            "green = successful episode, red = failed")
+            ax[0].grid(alpha=0.3)
+
+            succ = [d for d in head_delta_log if d["success"]]
+            fail = [d for d in head_delta_log if not d["success"]]
+            for grp, lab, c in ((succ, "success", "tab:green"), (fail, "fail", "tab:red")):
+                if not grp:
+                    continue
+                vals = np.concatenate([d["delta"] for d in grp])
+                ax[1].hist(vals, bins=40, alpha=0.55, label=f"{lab} (n={len(vals)})",
+                           color=c, density=True)
+            ax[1].set_xlabel("|a_primary - a_aux|"); ax[1].set_ylabel("density")
+            ax[1].set_title("disagreement distribution, success vs failure")
+            ax[1].legend(); ax[1].grid(alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(hd_dir, f"head_delta_seed{seed}.png"), dpi=120)
+            plt.close(fig)
+            allv = np.concatenate([d["delta"] for d in head_delta_log])
+            ms = np.concatenate([d["delta"] for d in succ]).mean() if succ else float("nan")
+            mf = np.concatenate([d["delta"] for d in fail]).mean() if fail else float("nan")
+            print(f"[head-delta] seed={seed} mean={allv.mean():.4f} "
+                  f"success={ms:.4f} fail={mf:.4f} -> {hd_dir}/head_delta_seed{seed}.png",
+                  flush=True)
+        except Exception as _hd_err:
+            print(f"[head-delta] plotting failed: {_hd_err}", flush=True)
 
     # Close environment after all episodes
     try:
@@ -600,6 +666,8 @@ def main():
                         help="Override max steps per episode (default: from config)")
     parser.add_argument("--save_videos", action="store_true",
                         help="Save videos of rollouts")
+    parser.add_argument("--plot_head_delta", action="store_true",
+                        help="Record |a_primary - a_aux| per replan and save plot+npz")
     parser.add_argument("--video_episodes", type=int, default=5,
                         help="Number of episodes to save videos for per seed (default: 5)")
     parser.add_argument("--video_fps", type=int, default=20,
@@ -962,6 +1030,8 @@ def main():
             save_videos=args.save_videos,
             video_dir=video_dir,
             video_episodes=args.video_episodes,
+            plot_head_delta=args.plot_head_delta,
+            head_delta_dir=os.path.join(args.output_dir, 'head_delta') if args.output_dir else None,
             video_fps=args.video_fps,
             task_id=multitask_task_id,
         )
