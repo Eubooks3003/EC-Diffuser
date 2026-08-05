@@ -61,6 +61,10 @@ def _build_args(raw_argv):
                    help="Comma-separated list of seeds (default: 42,123,456)")
     p.add_argument("--max_steps", type=int, default=None,
                    help="Override max steps per episode (default: from config)")
+    p.add_argument("--execute_aux", type=int, default=None,
+                   help="Execute auxiliary branch N's decode instead of the primary head")
+    p.add_argument("--no_head_delta", action="store_true",
+                   help="Disable head-delta recording (on by default for aux models)")
     p.add_argument("--save_videos", action="store_true",
                    help="Forwarded to each worker.")
     p.add_argument("--video_episodes", type=int, default=5,
@@ -148,6 +152,10 @@ def _build_worker_cmd(args, task, output_subdir):
         cmd += ["--max_steps", str(args.max_steps)]
     if args.save_videos:
         cmd += ["--save_videos", "--video_episodes", str(args.video_episodes)]
+    if getattr(args, "execute_aux", None) is not None:
+        cmd += ["--execute_aux", str(args.execute_aux)]
+    if getattr(args, "no_head_delta", False):
+        cmd += ["--no_head_delta"]
     return cmd
 
 
