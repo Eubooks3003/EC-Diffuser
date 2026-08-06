@@ -111,7 +111,9 @@ class GaussianDiffusion(nn.Module):
         # slice, and is trained against the SAME target as the primary head.
         self.aux_action_loss_weight = float(aux_action_loss_weight)
         self.aux_action_branches = len(getattr(model, 'aux_action_token_groups', []) or [])
-        self.has_aux_action = self.aux_action_branches > 0 and self.aux_action_loss_weight > 0
+        self.aux_proprio_branches = len(getattr(model, 'aux_proprio_token_groups', []) or [])
+        self.has_aux_action = (self.aux_action_branches + self.aux_proprio_branches) > 0 \
+            and self.aux_action_loss_weight > 0
 
         if self.obs_only:
             self.loss_fn = nn.L1Loss()
@@ -134,6 +136,9 @@ class GaussianDiffusion(nn.Module):
             # Registered only when aux is active -> old checkpoints still load.
             self.register_buffer('aux_action_weights',
                                  loss_weights[:, :self.action_dim].clone())
+            if self.aux_proprio_branches and self.gripper_dim > 0:
+                self.register_buffer('aux_proprio_weights',
+                                     loss_weights[:, self.action_dim:self.action_dim + self.gripper_dim].clone())
 
     def get_loss_weights(self, action_weight, discount, weights_dict):
         '''
@@ -264,6 +269,16 @@ class GaussianDiffusion(nn.Module):
 
         return sample
 
+    def _aux_slice_loss(self, preds, target, weights, slice_dim):
+        '''Per-branch loss for one aux family, rescaled to the primary head's
+           per-element weight (see _aux_action_loss for the rationale).'''
+        scale = slice_dim / self.transition_dim
+        out = []
+        for pred in preds:
+            e = torch.abs(pred - target) if self.aux_loss_type == 'l1' else (pred - target) ** 2
+            out.append((e * weights).mean() * scale)
+        return out
+
     def _aux_action_loss(self, aux_preds, target_action):
         '''
             aux_preds     : list of [ batch_size x horizon x action_dim ]
@@ -296,12 +311,14 @@ class GaussianDiffusion(nn.Module):
         x_noisy = apply_conditioning(x_noisy, cond, self.action_dim) # a, 0, 1
 
         if self.has_aux_action:
-            # Aux branches read the same action slice of `x_noisy` -> the
+            # Aux branches read the same action/proprio slices of `x_noisy` -> the
             # diffusion noise is shared across representations by construction.
-            x_recon, aux_preds = self.model(x_noisy, cond, t, task_id=task_id, return_aux=True)
+            x_recon, aux_out = self.model(x_noisy, cond, t, task_id=task_id, return_aux=True)
+            aux_preds = aux_out['action'] if isinstance(aux_out, dict) else aux_out
+            aux_prop = aux_out.get('proprio', []) if isinstance(aux_out, dict) else []
         else:
             x_recon = self.model(x_noisy, cond, t, task_id=task_id)  # a' 0' 1'
-            aux_preds = []
+            aux_preds, aux_prop = [], []
 
         x_recon = apply_conditioning(x_recon, cond, self.action_dim)
 
@@ -313,6 +330,13 @@ class GaussianDiffusion(nn.Module):
             info = {}
         else:
             loss, info = self.loss_fn(x_recon, target)
+
+        if aux_prop:
+            pt = target[:, :, self.action_dim:self.action_dim + self.gripper_dim]
+            pl = self._aux_slice_loss(aux_prop, pt, self.aux_proprio_weights, self.gripper_dim)
+            ploss = torch.stack(pl).sum()
+            loss = loss + self.aux_action_loss_weight * ploss
+            info['aux_proprio_loss'] = ploss.detach()
 
         if aux_preds:
             aux_losses = self._aux_action_loss(aux_preds, target[:, :, :self.action_dim])
@@ -357,7 +381,8 @@ class GaussianDiffusion(nn.Module):
             out, aux = self.model(x, cond, t, task_id=task_id, return_aux=True)
         finally:
             self.model.execute_aux_branch = _prev
-        return out[:, :, :self.action_dim], aux
+        aux_a = aux['action'] if isinstance(aux, dict) else aux
+        return out[:, :, :self.action_dim], aux_a
 
     def loss(self, x, cond, task_id=None):
         batch_size = len(x)

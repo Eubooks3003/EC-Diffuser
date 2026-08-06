@@ -1,0 +1,290 @@
+"""
+Multitask multiview mimicgen — semantic + uniform, on BOTH action and proprio.
+
+Primary (executed) tokenization is the semantic baseline: action [3,3,1],
+proprio [3,6,1]. On top of that, one auxiliary branch re-tokenizes the SAME
+noisy action slice with one token per scalar dim. Token sequence:
+
+    [a_pos, a_rot, a_grip, p_pos, p_rot, p_grip, AUX(a_0..a_6), particle_1..K]
+
+Because both branches read the same action slice of the same corrupted
+trajectory, the diffusion noise is shared across the two representations by
+construction — no second noise draw, nothing to synchronise.
+
+Both branches are decoded and take loss during training (the aux projection /
+decoder has to be trained for its token to be meaningful in attention). At
+rollout the aux tokens are still built and still attend, but only the semantic
+decode is executed — see policies.py, which reads trajectories[:, :, :A].
+
+Control run: the semantic baseline (action [3,3,1] / proprio [3,6,1]); the
+auxiliary branch is the only delta.
+
+Remote: in-training rollout eval is OFF; evaluate offline from checkpoints
+with scripts/eval_paper.py.
+"""
+
+import os
+
+from diffuser.utils import watch
+
+args_to_watch = [
+    ('prefix', ''),
+    ('horizon', 'H'),
+    ('n_diffusion_steps', 'T'),
+    ('seed', 'seed'),
+]
+
+logbase = 'data'
+
+# 12 d0 tasks, alphabetical → stable integer task IDs (0..11)
+TASK_NAMES = [
+    'coffee',
+    'coffee_preparation',
+    'hammer_cleanup',
+    'kitchen',
+    'mug_cleanup',
+    'nut_assembly',
+    'pick_place',
+    'square',
+    'stack',
+    'stack_three',
+    'threading',
+    'three_piece_assembly',
+]
+TASK_NAME_TO_ID = {name: i for i, name in enumerate(TASK_NAMES)}
+
+# Per-task rollout horizon. Sourced from each task's standalone config
+# (diffuser/config/mimicgen_<task>_dlp.py 'mimicgen_max_steps' field). The
+# multitask training config keeps one global default for backwards-compat
+# (mode_to_args['12C_dlp']['mimicgen_max_steps']), but eval_paper.py reads
+# this map via task_entries when --eval_task is set so each task gets its
+# own horizon.
+TASK_MAX_STEPS = {
+    'coffee':                600,
+    'coffee_preparation':   1200,
+    'hammer_cleanup':        700,
+    'kitchen':              1000,
+    'mug_cleanup':           700,
+    'nut_assembly':          700,
+    'pick_place':           1500,
+    'square':                600,
+    'stack':                 500,
+    'stack_three':           600,
+    'threading':            1000,
+    'three_piece_assembly': 1000,
+}
+
+
+def _resolve_data_root():
+    """Pick lambda (remote training) or local desktop (rollout) based on which exists."""
+    candidates = [
+        '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/preprocessed_multiview_tokens',
+        '/home/ellina/Desktop/data/preprocessed_multiview_tokens',
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return candidates[0]
+
+
+def _resolve_calib_root():
+    candidates = [
+        '/lambda/nfs/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data/core',
+        '/home/ellina/Desktop/data/3D-DLP-mimicgen-data/core',
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return candidates[0]
+
+
+DATA_ROOT = _resolve_data_root()
+CALIB_ROOT = _resolve_calib_root()
+
+
+def _build_task_entries():
+    """One entry per task: pkl, calib h5, per-task DLP ckpt + cfg + max_steps."""
+    entries = []
+    for name in TASK_NAMES:
+        task_dir = f'{name}_d0'
+        entries.append({
+            'name': name,
+            'task_id': TASK_NAME_TO_ID[name],
+            'pkl': os.path.join(DATA_ROOT, task_dir, f'{task_dir}.pkl'),
+            'calib_h5': os.path.join(CALIB_ROOT, f'{task_dir}.hdf5'),
+            'dlp_ckpt': os.path.join(DATA_ROOT, task_dir, 'dlp_ckpt.pt'),
+            'dlp_cfg':  os.path.join(DATA_ROOT, task_dir, 'dlp_config.json'),
+            'max_steps': TASK_MAX_STEPS[name],
+        })
+    return entries
+
+
+TASK_ENTRIES = _build_task_entries()
+
+
+# IMPORTANT: key must match mode computed in setup.py: "{num_entity}C_{input_type}"
+# Use --num_entity 12 to select this mode.
+mode_to_args = {
+    '12C_dlp': {
+        'dataset': 'multitask',
+        'multitask': True,                  # signals multitask path in dataset
+        'task_entries': TASK_ENTRIES,
+        'task_names': TASK_NAMES,
+        'n_tasks': len(TASK_NAMES),
+        'max_demos_per_task': 200,
+
+        # Sentinel so setup.py's dataset-path resolver does not raise; the
+        # multitask dataset ignores this and uses `task_entries` instead.
+        'override_dataset_path': TASK_ENTRIES[0]['pkl'],
+        # Renderer/eval default DLP if no --eval_task is given (used only for reference renders).
+        'dlp_ckpt': TASK_ENTRIES[0]['dlp_ckpt'],
+        'dlp_cfg':  TASK_ENTRIES[0]['dlp_cfg'],
+        'dlp_ctor': 'models:DLP',
+        'calib_h5_path': TASK_ENTRIES[0]['calib_h5'],
+
+        # Shapes confirmed from per-task pkl meta (all 12 agree):
+        # E=200, K=40 (20/view × 2 views), Dtok=10, A=7, G=10, BG=8 (4/view × 2 views)
+        # Path lengths vary: pick_place_d0 max=798 (longest), stack_d0 min=81.
+        'features_dim': 10,
+        'gripper_dim': 10,
+        'use_gripper_obs': True,
+        'gripper_state_mask_ratio': 0.0,
+        'bg_dim': 8,
+        'use_bg_obs': True,
+        'max_particles': 48,                # covers K=40
+        'multiview': True,
+        'device': 'cuda:0',
+
+        # max_path_length must cover the longest task (pick_place_d0=798).
+        # Set generously so per-episode `path_lengths` does the trimming.
+        'max_path_length': 800,
+
+        # In-training rollout eval DISABLED (remote has no sim/render).
+        'eval_freq': 0,
+        'eval_backend': 'none',
+        'mimicgen_eval_episodes': 1,   # 1 episode per task per eval cycle
+        'n_steps_per_epoch': 500,
+
+        # mimicgen rollout knobs (used only when --eval_task is set)
+        'mimicgen_cams': ['agentview', 'sideview'],
+        'mimicgen_camera_width': 256,
+        'mimicgen_camera_height': 256,
+        'mimicgen_max_steps': 600,
+        'mimicgen_pixel_stride': 1,
+        'use_absolute_actions': False,
+
+        # diffusion knobs
+        'horizon': 16,
+        'exe_steps': 8,
+        'random_init': True,
+        'random_init_eval': True,
+    },
+}
+
+
+base = {
+    'diffusion': {
+        'model': 'models.AdaLNPINTDenoiser',
+        'diffusion': 'models.GaussianDiffusion',
+
+        'horizon': 5,
+        'features_dim': 10,
+        'hidden_dim': 256,
+        'projection_dim': 256,
+        'n_heads': 8,
+        'n_layers': 6,
+        'dropout': 0.0,
+
+        'n_diffusion_steps': 5,
+        'action_weight': 50,
+
+        'max_particles': 48,
+        'positional_bias': False,
+        'multiview': True,
+
+        # Primary (executed) tokenization: semantic pos/rot/grip.
+        'action_token_groups': [3, 3, 1],
+        'proprio_token_groups': [3, 6, 1],
+
+        # Auxiliary tokenization, trained but never executed: one token per
+        # scalar action dim (uniform), reading the same noisy action slice as
+        # the primary branch -> the diffusion noise is shared by construction.
+        # NOTE: assumes the balanced aux loss (aux scaled by
+        # action_dim/transition_dim). Without that fix, 1.0 over-weights the aux
+        # head ~60x relative to the primary action head.
+        'aux_action_token_groups': 'per_dim',
+        'aux_proprio_token_groups': 'per_dim',
+        'aux_action_loss_weight': 1.0,
+
+        # multitask flags (defaults; overridden by mode_to_args)
+        'multitask': False,
+        'n_tasks': 1,
+
+        # dataset
+        'loader': 'datasets.MultitaskGoalDataset',
+        'normalizer': 'GaussianNormalizer',
+        'particle_normalizer': 'ParticleGaussianNormalizer',
+        'preprocess_fns': [],
+        'clip_denoised': False,
+        'use_padding': True,
+        'max_path_length': 800,
+        'obs_only': False,
+        'action_only': False,
+        'action_z_scale': 1.0,
+        'gripper_state_mask_ratio': 0.0,
+
+        # serialization
+        'logbase': logbase,
+        'prefix': 'diffusion/mimicgen_multitask_sem_plus_uniform_dualprop/',
+        'exp_name': watch(args_to_watch),
+
+        # training
+        'n_steps_per_epoch': 200,
+        'loss_type': 'l1',
+        'n_train_steps': 2.5e6,    # 5000 epochs @ 500 steps/epoch (was 2e6 = 4000); +1000 epochs to continue training
+        'batch_size': 16,
+        'learning_rate': 8e-5,
+        'gradient_accumulate_every': 1,
+        'ema_decay': 0.995,
+        'save_freq': 10_000,
+        'eval_freq': 10**9,
+        'sample_freq': 1,
+        'n_saves': 2,
+        'save_parallel': False,
+        'n_reference': 1,
+        'bucket': None,
+        'device': 'cuda:0',
+        'seed': 0,
+        'renderer': 'utils.ParticleRenderer',
+        'predict_epsilon': False,
+        'env_config_dir': 'env_config/n_cubes',
+
+        'loss_weights': None,
+        'loss_discount': 1,
+
+        'exe_steps': 3,
+    },
+
+    'plan': {
+        'policy': 'sampling.GoalConditionedPolicy',
+        'max_episode_length': 50,
+        'batch_size': 1,
+        'preprocess_fns': [],
+        'device': 'cuda:0',
+        'seed': 0,
+        'exe_steps': 3,
+
+        'loadbase': None,
+        'logbase': logbase,
+        'prefix': 'plans/mimicgen_multitask_sem_plus_uniform_dualprop/',
+        'exp_name': watch(args_to_watch),
+        'vis_freq': 10,
+        'max_render': 8,
+
+        'diffusion_epoch': 'latest',
+        'horizon': 5,
+        'n_diffusion_steps': 5,
+        'verbose': False,
+        'suffix': 'f:step_{diffusion_epoch}',
+    },
+}
