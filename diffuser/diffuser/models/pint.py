@@ -507,7 +507,7 @@ class AdaLNPINTDenoiser(nn.Module):
                 for _dec in _decs:
                     _bp.append(_dec(particles_trans[:, :, _ai, :])); _ai += 1
                 _aux_decoded.append(torch.cat(_bp, dim=-1))
-        if (self.execute_aux_branch is not None) and self.aux_proprio_token_groups:
+        if False and self.aux_proprio_token_groups:  # decoded lazily under return_aux
             _pi = n_primary_tokens + n_aux_action_tokens
             for _decs in self.aux_p_decoders:
                 _bp = []
@@ -536,13 +536,15 @@ class AdaLNPINTDenoiser(nn.Module):
 
         if self.has_proprio:
             if self.grouped_tokens:
-                _p_start = len(parts)
                 for dec in self.p_group_decoders:
                     parts.append(dec(particles_trans[:, :, idx, :])); idx += 1
-                if _aux_p_decoded:
-                    k = int(self.execute_aux_branch)
-                    if k < len(_aux_p_decoded):
-                        parts = parts[:_p_start] + [_aux_p_decoded[k]]
+                # NOTE: execute_aux_branch deliberately swaps the ACTION readout
+                # only. Proprio is never executed -- policies.py reads just
+                # trajectories[:, :, :action_dim] -- so the primary proprio head
+                # always drives the denoising chain, keeping the exec-head
+                # comparison a one-variable change. The aux proprio branch stays
+                # a training-time signal plus an attended token, exactly like an
+                # unexecuted aux action branch.
             else:
                 parts.append(self.p_pos_decoder(particles_trans[:, :, idx, :])); idx += 1
                 parts.append(self.p_rot_decoder(particles_trans[:, :, idx, :])); idx += 1
