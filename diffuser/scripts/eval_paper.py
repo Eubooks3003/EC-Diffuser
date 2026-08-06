@@ -598,28 +598,54 @@ def run_eval_rollouts(
                    for k in ("steps", "delta", "per_dim")},
                 success=np.array([d["success"] for d in head_delta_log]))
 
-            fig, ax = plt.subplots(1, 2, figsize=(13, 4.2))
-            for d in head_delta_log:
-                ax[0].plot(d["steps"], d["delta"], lw=1.0, alpha=0.75,
-                           color=("tab:green" if d["success"] else "tab:red"))
-            ax[0].set_xlabel("env timestep"); ax[0].set_ylabel("|a_primary - a_aux|  (mean abs)")
-            ax[0].set_title(f"head disagreement over time  (seed {seed})\n"
-                            "green = successful episode, red = failed")
-            ax[0].grid(alpha=0.3)
-
+            SU, FA = "tab:green", "tab:red"
             succ = [d for d in head_delta_log if d["success"]]
             fail = [d for d in head_delta_log if not d["success"]]
-            for grp, lab, c in ((succ, "success", "tab:green"), (fail, "fail", "tab:red")):
-                if not grp:
+            pick = (succ[:3] + fail[:3])[:6]
+            fig = plt.figure(figsize=(15, 7.5))
+            gs = fig.add_gridspec(2, 6, height_ratios=[1, 1.25], hspace=0.45, wspace=0.35)
+            ymax = max((d["delta"].max() for d in pick), default=1.0) * 1.15
+            for i, d in enumerate(pick):
+                ax = fig.add_subplot(gs[0, i]); col = SU if d["success"] else FA
+                pd_ = d.get("per_dim")
+                if pd_ is not None and len(pd_):
+                    for sl, lab, c in ((slice(0, 3), "pos", "#8888ff"),
+                                       (slice(3, 6), "rot", "#ffaa55"),
+                                       (slice(6, 7), "grip", "#aaaaaa")):
+                        ax.plot(d["steps"], pd_[:, sl].mean(1), color=c, lw=0.9, alpha=0.8,
+                                label=lab if i == 0 else None)
+                ax.plot(d["steps"], d["delta"], color=col, lw=1.8)
+                ax.set_title(f"ep {d['ep']} - {'success' if d['success'] else 'FAIL'}",
+                             fontsize=9, color=col)
+                ax.set_ylim(0, ymax); ax.grid(alpha=0.25); ax.tick_params(labelsize=7)
+                ax.set_xlabel("env step", fontsize=7)
+                if i == 0:
+                    ax.set_ylabel("|a_prim - a_aux|", fontsize=8); ax.legend(fontsize=6, loc="upper left")
+            ax = fig.add_subplot(gs[1, :3])
+            grid = np.linspace(0, 1, 40)
+            for grp, lab, c in ((succ, "success", SU), (fail, "failure", FA)):
+                cur = [np.interp(grid, np.linspace(0, 1, len(d["delta"])), d["delta"])
+                       for d in grp if len(d["delta"]) >= 3]
+                if not cur:
                     continue
-                vals = np.concatenate([d["delta"] for d in grp])
-                ax[1].hist(vals, bins=40, alpha=0.55, label=f"{lab} (n={len(vals)})",
-                           color=c, density=True)
-            ax[1].set_xlabel("|a_primary - a_aux|"); ax[1].set_ylabel("density")
-            ax[1].set_title("disagreement distribution, success vs failure")
-            ax[1].legend(); ax[1].grid(alpha=0.3)
-            fig.tight_layout()
-            fig.savefig(os.path.join(hd_dir, f"head_delta_seed{seed}.png"), dpi=120)
+                cur = np.array(cur)
+                ax.plot(grid, np.median(cur, 0), color=c, lw=2, label=f"{lab} (n={len(cur)}), median")
+                ax.fill_between(grid, np.percentile(cur, 25, 0), np.percentile(cur, 75, 0),
+                                color=c, alpha=0.20, lw=0)
+            ax.set_xlabel("episode progress (normalised)"); ax.set_ylabel("|a_prim - a_aux|")
+            ax.set_title("median +/- IQR over episodes", fontsize=10)
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+            ax = fig.add_subplot(gs[1, 3:])
+            for grp, lab, c in ((succ, "success", SU), (fail, "failure", FA)):
+                if grp:
+                    v = np.concatenate([d["delta"] for d in grp])
+                    ax.hist(v, bins=45, alpha=0.55, density=True, color=c,
+                            label=f"{lab}: mean {v.mean():.4f} (n={len(v)})")
+            ax.set_xlabel("|a_prim - a_aux| per replan"); ax.set_ylabel("density")
+            ax.set_title("distribution, success vs failure", fontsize=10)
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+            fig.suptitle(f"head disagreement - seed {seed}", fontsize=11)
+            fig.savefig(os.path.join(hd_dir, f"head_delta_seed{seed}.png"), dpi=110, bbox_inches="tight")
             plt.close(fig)
             allv = np.concatenate([d["delta"] for d in head_delta_log])
             ms = np.concatenate([d["delta"] for d in succ]).mean() if succ else float("nan")
