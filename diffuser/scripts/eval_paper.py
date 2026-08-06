@@ -698,6 +698,9 @@ def main():
     parser.add_argument("--execute_aux", type=int, default=None,
                         help="Execute auxiliary branch N's decode instead of the primary "
                              "head (no retraining; both decoders exist in the ckpt)")
+    parser.add_argument("--exec_aux_action_only", action="store_true",
+                        help="With --execute_aux, swap only the action readout and keep the "
+                             "primary proprio head driving the denoising chain")
     parser.add_argument("--no_head_delta", action="store_true",
                         help="Disable the head-delta recording (on by default for aux models)")
     parser.add_argument("--video_episodes", type=int, default=5,
@@ -981,6 +984,7 @@ def main():
     model = model_config()
     if getattr(args, "execute_aux", None) is not None:
         model.execute_aux_branch = int(args.execute_aux)
+        model.execute_aux_proprio = not getattr(args, "exec_aux_action_only", False)
         print(f"[eval] EXECUTING AUX BRANCH {args.execute_aux} "
               f"(groups={model.aux_action_token_groups[int(args.execute_aux)]}) "
               f"instead of the primary head {model.action_token_groups}", flush=True)
