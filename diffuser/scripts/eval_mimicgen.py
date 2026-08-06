@@ -278,6 +278,7 @@ def main():
         action_token_groups=getattr(args, "action_token_groups", None),
         proprio_token_groups=getattr(args, "proprio_token_groups", None),
         aux_action_token_groups=getattr(args, "aux_action_token_groups", None),
+        aux_proprio_token_groups=getattr(args, "aux_proprio_token_groups", None),
     )
     diffusion_config = utils.Config(
         args.diffusion,
