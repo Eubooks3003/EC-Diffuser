@@ -343,6 +343,13 @@ def run_eval_rollouts(
     head_delta_dir=None,
     video_fps=20,
     task_id=None,
+    probe_draws=0,
+    probe_dir=None,
+    gate_delta=None,
+    gate_max_resamples=8,
+    gate_metric="mean",
+    gate_batch=4,
+    gate_invert=False,
 ):
     """
     Run evaluation rollouts (simplified version of eval_mimicgen_rollouts).
@@ -408,6 +415,29 @@ def run_eval_rollouts(
     plot_head_delta = bool(plot_head_delta) and bool(
         getattr(getattr(trainer.ema_model, 'model', None), 'aux_action_token_groups', None))
     head_delta_log = []
+    probe_log = []
+
+    # ---- agreement gate ---------------------------------------------------
+    # Resample the plan at a fixed state until the two heads agree to within
+    # `gate_delta`, capped at `gate_max_resamples` extra draws; on failure keep
+    # the smallest-delta candidate seen. Only meaningful with a second head.
+    gate_on = (gate_delta is not None) and probe_draws <= 0 and bool(
+        getattr(getattr(trainer.ema_model, 'model', None), 'aux_action_token_groups', None))
+    gate_log = []          # one record per replan
+    _GATE_DIMS = {"mean": slice(0, 7), "pos": slice(0, 3), "rot": slice(3, 6),
+                  "gripper": slice(6, 7)}
+
+    def _gate_score(d_kd):
+        """(K, a_dim) per-dim deltas -> (K,) scalar score; lower = better agreement."""
+        if gate_metric == "max_dim":
+            return d_kd.max(axis=1)
+        return d_kd[:, _GATE_DIMS.get(gate_metric, slice(0, 7))].mean(axis=1)
+
+    if gate_on:
+        print(f"[gate] ON  threshold={gate_delta} metric={gate_metric} "
+              f"max_resamples={gate_max_resamples} batch={gate_batch}"
+              + ("  [INVERTED: maximising delta]" if gate_invert else ""), flush=True)
+
     pbar = tqdm(range(n_episodes), desc=f"Seed {seed}", unit="ep")
     for ep in pbar:
         obs_vec = envw.reset()
@@ -504,17 +534,94 @@ def run_eval_rollouts(
                     0: torch.from_numpy(obs_norm[None]).float().to(device),
                 }
 
-                # Sample trajectory from diffusion model
-                if task_id_tensor is not None:
-                    sample = trainer.ema_model(cond, verbose=False, task_id=task_id_tensor)
+                # --- within-state probe: draw K samples from the SAME state -------
+                # Batched so K draws cost roughly one sample's wall-clock. Draw 0
+                # is executed, so the rollout itself stays unbiased — this only
+                # measures how much the head-delta moves with the noise seed at a
+                # state held fixed (the quantity an agreement gate would exploit).
+                if probe_draws > 0:
+                    K = int(probe_draws)
+                    cond_K = {k: v.repeat(K, *([1] * (v.dim() - 1))) for k, v in cond.items()}
+                    tid_K = task_id_tensor.repeat(K) if task_id_tensor is not None else None
+                    if tid_K is not None:
+                        sample = trainer.ema_model(cond_K, verbose=False, task_id=tid_K)
+                    else:
+                        sample = trainer.ema_model(cond_K, verbose=False)
+                    _p, _aux = trainer.ema_model.predict_heads(
+                        sample.trajectories, cond_K, task_id=tid_K)
+                    if len(_aux):
+                        # (K, H, a_dim) -> mean over the executed horizon -> (K, a_dim)
+                        _dk = (_p - _aux[0]).abs()[:, :exe_steps].mean(1)
+                        probe_log.append(dict(ep=ep, t=t,
+                                              per_dim=_dk.detach().cpu().numpy()))
+                    traj = sample.trajectories[0]
+                    action_buffer = traj[:, :a_dim].detach().cpu().numpy()
+                    action_idx = 0
+                elif gate_on:
+                    # Redraw noise at this fixed state until the heads agree.
+                    # Drawn in chunks of `gate_batch` because the probe showed the
+                    # budget is spent almost entirely on states that never satisfy,
+                    # where sequential draws would pay K forward passes for nothing.
+                    budget = 1 + int(gate_max_resamples)
+                    best_traj, best_pd, best_sc = None, None, None
+                    n_drawn, n_to_accept, satisfied, first_sc = 0, None, False, None
+                    while n_drawn < budget and not satisfied:
+                        B = min(int(gate_batch), budget - n_drawn)
+                        cond_B = {k: v.repeat(B, *([1] * (v.dim() - 1))) for k, v in cond.items()}
+                        tid_B = task_id_tensor.repeat(B) if task_id_tensor is not None else None
+                        if tid_B is not None:
+                            s_B = trainer.ema_model(cond_B, verbose=False, task_id=tid_B)
+                        else:
+                            s_B = trainer.ema_model(cond_B, verbose=False)
+                        _p, _aux = trainer.ema_model.predict_heads(
+                            s_B.trajectories, cond_B, task_id=tid_B)
+                        pd_B = (_p - _aux[0]).abs()[:, :exe_steps].mean(1)      # (B, a_dim)
+                        pd_B = pd_B.detach().cpu().numpy()
+                        sc_B = _gate_score(pd_B)                                # (B,)
+                        if first_sc is None:
+                            first_sc = float(sc_B[0])
+                        # running best across all chunks
+                        j = int(sc_B.argmax() if gate_invert else sc_B.argmin())
+                        if best_sc is None or ((sc_B[j] > best_sc) if gate_invert
+                                               else (sc_B[j] < best_sc)):
+                            best_sc = float(sc_B[j])
+                            best_traj = s_B.trajectories[j]
+                            best_pd = pd_B[j]
+                        # first candidate in this chunk that clears the threshold
+                        ok = (sc_B >= gate_delta) if gate_invert else (sc_B <= gate_delta)
+                        if ok.any():
+                            i = int(np.argmax(ok))
+                            satisfied = True
+                            n_to_accept = n_drawn + i + 1
+                            best_sc = float(sc_B[i])
+                            best_traj = s_B.trajectories[i]
+                            best_pd = pd_B[i]
+                        n_drawn += B
+                    if n_to_accept is None:
+                        n_to_accept = n_drawn
+                    gate_log.append(dict(ep=ep, t=t, n_drawn=n_drawn,
+                                         n_to_accept=n_to_accept, satisfied=bool(satisfied),
+                                         first=first_sc, accepted=best_sc))
+                    _gate_pd = best_pd
+                    action_buffer = best_traj[:, :a_dim].detach().cpu().numpy()
+                    action_idx = 0
                 else:
-                    sample = trainer.ema_model(cond, verbose=False)
-                traj = sample.trajectories[0]  # (H, action_dim + obs_dim)
-                action_buffer = traj[:, :a_dim].detach().cpu().numpy()
-                action_idx = 0
+                    # Sample trajectory from diffusion model
+                    if task_id_tensor is not None:
+                        sample = trainer.ema_model(cond, verbose=False, task_id=task_id_tensor)
+                    else:
+                        sample = trainer.ema_model(cond, verbose=False)
+                    traj = sample.trajectories[0]  # (H, action_dim + obs_dim)
+                    action_buffer = traj[:, :a_dim].detach().cpu().numpy()
+                    action_idx = 0
 
-                # --- head-delta diagnostic (observational; executed action unchanged)
-                if plot_head_delta:
+                # --- head-delta diagnostic; under the gate, log the ACCEPTED
+                # candidate rather than re-sampling a fresh one.
+                if plot_head_delta and gate_on:
+                    hd_steps.append(t)
+                    hd_delta.append(float(_gate_pd.mean()))
+                    hd_per_dim.append(_gate_pd)
+                elif plot_head_delta:
                     _p, _aux = trainer.ema_model.predict_heads(
                         sample.trajectories[:1], cond,
                         task_id=task_id_tensor[:1] if task_id_tensor is not None else None)
@@ -582,6 +689,109 @@ def run_eval_rollouts(
                         imageio.mimsave(vpath, cam_frames, fps=video_fps)
                     except Exception:
                         pass
+
+    # ---- agreement gate: resampling tally ----------------------------------
+    gate_stats = None
+    if gate_on and gate_log:
+        nd = np.array([g["n_drawn"] for g in gate_log], dtype=float)
+        na = np.array([g["n_to_accept"] for g in gate_log], dtype=float)
+        sat = np.array([g["satisfied"] for g in gate_log], dtype=bool)
+        fi = np.array([g["first"] for g in gate_log], dtype=float)
+        ac = np.array([g["accepted"] for g in gate_log], dtype=float)
+        ep_of = np.array([g["ep"] for g in gate_log], dtype=int)
+        succ_of = np.array([successes[e] if e < len(successes) else False
+                            for e in ep_of], dtype=bool)
+        hist = {int(k): int(v) for k, v in zip(*np.unique(na.astype(int),
+                                                          return_counts=True))}
+        gate_stats = {
+            "threshold": float(gate_delta), "metric": gate_metric,
+            "max_resamples": int(gate_max_resamples), "batch": int(gate_batch),
+            "inverted": bool(gate_invert),
+            "n_replans": int(len(gate_log)),
+            "mean_draws_paid": float(nd.mean()),
+            "mean_draws_to_accept": float(na.mean()),
+            "draws_to_accept_hist": hist,
+            "satisfied_rate": float(sat.mean()),
+            "gate_failure_rate": float(1.0 - sat.mean()),
+            "mean_first_delta": float(fi.mean()),
+            "mean_accepted_delta": float(ac.mean()),
+            "delta_reduction": float(1.0 - ac.mean() / max(fi.mean(), 1e-12)),
+            "total_extra_diffusion_calls": int(nd.sum() - len(gate_log)),
+            "by_outcome": {},
+        }
+        for nm, msk in (("success", succ_of), ("failure", ~succ_of)):
+            if msk.any():
+                gate_stats["by_outcome"][nm] = {
+                    "n_replans": int(msk.sum()),
+                    "mean_draws_paid": float(nd[msk].mean()),
+                    "satisfied_rate": float(sat[msk].mean()),
+                    "mean_first_delta": float(fi[msk].mean()),
+                    "mean_accepted_delta": float(ac[msk].mean()),
+                }
+        print("\n" + "=" * 68)
+        print(f"AGREEMENT GATE TALLY  (seed {seed}, {len(gate_log)} replans)")
+        print("=" * 68)
+        print(f"  threshold {gate_delta} on '{gate_metric}'"
+              + ("  [INVERTED]" if gate_invert else ""))
+        print(f"  satisfied within budget      : {100 * sat.mean():.1f}%"
+              f"   (gate failures {100 * (1 - sat.mean()):.1f}%)")
+        print(f"  draws paid per replan        : {nd.mean():.2f}  (cap {1 + gate_max_resamples})")
+        print(f"  draws needed to accept       : {na.mean():.2f}")
+        print(f"  delta  first-draw -> accepted: {fi.mean():.4f} -> {ac.mean():.4f}"
+              f"  ({100 * (ac.mean() / max(fi.mean(), 1e-12) - 1):+.1f}%)")
+        print(f"  extra diffusion calls        : {int(nd.sum() - len(gate_log))}")
+        for nm in ("success", "failure"):
+            b = gate_stats["by_outcome"].get(nm)
+            if b:
+                print(f"  [{nm:7s}] draws {b['mean_draws_paid']:.2f}  "
+                      f"satisfied {100 * b['satisfied_rate']:.1f}%  "
+                      f"delta {b['mean_first_delta']:.4f} -> {b['mean_accepted_delta']:.4f}")
+        print("=" * 68 + "\n", flush=True)
+        gdir = probe_dir or video_dir or head_delta_dir
+        if gdir:
+            os.makedirs(gdir, exist_ok=True)
+            np.savez_compressed(
+                os.path.join(gdir, f"gate_tally_seed{seed}.npz"),
+                n_drawn=nd, n_to_accept=na, satisfied=sat, first=fi, accepted=ac,
+                ep=ep_of, success=np.array(successes))
+
+    # ---- within-state probe: variance decomposition ------------------------
+    # An agreement gate resamples noise at a FIXED state, so it can only exploit
+    # within-state spread. Everything measured so far is across-state spread.
+    # If within/across is near zero the gate cannot move the delta at all.
+    if probe_draws > 0 and probe_log:
+        P = np.stack([d["per_dim"] for d in probe_log])      # (n_states, K, a_dim)
+        m = P.mean(axis=2)                                   # mean-all-dims metric (n_states, K)
+        within = m.std(axis=1, ddof=1).mean()                # avg spread across draws at one state
+        across = m.mean(axis=1).std(ddof=1)                  # spread of per-state means
+        per_state_med = np.median(m, axis=1)
+        gain = (m.min(axis=1) / np.maximum(per_state_med, 1e-12))
+        # can a gate rescue hard states, or only re-rank within them?
+        order = np.argsort(per_state_med)
+        easy_med = float(np.median(per_state_med[order[:len(order) // 4]]))
+        hard = order[-len(order) // 4:]
+        hard_rescued = float(np.mean(m[hard].min(axis=1) <= easy_med))
+        print("\n" + "=" * 68)
+        print(f"WITHIN-STATE PROBE  ({len(P)} states x {P.shape[1]} draws, seed {seed})")
+        print("=" * 68)
+        print(f"  std within state (across draws) : {within:.5f}")
+        print(f"  std across states               : {across:.5f}")
+        print(f"  ratio within/across             : {within / max(across, 1e-12):.3f}")
+        print(f"  min-of-K / median-of-K          : {gain.mean():.3f} "
+              f"(p10 {np.percentile(gain, 10):.3f}, p90 {np.percentile(gain, 90):.3f})")
+        print(f"  hard states pulled below easy-quartile median by min-of-K: "
+              f"{100 * hard_rescued:.1f}%")
+        print("=" * 68 + "\n", flush=True)
+        pdir = probe_dir or video_dir or head_delta_dir
+        if pdir:
+            os.makedirs(pdir, exist_ok=True)
+            np.savez_compressed(
+                os.path.join(pdir, f"within_state_probe_seed{seed}.npz"),
+                per_dim=P,
+                ep=np.array([d["ep"] for d in probe_log]),
+                t=np.array([d["t"] for d in probe_log]),
+                success=np.array(successes))
+            print(f"[probe] wrote {pdir}/within_state_probe_seed{seed}.npz", flush=True)
 
     # ---- head-delta diagnostic: raw arrays + plot -------------------------
     hd_dir = video_dir if video_dir is not None else (
@@ -672,6 +882,7 @@ def run_eval_rollouts(
         "success_rate": success_rate,
         "avg_return": float(np.mean(returns)),
         "avg_length": float(np.mean(lengths)),
+        "gate_stats": gate_stats,
     }
 
 
@@ -703,6 +914,28 @@ def main():
                              "primary proprio head driving the denoising chain")
     parser.add_argument("--no_head_delta", action="store_true",
                         help="Disable the head-delta recording (on by default for aux models)")
+    parser.add_argument("--probe_draws", type=int, default=0,
+                        help="Diagnostic: at each replan draw K samples from the SAME state "
+                             "and report how much the head-delta varies with the noise seed. "
+                             "Draw 0 is executed so the rollout stays unbiased. 0 = off.")
+    parser.add_argument("--probe_dir", type=str, default=None,
+                        help="Where to write within_state_probe_seed*.npz (default: video/head-delta dir)")
+    parser.add_argument("--gate_delta", type=float, default=None,
+                        help="Agreement gate: resample the plan until the two action heads "
+                             "agree to within this threshold (normalized action units). "
+                             "Absent = no gating. 0 = never satisfied, i.e. pure best-of-K.")
+    parser.add_argument("--gate_max_resamples", type=int, default=8,
+                        help="Extra draws beyond the first before giving up and taking "
+                             "the smallest-delta candidate (default: 8)")
+    parser.add_argument("--gate_metric", type=str, default="mean",
+                        choices=["mean", "pos", "rot", "gripper", "max_dim"],
+                        help="Which delta to gate on (default: mean over all action dims)")
+    parser.add_argument("--gate_batch", type=int, default=4,
+                        help="Draw candidates in batches of this size (default: 4). "
+                             "Wall-clock only; does not change the tally semantics.")
+    parser.add_argument("--gate_invert", action="store_true",
+                        help="Control arm: keep the LARGEST-delta candidate instead of the "
+                             "smallest. If SR drops symmetrically the delta signal is real.")
     parser.add_argument("--video_episodes", type=int, default=5,
                         help="Number of episodes to save videos for per seed (default: 5)")
     parser.add_argument("--video_fps", type=int, default=20,
@@ -1072,6 +1305,13 @@ def main():
             save_videos=args.save_videos,
             video_dir=video_dir,
             video_episodes=args.video_episodes,
+            probe_draws=getattr(args, "probe_draws", 0),
+            probe_dir=getattr(args, "probe_dir", None),
+            gate_delta=getattr(args, "gate_delta", None),
+            gate_max_resamples=getattr(args, "gate_max_resamples", 8),
+            gate_metric=getattr(args, "gate_metric", "mean"),
+            gate_batch=getattr(args, "gate_batch", 4),
+            gate_invert=getattr(args, "gate_invert", False),
             plot_head_delta=not args.no_head_delta,
             head_delta_dir=os.path.join(args.output_dir, 'head_delta') if args.output_dir else None,
             video_fps=args.video_fps,

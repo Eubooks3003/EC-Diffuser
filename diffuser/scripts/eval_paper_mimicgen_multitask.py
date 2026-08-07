@@ -65,6 +65,16 @@ def _build_args(raw_argv):
                    help="Execute auxiliary branch N's decode instead of the primary head")
     p.add_argument("--no_head_delta", action="store_true",
                    help="Disable head-delta recording (on by default for aux models)")
+    p.add_argument("--gate_delta", type=float, default=None,
+                   help="Agreement gate threshold, forwarded to each worker")
+    p.add_argument("--gate_max_resamples", type=int, default=None,
+                   help="Extra draws before falling back to the smallest delta")
+    p.add_argument("--gate_metric", type=str, default=None,
+                   help="Which delta to gate on (default: mean over action dims)")
+    p.add_argument("--gate_batch", type=int, default=None,
+                   help="Candidate batch size (wall-clock only)")
+    p.add_argument("--gate_invert", action="store_true",
+                   help="Control arm: keep the LARGEST-delta candidate")
     p.add_argument("--save_videos", action="store_true",
                    help="Forwarded to each worker.")
     p.add_argument("--video_episodes", type=int, default=5,
@@ -156,6 +166,12 @@ def _build_worker_cmd(args, task, output_subdir):
         cmd += ["--execute_aux", str(args.execute_aux)]
     if getattr(args, "no_head_delta", False):
         cmd += ["--no_head_delta"]
+    for _flag in ("gate_delta", "gate_max_resamples", "gate_metric", "gate_batch"):
+        _v = getattr(args, _flag, None)
+        if _v is not None:
+            cmd += [f"--{_flag}", str(_v)]
+    if getattr(args, "gate_invert", False):
+        cmd += ["--gate_invert"]
     return cmd
 
 
