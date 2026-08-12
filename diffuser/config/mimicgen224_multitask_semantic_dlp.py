@@ -169,10 +169,14 @@ mode_to_args = {
         # Set generously so per-episode `path_lengths` does the trimming.
         'max_path_length': 800,
 
-        # In-training eval: every 100 epochs run 1 rollout for EACH of the 12 tasks,
-        # with DLP keypoints overlaid on the rollout video (logged to wandb).
-        'eval_freq': 100,
-        'eval_backend': 'mimicgen',
+        # In-training rollout eval is OFF: the GH200 training hosts have no sim
+        # (robomimic/mujoco are not installed there), and eval_backend='mimicgen'
+        # crashes at wiring time on ModuleNotFoundError before a single step.
+        # Evaluate offline from checkpoints via
+        # scripts/eval_paper_mimicgen_multitask.py. Matches the 0e6f26c
+        # convention and keeps all three tokenization arms identical here.
+        'eval_freq': 0,
+        'eval_backend': 'none',
         'mimicgen_eval_episodes': 1,
         'n_steps_per_epoch': 500,
 
