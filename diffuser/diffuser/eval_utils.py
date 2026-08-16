@@ -542,14 +542,31 @@ def setup_mimicgen_env(args, use_absolute_actions=True):
         env_meta.setdefault("env_kwargs", {})
         env_meta["env_kwargs"].update(env_kwargs)
 
-        env = EnvUtils.create_env_from_metadata(
+        # The depth flag is not portable across robomimic versions: 0.5.0 takes
+        # use_depth_obs, some builds took use_obs_depth, and 0.3.0 has no depth
+        # kwarg at all. The 2D DLP eval path reads only {cam}_image (depth is
+        # for the voxel path), so treat depth as best-effort and fall back to
+        # requesting none rather than failing to build the env.
+        _base = dict(
             env_meta=env_meta,
             env_name=env_meta.get("env_name", None),
             render=False,
             render_offscreen=True,
             use_image_obs=True,
-            use_depth_obs=True
         )
+        env = None
+        _last_err = None
+        for _extra in ({"use_depth_obs": True}, {"use_obs_depth": True}, {}):
+            try:
+                env = EnvUtils.create_env_from_metadata(**_base, **_extra)
+                break
+            except TypeError as _e:
+                _last_err = _e
+        if env is None:
+            raise RuntimeError(
+                f"create_env_from_metadata rejected every depth-kwarg variant; "
+                f"last error: {_last_err}"
+            )
 
         # robosuite 1.4.1 + mujoco 2.3.2: vopt.geomgroup[i] = v assignments in
         # base.py:_reset_internal don't persist (binding quirk), so the renderer
@@ -581,15 +598,11 @@ def setup_mimicgen_env(args, use_absolute_actions=True):
         return env
 
     except TypeError:
-        # older signatures
-        env = EnvUtils.create_env_from_metadata(
-            env_meta,
-            env_name=env_name,
-            render=False,
-            render_offscreen=True,
-            use_image_obs=True,
-            use_obs_depth=True
-        )
+        # Kept only so a genuinely unexpected signature surfaces loudly. The
+        # previous code retried here without re-applying the vopt patch below,
+        # which rendered group-0 collision geoms as green noise and produced
+        # silent 0% rollouts.
+        raise
 
     return env
 
