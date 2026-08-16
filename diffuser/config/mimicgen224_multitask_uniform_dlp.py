@@ -173,9 +173,17 @@ mode_to_args = {
         'n_steps_per_epoch': 500,
 
         # mimicgen rollout knobs (used only when --eval_task is set)
-        'mimicgen_cams': ['agentview', 'sideview'],
-        'mimicgen_camera_width': 256,
-        'mimicgen_camera_height': 256,
+        # MUST match the views the tokens were encoded from: the 224 store is
+        # agentview + robot0_eye_in_hand (wrist), NOT the agentview + sideview
+        # the 84-res d0 tokens used. Rendering sideview here would feed wrist
+        # token slots with sideview particles -- no crash, just a silent
+        # observation-space mismatch that reads as policy failure.
+        # Provenance: meta['cameras'] in mimicgen_224_wrist_tokens/*/*.pkl.
+        # Render at 224 so it matches the training memmap natively rather than
+        # going through a 256->224 resize.
+        'mimicgen_cams': ['agentview', 'robot0_eye_in_hand'],
+        'mimicgen_camera_width': 224,
+        'mimicgen_camera_height': 224,
         'mimicgen_max_steps': 600,
         'mimicgen_pixel_stride': 1,
         'use_absolute_actions': False,
