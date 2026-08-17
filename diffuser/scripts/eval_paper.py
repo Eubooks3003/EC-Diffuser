@@ -1071,9 +1071,16 @@ def main():
     # image_size produces a different image distribution, causing OOD observations
     # and degraded policy performance.
     if is_2d_dlp:
-        cfg.mimicgen_camera_width = 84
-        cfg.mimicgen_camera_height = 84
-        print(f"[2D DLP] Overriding camera resolution to 84x84 (matching preprocessing)")
+        # 84 was correct for the original store (preprocess_mimicgen_multiview.py
+        # rendered 84x84); the 224 stores render natively at 224, so hardcoding
+        # 84 there would feed the DLP 84->224 upsampled frames while training saw
+        # true 224 -- the exact OOD gap this block exists to prevent. Configs
+        # whose tokens came from a different render size set the knob.
+        _pre_res = int(getattr(cfg, "mimicgen_preprocess_render_res", 84))
+        cfg.mimicgen_camera_width = _pre_res
+        cfg.mimicgen_camera_height = _pre_res
+        print(f"[2D DLP] Overriding camera resolution to {_pre_res}x{_pre_res} "
+              f"(matching preprocessing)")
 
     # Load dataset
     cfg.dataset_path = dataset_path

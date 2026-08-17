@@ -181,6 +181,9 @@ mode_to_args = {
         # Provenance: meta['cameras'] in mimicgen_224_wrist_tokens/*/*.pkl.
         # Render at 224 so it matches the training memmap natively rather than
         # going through a 256->224 resize.
+        # The 224 store was rendered natively at 224; eval must render at the
+        # same size or the DLP sees upsampled frames it never trained on.
+        'mimicgen_preprocess_render_res': 224,
         'mimicgen_cams': ['agentview', 'robot0_eye_in_hand'],
         'mimicgen_camera_width': 224,
         'mimicgen_camera_height': 224,
