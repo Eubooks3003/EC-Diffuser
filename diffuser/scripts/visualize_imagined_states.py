@@ -681,6 +681,9 @@ def main():
                         help="Save decoded image for every horizon step (not just selected)")
     parser.add_argument("--max_replans_to_log", type=int, default=20,
                         help="Max number of replan steps to visualize per episode")
+    parser.add_argument("--eval_task", type=str, default=None,
+                        help="Task name, required when the config is multitask "
+                             "(selects that task's pkl / DLP / calib / horizon).")
     parser.add_argument("--random_init", action="store_true", default=True)
     parser.add_argument("--no_random_init", dest="random_init", action="store_false")
     args = parser.parse_args()
@@ -703,6 +706,40 @@ def main():
     set_global_device(cfg.device)
 
     # Load DLP
+    # Multitask configs carry per-task pkl / DLP / calib in task_entries rather
+    # than at the top level, so resolve the requested task first (same fields
+    # eval_paper.py sets) or the getattrs below have nothing to read.
+    if getattr(cfg, "multitask", False):
+        if not args.eval_task:
+            raise RuntimeError("Config has multitask=True; --eval_task <name> is required.")
+        _entries = getattr(cfg, "task_entries", []) or []
+        _match = next((e for e in _entries if e["name"] == args.eval_task), None)
+        if _match is None:
+            raise RuntimeError(
+                f"--eval_task='{args.eval_task}' not in task_entries "
+                f"(available: {[e['name'] for e in _entries]})"
+            )
+        cfg.calib_h5_path = _match["calib_h5"]
+        cfg.dlp_ckpt = _match["dlp_ckpt"]
+        cfg.dlp_cfg = _match["dlp_cfg"]
+        cfg.override_dataset_path = _match["pkl"]
+        cfg.multitask_task_id = int(_match["task_id"])
+        if "max_steps" in _match:
+            cfg.mimicgen_max_steps = int(_match["max_steps"])
+        # Cameras come from the pkl meta, as in eval_paper.py: the store's view
+        # set is authoritative over whatever the config happens to list.
+        try:
+            import pickle as _pkl
+            with open(_match["pkl"], "rb") as _fh:
+                _cams = _pkl.load(_fh).get("meta", {}).get("cameras", None)
+            if _cams:
+                cfg.mimicgen_cams = list(_cams)
+        except Exception as _e:
+            print(f"[multitask] WARNING: could not read meta cameras: {_e}")
+        print(f"[multitask] eval_task={args.eval_task} -> task_id={cfg.multitask_task_id}")
+        print(f"[multitask]   pkl  = {_match['pkl']}")
+        print(f"[multitask]   cams = {getattr(cfg, 'mimicgen_cams', None)}")
+
     dlp_ctor = getattr(cfg, 'dlp_ctor', 'voxel_models:DLP')
     is_3d = "voxel" in dlp_ctor.lower()
     print(f"Loading DLP model (ctor={dlp_ctor}, is_3d={is_3d})...")
@@ -797,11 +834,12 @@ def main():
     # The DLP was trained on 84x84 images (from preprocess_mimicgen_multiview.py),
     # resized to image_size=128 internally. Rendering at 256 then downsampling to 128
     # produces different image characteristics than rendering at 84 then upsampling to 128.
-    cfg.mimicgen_camera_width = 84
-    cfg.mimicgen_camera_height = 84
+    _pre_res = int(getattr(cfg, "mimicgen_preprocess_render_res", 84))
+    cfg.mimicgen_camera_width = _pre_res
+    cfg.mimicgen_camera_height = _pre_res
 
     print(f"Task: {task}, max_steps: {args.max_steps}, exe_steps: {exe_steps}, "
-          f"is_3d: {is_3d}, multiview: {multiview}, cam_res: 84x84 (matching preprocessing)")
+          f"is_3d: {is_3d}, multiview: {multiview}, cam_res: {_pre_res}x{_pre_res} (matching preprocessing)")
 
     device = torch.device(args.device)
 
