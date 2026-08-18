@@ -10,6 +10,13 @@ without crashing.
     action  (22-D, ABSOLUTE rotvec) = [xyz(3), rotvec(3), allegro(16)]
     proprio (23-D)                  = [xyz(3), quat_wxyz(4), allegro(16)]
 
+The 16 Allegro dims are FINGER-major -- [index(4), middle(4), ring(4),
+thumb(4)], each finger being [spread, proximal, medial, distal] (thumb: twist,
+abduction, flexion, flexion). This is NOT the XML's actuator declaration order,
+which is joint-major (ffa0, mfa0, rfa0, ffa1, ...); the env re-derives the
+mapping from an explicit finger-major name list, so reading the order off the
+XML gives a scrambled hand. Semantic groups therefore put one token per digit.
+
 Single-arm and bimanual are SEPARATE configs on purpose: their action/proprio
 widths differ (22/23 vs the other arm's), and ReplayBuffer.load_paths_from_pickles
 pads only T and K -- a mixed buffer would be malformed. They do share one DLP
@@ -152,8 +159,8 @@ base = {
         # Token grouping (see pint.py grouped_tokens): each group is one
         # transformer token with its own projection/type-encoding/decoder.
         # [n]=one token spanning n dims; 'per_dim'=one token per scalar.
-        'action_token_groups': [3, 3, 16],
-        'proprio_token_groups': [3, 4, 16],
+        'action_token_groups': [3, 3, 4, 4, 4, 4],
+        'proprio_token_groups': [3, 4, 4, 4, 4, 4],
 
         # multitask flags (defaults; overridden by mode_to_args)
         'multitask': False,
