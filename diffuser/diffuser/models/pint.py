@@ -150,11 +150,19 @@ class AdaLNPINTDenoiser(nn.Module):
             self.split_action_tokens = bool(split_action_tokens)
         self.has_proprio = gripper_dim > 0
 
-        if self.split_action_tokens:
+        # The named sub-dims (act_pos/rot/grip, prop_pos/rot/grip) describe the
+        # LEGACY tokenization only. When *_token_groups are supplied they are
+        # unused for tokenization, and their defaults (3+3+1=7, 3+6+1=10) are
+        # MimicGen-shaped -- asserting on them would reject every policy with a
+        # different action_dim (e.g. DexJoCo's 22/44) purely on the strength of
+        # a default it never uses. The grouped path re-asserts the real
+        # constraint (sum(groups) == action_dim / gripper_dim) just below.
+        _grouped = (action_token_groups is not None) or (proprio_token_groups is not None)
+        if self.split_action_tokens and not _grouped:
             assert act_pos_dim + act_rot_dim + act_grip_dim == action_dim, (
                 f"action sub-dims {act_pos_dim}+{act_rot_dim}+{act_grip_dim} "
                 f"must sum to action_dim={action_dim}")
-        if self.has_proprio:
+        if self.has_proprio and not _grouped:
             assert prop_pos_dim + prop_rot_dim + prop_grip_dim == gripper_dim, (
                 f"proprio sub-dims {prop_pos_dim}+{prop_rot_dim}+{prop_grip_dim} "
                 f"must sum to gripper_dim={gripper_dim}")
