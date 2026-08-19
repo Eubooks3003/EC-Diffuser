@@ -67,6 +67,26 @@ class ParticleRenderer:
         self.require_bg = True
         self.single_view = single_view
     
+    def _model(self):
+        return self.latent_rep_model if self.env is None else self.env.latent_rep_model
+
+    def _n_views(self, latent_rep_model, bg_a, bg_b):
+        """How many camera views the bg vector spans.
+
+        bg_dim = n_views * learned_bg_feature_dim. Reading the per-view width
+        off the DLP keeps this correct for 2-view MimicGen/DexJoCo-single and
+        3-view DexJoCo-bimanual alike. Falls back to the historical assumption
+        of 2 when the model does not expose the attribute.
+        """
+        per_view = getattr(latent_rep_model, 'learned_bg_feature_dim', None)
+        bg = bg_a if bg_a is not None else bg_b
+        if per_view is None or bg is None:
+            return 2
+        total = int(bg.shape[-1])
+        if per_view <= 0 or total % per_view != 0:
+            return 2
+        return max(1, total // int(per_view))
+
     def render(self, particles, front_bg, side_bg, ret_glimpse=False, **kwargs):
         if self.env is None:
             latent_rep_model = self.latent_rep_model
@@ -76,6 +96,21 @@ class ParticleRenderer:
             device = self.env.device
 
         particles = particles.reshape(1, -1, self.particle_dim)
+        n_views = 1 if self.single_view else self._n_views(latent_rep_model, front_bg, side_bg)
+        if n_views > 2:
+            # 3+ views (DexJoCo bimanual: base + wrist_left + wrist_right).
+            # `front_bg`/`side_bg` only name two slots, so the caller passes the
+            # whole bg vector as front_bg and we chunk it here alongside the
+            # particles. Two-view behaviour below is untouched.
+            K = particles.shape[1] // n_views
+            bg_all = front_bg
+            bg_per = (bg_all.shape[-1] // n_views) if bg_all is not None else None
+            imgs = []
+            for v in range(n_views):
+                bg_v = bg_all[v * bg_per:(v + 1) * bg_per] if bg_per else None
+                imgs.append(get_recon_from_dlps(
+                    particles[:, v * K:(v + 1) * K, :], bg_v, latent_rep_model, device))
+            return np.concatenate(imgs, axis=0)
         if self.single_view:
             particles = particles[:, :particles.shape[1], :]
         else:
@@ -106,17 +141,28 @@ class ParticleRenderer:
         """
         sample_images = []
         bg_per_view = None
+        n_views = 2
         if bg_features_seq is not None and len(bg_features_seq.shape) >= 1:
             if self.single_view:
                 bg_per_view = bg_features_seq.shape[-1]
+                n_views = 1
             else:
-                bg_per_view = bg_features_seq.shape[-1] // 2
+                # Derive the view count from the DLP's own bg width instead of
+                # assuming 2. bg_dim = n_views * learned_bg_feature_dim, so a
+                # 3-view store (bg_dim 12, bg-per-view 4) previously produced
+                # bg_per_view=6 and died in the bg decoder's first Linear with
+                #   mat1 and mat2 shapes cannot be multiplied (1x6 and 4x256)
+                n_views = self._n_views(self._model(), bg_features_seq, None)
+                bg_per_view = bg_features_seq.shape[-1] // n_views
 
         for t, sample in enumerate(samples):
             fb, sb = front_bg, side_bg
             if bg_features_seq is not None and bg_per_view is not None:
-                fb = bg_features_seq[t, :bg_per_view]
-                sb = bg_features_seq[t, bg_per_view:] if not self.single_view else None
+                if n_views > 2:
+                    fb, sb = bg_features_seq[t], None   # chunked inside render()
+                else:
+                    fb = bg_features_seq[t, :bg_per_view]
+                    sb = bg_features_seq[t, bg_per_view:] if not self.single_view else None
             sample_images.append(self.render(sample, fb, sb, **kwargs))
         return np.concatenate(sample_images, axis=1)
 
