@@ -199,7 +199,15 @@ class DexJoCoDLPWrapper:
         return self._encode(obs)
 
     def step(self, action):
-        env_action = self._convert_action(np.asarray(action, dtype=np.float64))
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        # Under a MERGED single+bimanual policy the action head is 44-D. The
+        # bimanual layout leads with the right arm, so a single-arm task is
+        # exactly the first 22 dims and the rest is the phantom left arm --
+        # DexJoCo's own convention (dp_dexjoco_env.py takes action[:22] too).
+        native = 44 if self.dual_arm else 22
+        if action.shape[0] > native:
+            action = action[:native]
+        env_action = self._convert_action(action)
         obs, reward, terminated, truncated, info = self.env.step(env_action)
         self._success = bool(info.get("succeed", False))
         obs_vec = self._encode(obs)
@@ -423,6 +431,23 @@ def _zero_policy_action(task):
 # ---------------------------------------------------------------------------
 # Rollouts
 # ---------------------------------------------------------------------------
+def _fit_width(vec, width):
+    """Zero-pad (or trim) a 1-D observation slice to the policy's width.
+
+    A merged single+bimanual policy expects the bimanual widths (proprio 46,
+    bg 12, 60 particles). A single-arm rollout produces the narrower vectors,
+    and the buffer padded exactly the same way at training time -- with zeros,
+    on the right -- so this reproduces the training-time layout. For a
+    single-embodiment policy the widths already match and this is a no-op.
+    """
+    v = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if v.shape[0] == width:
+        return v
+    if v.shape[0] > width:
+        return v[:width]
+    return np.concatenate([v, np.zeros(width - v.shape[0], dtype=np.float32)])
+
+
 def run_rollouts(trainer, cfg, task, task_id, entry, device, n_episodes,
                  max_steps, exe_steps, seed, store_size,
                  save_videos=False, video_dir=None, video_episodes=3):
@@ -433,6 +458,7 @@ def run_rollouts(trainer, cfg, task, task_id, entry, device, n_episodes,
     a_dim = trainer.dataset.action_dim
     grip_dim = getattr(trainer.dataset, "gripper_dim", 0)
     bg_dim = getattr(trainer.dataset, "bg_dim", 0)
+    obs_dim = trainer.dataset.observation_dim
     norm = trainer.dataset.normalizer
     tid = torch.tensor([int(task_id)], dtype=torch.long, device=device)
 
@@ -452,12 +478,13 @@ def run_rollouts(trainer, cfg, task, task_id, entry, device, n_episodes,
             if buf is None or idx >= exe_steps:
                 parts = []
                 if grip_dim > 0:
-                    g = np.asarray(envw.last_gripper_state).flatten()[:grip_dim]
+                    g = _fit_width(envw.last_gripper_state, grip_dim)
                     parts.append(norm.normalize(g[None], "gripper_state")[0])
                 if bg_dim > 0:
-                    b = np.asarray(envw.last_bg_features).flatten()[:bg_dim]
+                    b = _fit_width(envw.last_bg_features, bg_dim)
                     parts.append(norm.normalize(b[None], "bg_features")[0])
-                parts.append(norm.normalize(obs_vec[None], "observations")[0])
+                parts.append(norm.normalize(_fit_width(obs_vec, obs_dim)[None],
+                                            "observations")[0])
                 cond = {0: torch.from_numpy(np.concatenate(parts)[None]).float().to(device)}
 
                 with torch.no_grad():

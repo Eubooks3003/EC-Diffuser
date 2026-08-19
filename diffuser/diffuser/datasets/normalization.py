@@ -8,10 +8,66 @@ POINTMASS_KEYS = ['observations', 'actions', 'next_observations', 'deltas']
 #--------------------------- multi-field normalizer --------------------------#
 #-----------------------------------------------------------------------------#
 
+#-----------------------------------------------------------------------------#
+#------------------------- ragged-width normalizer fit -----------------------#
+#-----------------------------------------------------------------------------#
+
+# Fitted statistics live on these attributes across every Normalizer subclass
+# (mins/maxs for Limits-style, means/stds for Gaussian-style). Each is a 1-D
+# array indexed by the field's last axis, which is what makes a per-dimension
+# splice possible without knowing which normalizer was used.
+_FIT_ATTRS = ('mins', 'maxs', 'means', 'stds')
+
+
+def fit_normalizer_masked(normalizer_cls, X, widths=None):
+    """Fit `normalizer_cls` on X, ignoring zero-padding in ragged fields.
+
+    `widths[i]` is the true width of row i's last axis. In a merged DexJoCo
+    buffer a single-arm frame carries a 22-D action zero-padded to 44; fitting
+    naively would drag dims 22:44 toward zero and shrink their std, so every
+    bimanual action would be normalized against statistics that are mostly a
+    description of the padding.
+
+    Dimensions below `widths.min()` are valid in every row and are fitted on
+    all of X. Dimensions at or above it are fitted on full-width rows only,
+    then spliced in. When `widths` is None or constant -- i.e. every existing
+    single-embodiment config -- this returns `normalizer_cls(X)` unchanged, so
+    the legacy path is bit-for-bit identical.
+    """
+    if widths is None:
+        return normalizer_cls(X)
+    widths = np.asarray(widths).astype(int)
+    if widths.size == 0 or widths.min() == widths.max():
+        return normalizer_cls(X)
+
+    lo, hi = int(widths.min()), int(widths.max())
+    norm = normalizer_cls(X)                      # correct for dims < lo
+    full = widths == hi
+    if not full.any():
+        return norm
+    norm_wide = normalizer_cls(X[full])           # correct for all dims, wide rows
+
+    spliced = []
+    for attr in _FIT_ATTRS:
+        a, b = getattr(norm, attr, None), getattr(norm_wide, attr, None)
+        if a is None or b is None:
+            continue
+        a = np.asarray(a)
+        if a.ndim < 1 or a.shape[-1] != hi or np.asarray(b).shape[-1] != hi:
+            continue
+        a = a.copy()
+        a[..., lo:] = np.asarray(b)[..., lo:]
+        setattr(norm, attr, a)
+        spliced.append(attr)
+    print(f'[ utils/normalization ] ragged fit: dims {lo}:{hi} taken from '
+          f'{int(full.sum())}/{len(widths)} full-width rows (spliced {spliced})')
+    return norm
+
+
 class DatasetNormalizer:
 
     def __init__(self, dataset, normalizer, particle_normalizer=None, path_lengths=None,
-                 gripper_normalizer=None):
+                 gripper_normalizer=None, valid_widths=None):
         self.observation_dim = dataset['observations'].shape[-1]
         self.action_dim = dataset['actions'].shape[-1]
         self.gripper_dim = dataset['gripper_state'].shape[-1] if 'gripper_state' in dataset._dict else 0
@@ -25,9 +81,21 @@ class DatasetNormalizer:
             gripper_normalizer = eval(gripper_normalizer)
 
         dataset = flatten(dataset, path_lengths)
+
+        # Per-episode widths -> per-frame widths, matching flatten()'s ordering
+        # (episodes concatenated in order, path_lengths frames each).
+        frame_widths = {}
+        if valid_widths:
+            pl = np.asarray(path_lengths).astype(int)
+            for k, w in valid_widths.items():
+                w = np.asarray(w).astype(int)
+                if w.min() != w.max() and len(w) == len(pl):
+                    frame_widths[k] = np.repeat(w, pl)
+
         self.normalizers = {}
         for key, val in dataset.items():
             try:
+                w = frame_widths.get(key)
                 if key == 'observations' and particle_normalizer is not None:
                     ### concatenate goals to observations for normalizing
                     if goal_X is not None:
@@ -39,13 +107,11 @@ class DatasetNormalizer:
                     continue
                 elif key == 'gripper_state':
                     # Use gripper_normalizer if provided, else use standard normalizer
-                    if gripper_normalizer is not None:
-                        self.normalizers[key] = gripper_normalizer(val)
-                    else:
-                        self.normalizers[key] = GaussianNormalizer(val)
+                    cls = gripper_normalizer if gripper_normalizer is not None else GaussianNormalizer
+                    self.normalizers[key] = fit_normalizer_masked(cls, val, w)
                     print(f'[ utils/normalization ] Gripper state normalizer: {self.normalizers[key]}')
                 else:
-                    self.normalizers[key] = normalizer(val)
+                    self.normalizers[key] = fit_normalizer_masked(normalizer, val, w)
             except Exception as e:
                 print(e)
                 print(f'[ utils/normalization ] Skipping {key} | {normalizer}')

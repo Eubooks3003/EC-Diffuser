@@ -24,6 +24,10 @@ class ReplayBuffer:
         self.max_n_episodes = max_n_episodes
         self.max_path_length = max_path_length
         self.termination_penalty = termination_penalty
+        # {field: (n_episodes,) true width of the last axis}. Only the merged
+        # multitask loader populates this; every other path leaves it empty,
+        # which downstream code reads as "nothing was padded".
+        self.valid_widths = {}
 
     def __repr__(self):
         return '[ datasets/buffer ] Fields:\n' + '\n'.join(
@@ -155,32 +159,45 @@ class ReplayBuffer:
                     f"but task_id={loaded[0][1]} has {sorted(keys)}"
                 )
 
-        # Determine global allocation shape. For 4D obs/goals we also take the
-        # max K across tasks (defensive — should be uniform for d0 mimicgen).
-        global_T = 0
-        global_K = 0
-        for paths_dict, _, _ in loaded:
-            obs = paths_dict['observations']
-            global_T = max(global_T, obs.shape[1])
-            if obs.ndim == 4:
-                global_K = max(global_K, obs.shape[2])
-
+        # Determine global allocation shape: elementwise max over every axis
+        # except episodes. Previously only T (axis 1) and K (axis 2 of 4D obs)
+        # were maxed, which assumed a uniform final axis across tasks -- true
+        # for MimicGen, false for a merged DexJoCo single+bimanual buffer where
+        # actions are 22/44, proprio 23/46 and bg 8/12. Narrower tasks are
+        # zero-padded up to the widest, and the real width is recorded per
+        # episode so the normalizer can ignore the padding.
+        #
+        # Backwards compatible by construction: when every task already agrees
+        # on a shape, the max equals that shape and each write covers the whole
+        # array, exactly as before.
         total_eps = sum(n for _, _, n in loaded)
+
+        shape_max = {}
+        for k in keys:
+            if k == 'path_lengths':
+                continue
+            for paths_dict, _, _ in loaded:
+                shp = list(paths_dict[k].shape)
+                if k not in shape_max:
+                    shape_max[k] = shp
+                else:
+                    shape_max[k] = [max(a, b) for a, b in zip(shape_max[k], shp)]
 
         out = {}
         for k in keys:
-            arr = sample[k]
             if k == 'path_lengths':
                 out[k] = np.zeros(total_eps, dtype=np.int32)
                 continue
-            shape = list(arr.shape)
+            shape = list(shape_max[k])
             shape[0] = total_eps
-            if arr.ndim >= 2:
-                shape[1] = global_T
-            if k in ('observations', 'goals') and arr.ndim == 4:
-                shape[2] = global_K
             out[k] = np.zeros(tuple(shape), dtype=np.float32)
         out['task_ids'] = np.zeros(total_eps, dtype=np.int32)
+
+        # Per-episode true width of each field's LAST axis. Uniform-width runs
+        # produce a constant array, which the normalizer treats as "no padding".
+        valid_widths = {k: np.zeros(total_eps, dtype=np.int32)
+                        for k in keys if k != 'path_lengths'
+                        and len(shape_max[k]) >= 2}
 
         offset = 0
         for paths_dict, task_id, n_eps in loaded:
@@ -188,17 +205,25 @@ class ReplayBuffer:
                 arr = paths_dict[k][:n_eps]
                 if k == 'path_lengths':
                     out[k][offset:offset + n_eps] = arr.astype(np.int32)
-                elif arr.ndim == 1:
+                    continue
+                if arr.ndim == 1:
                     out[k][offset:offset + n_eps] = arr.astype(np.float32)
-                else:
-                    T = arr.shape[1]
-                    if k in ('observations', 'goals') and arr.ndim == 4:
-                        K = arr.shape[2]
-                        out[k][offset:offset + n_eps, :T, :K] = arr.astype(np.float32)
-                    else:
-                        out[k][offset:offset + n_eps, :T] = arr.astype(np.float32)
+                    continue
+                # Slice each trailing axis to this task's actual extent.
+                sl = (slice(offset, offset + n_eps),) + tuple(
+                    slice(0, n) for n in arr.shape[1:])
+                out[k][sl] = arr.astype(np.float32)
+                if k in valid_widths:
+                    valid_widths[k][offset:offset + n_eps] = arr.shape[-1]
             out['task_ids'][offset:offset + n_eps] = int(task_id)
             offset += n_eps
+
+        self.valid_widths = valid_widths
+        _padded = {k: (int(v.min()), int(v.max())) for k, v in valid_widths.items()
+                   if v.min() != v.max()}
+        if _padded:
+            print(f'[ datasets/buffer ] Ragged fields zero-padded to the widest '
+                  f'task (min,max per field): {_padded}')
 
         for k, v in out.items():
             self._dict[k] = v
@@ -214,8 +239,10 @@ class ReplayBuffer:
             print(f'[ datasets/buffer ] Found bg_features: shape={bg.shape}, '
                   f'range=[{bg.min():.3f}, {bg.max():.3f}]')
         per_task = np.bincount(self._dict['task_ids'], minlength=int(self._dict['task_ids'].max()) + 1)
+        _obs_shape = self._dict['observations'].shape
         print(f'[ datasets/buffer ] Multitask buffer: {self._count} episodes total, '
-              f'per-task counts={per_task.tolist()}, T_alloc={global_T}, K_alloc={global_K}')
+              f'per-task counts={per_task.tolist()}, T_alloc={_obs_shape[1]}, '
+              f'K_alloc={_obs_shape[2] if len(_obs_shape) > 2 else "n/a"}')
 
     def _maybe_apply_single_view(self, paths_dict, single_view):
         """Mirror the single-view slicing logic from `load_paths_from_pickle`."""

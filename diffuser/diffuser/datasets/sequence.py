@@ -362,9 +362,13 @@ class MultitaskGoalDataset(GoalDataset):
 
         # Single global normalizer fit on valid frames across all tasks.
         # `flatten()` already respects path_lengths so padded zeros are excluded.
+        # `valid_widths` is empty unless the buffer had to zero-pad ragged
+        # fields (merged single+bimanual). When empty the normalizer takes its
+        # legacy path unchanged.
         self.normalizer = DatasetNormalizer(
             fields, normalizer, particle_normalizer=particle_normalizer,
             path_lengths=fields['path_lengths'],
+            valid_widths=getattr(fields, 'valid_widths', None),
         )
 
         self.normalizer.sanity_check_roundtrip(
