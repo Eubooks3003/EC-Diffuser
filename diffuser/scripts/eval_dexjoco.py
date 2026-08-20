@@ -529,7 +529,8 @@ def main():
     ap.add_argument("--n_episodes", type=int, default=5)
     ap.add_argument("--max_steps", type=int, default=600)
     ap.add_argument("--exe_steps", type=int, default=None)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seeds", type=str, default="42,123,456",
+                    help="comma-separated, as in eval_paper.py (paper protocol: 42,123,456)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--store_size", type=int, default=84,
                     help="resolution the training memmap was built at")
@@ -547,6 +548,8 @@ def main():
     tasks = args.tasks or ([args.eval_task] if args.eval_task else list(entries))
     exe_steps = args.exe_steps or getattr(cfg, "exe_steps", 8)
 
+    seeds = [int(x) for x in str(args.seeds).split(",") if x.strip()]
+
     if args.parity:
         allok = True
         for t in tasks:
@@ -559,41 +562,62 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     ckpt_name = os.path.basename(args.ckpt_path).replace(".pt", "")
 
+    from datetime import datetime
+
     results = {}
     for t in tasks:
         e = entries[t]
-        print(f"\n=== {t} (task_id {e['task_id']}) — {args.n_episodes} eps, "
-              f"seed {args.seed} ===")
-        succ, lens = run_rollouts(
-            trainer, cfg, t, e["task_id"], e, args.device,
-            n_episodes=args.n_episodes, max_steps=args.max_steps,
-            exe_steps=exe_steps, seed=args.seed, store_size=args.store_size,
-            save_videos=args.save_videos,
-            video_dir=os.path.join(out_dir, "videos"),
-            video_episodes=args.video_episodes)
-        results[t] = {"success_rate": float(np.mean(succ)),
-                      "n_episodes": len(succ),
-                      "successes": [bool(s) for s in succ],
-                      "mean_length": float(np.mean(lens))}
-        print(f"  -> {t}: {100*np.mean(succ):.1f}%")
+        per_seed = []
+        for sd in seeds:
+            print(f"\n=== {t} (task_id {e['task_id']}) — {args.n_episodes} eps, "
+                  f"seed {sd} ===")
+            succ, lens = run_rollouts(
+                trainer, cfg, t, e["task_id"], e, args.device,
+                n_episodes=args.n_episodes, max_steps=args.max_steps,
+                exe_steps=exe_steps, seed=sd, store_size=args.store_size,
+                save_videos=args.save_videos,
+                video_dir=os.path.join(out_dir, "videos"),
+                video_episodes=args.video_episodes)
+            per_seed.append({"seed": sd, "n_episodes": len(succ),
+                             "successes": [bool(x) for x in succ],
+                             "success_rate": float(np.mean(succ)),
+                             "mean_length": float(np.mean(lens))})
+            print(f"  -> {t} seed {sd}: {100*np.mean(succ):.1f}%")
 
-    summary = {
-        "ckpt_path": args.ckpt_path, "config": args.config, "mode": args.mode,
-        "seed": args.seed, "n_episodes": args.n_episodes,
-        "exe_steps": exe_steps, "store_size": args.store_size,
-        "per_task": results,
-        "mean_success_rate": float(np.mean([r["success_rate"] for r in results.values()])),
-    }
-    path = os.path.join(out_dir, f"dexjoco_eval_{ckpt_name}_seed{args.seed}.json")
-    with open(path, "w") as f:
-        json.dump(summary, f, indent=2)
+        srs = [r["success_rate"] for r in per_seed]
+        flat = [x for r in per_seed for x in r["successes"]]
+        # Mirrors eval_paper.py's schema so the same summariser reads both.
+        task_summary = {
+            "config": args.config, "mode": args.mode,
+            "ckpt_path": args.ckpt_path, "ckpt_step": int(trainer.step),
+            "n_rollouts_per_seed": args.n_episodes, "seeds": seeds,
+            "task": t, "eval_task": t, "task_id": int(e["task_id"]),
+            "max_steps": args.max_steps, "exe_steps": exe_steps,
+            "random_init": True, "timestamp": datetime.now().isoformat(),
+            "per_seed_results": per_seed,
+            "mean_success_rate": float(np.mean(srs)),
+            "std_success_rate": float(np.std(srs)),
+            "overall_success_rate": float(np.mean(flat)),
+            "total_rollouts": len(flat),
+        }
+        results[t] = task_summary
+        tdir = os.path.join(out_dir, t)
+        os.makedirs(tdir, exist_ok=True)
+        seed_tag = "_".join(str(x) for x in seeds)
+        with open(os.path.join(tdir, f"eval_{ckpt_name}_seeds{seed_tag}.json"), "w") as f:
+            json.dump(task_summary, f, indent=2)
+        print(f"  -> {t}: {100*task_summary['mean_success_rate']:.1f}% "
+              f"+/- {100*task_summary['std_success_rate']:.1f}%")
 
-    print("\n" + "=" * 56)
-    for t, r in sorted(results.items(), key=lambda kv: -kv[1]["success_rate"]):
-        print(f"  {t:26s} {100*r['success_rate']:5.1f}%  ({sum(r['successes'])}/{r['n_episodes']})")
-    print("-" * 56)
-    print(f"  {'MEAN':26s} {100*summary['mean_success_rate']:5.1f}%")
-    print(f"\nwrote {path}")
+    print("\n" + "=" * 62)
+    print(f"  {'task':26s} {'mean':>7s}   per-seed")
+    for t, r in sorted(results.items(), key=lambda kv: -kv[1]["mean_success_rate"]):
+        ps = " / ".join(f"{100*x['success_rate']:.0f}" for x in r["per_seed_results"])
+        print(f"  {t:26s} {100*r['mean_success_rate']:6.1f}%   {ps}")
+    print("-" * 62)
+    mean = float(np.mean([r["mean_success_rate"] for r in results.values()]))
+    print(f"  {'MEAN':26s} {100*mean:6.1f}%   "
+          f"({len(results)} tasks x {args.n_episodes} rollouts x {len(seeds)} seeds)")
 
 
 if __name__ == "__main__":
