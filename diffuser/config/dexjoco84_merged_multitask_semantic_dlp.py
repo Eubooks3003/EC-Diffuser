@@ -204,7 +204,11 @@ base = {
         # training
         'n_steps_per_epoch': 200,
         'loss_type': 'l1',
-        'n_train_steps': 2.5e6,
+        # 7000 epochs @ 500 steps/epoch (was 5000 = 2.5e6). The merged run
+        # spreads the same budget over 11 tasks where the single-arm run had
+        # 6, so per task it saw roughly half the updates -- extended to test
+        # whether the single-arm collapse is undertraining.
+        'n_train_steps': 3.5e6,
         'batch_size': 16,
         'learning_rate': 8e-5,
         'gradient_accumulate_every': 1,
