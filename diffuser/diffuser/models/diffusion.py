@@ -210,8 +210,14 @@ class GaussianDiffusion(nn.Module):
 
     def p_mean_variance(self, x, cond, t, task_id=None, self_cond=None,
                         return_x_recon=False):
-        x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.model(x, cond, t, task_id=task_id, self_cond=self_cond))
+        if self.self_cond_action:
+            model_out = self.model(x, cond, t, task_id=task_id, self_cond=self_cond)
+        else:
+            # Byte-identical to the pre-change call. A separate branch because
+            # denoisers without the kwarg (temporal.py:112 TemporalUnet,
+            # temporal.py:208 ValueFunction) would raise on self_cond=.
+            model_out = self.model(x, cond, t, task_id=task_id)
+        x_recon = self.predict_start_from_noise(x, t=t, noise=model_out)
 
         if self.clip_denoised:
             x_recon.clamp_(-1., 1.)
@@ -255,6 +261,11 @@ class GaussianDiffusion(nn.Module):
         progress = utils.Progress(self.n_timesteps) if verbose else utils.Silent()
         for i in reversed(range(0, self.n_timesteps)):
             t = make_timesteps(batch_size, i, device)
+            if return_attention and self.self_cond_action:
+                raise NotImplementedError(
+                    "return_attention with self_cond_action is not wired -- the "
+                    "attention sample_fn does not thread the x0 estimate, so the "
+                    "token would silently stay absent at every step.")
             if return_attention:
                 x, values, att_dict = sample_fn(self, x, cond, t, task_id=task_id, **sample_kwargs)
             elif self.self_cond_action:
@@ -346,8 +357,14 @@ class GaussianDiffusion(nn.Module):
         self_cond = None
         if self.self_cond_action and random.random() < 0.5:
             with torch.no_grad():
-                _prev = self.model(x_noisy, cond, t, task_id=task_id)
-                self_cond = _prev[:, :, :self.action_dim].detach()
+                _prev = self.model(x_noisy, cond, t, task_id=task_id, self_cond=None)
+                # Identity when predict_epsilon=False (these configs), but written
+                # correctly so an epsilon-parameterised config feeds x0 rather
+                # than epsilon into the token.
+                _prev_x0 = self.predict_start_from_noise(x_noisy, t=t, noise=_prev)
+                if self.clip_denoised:
+                    _prev_x0 = _prev_x0.clamp(-1., 1.)   # out-of-place
+                self_cond = _prev_x0[:, :, :self.action_dim].detach()
 
         if self.has_aux_action:
             # Aux branches read the same action/proprio slices of `x_noisy` -> the
