@@ -380,7 +380,7 @@ class AdaLNPINTDenoiser(nn.Module):
             self.particle_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
 
     def forward(self, x, cond, time, task_id=None, return_attention=False,
-                return_aux=False, self_cond=None):
+                return_aux=False, self_cond=None, self_cond_mask=None):
         """
         Input/output flat layout (both paths):
             [action(action_dim), gripper(gripper_dim), bg(bg_dim), particles(K*features_dim)]
@@ -484,11 +484,20 @@ class AdaLNPINTDenoiser(nn.Module):
         # BEFORE the aux branches so aux token indices are unchanged when both
         # are present. Always built when enabled, so it attends during sampling.
         if self.self_cond_action:
+            absent = self.sc_absent.repeat(bs, T, 1)
             if self_cond is None:
-                sc_tok = self.sc_absent.repeat(bs, T, 1)
+                sc_tok = absent
             else:
-                sc_tok = (self.sc_projection(self_cond)
+                # detach defensively: the estimate must never carry gradient
+                # back into the pass that produced it.
+                sc_tok = (self.sc_projection(self_cond.detach())
                           + self.sc_encoding.repeat(bs, T, 1))
+                if self_cond_mask is not None:
+                    # Per-row select. Rows at the noisiest level have no previous
+                    # denoising step, so they take the absent token -- exactly
+                    # what happens at the first sampling step.
+                    m = self_cond_mask.view(bs, 1, 1).to(sc_tok.dtype)
+                    sc_tok = m * sc_tok + (1.0 - m) * absent
             robot_tokens.append(sc_tok)
 
         # Auxiliary action branches: re-tokenize the SAME action slice. Appended

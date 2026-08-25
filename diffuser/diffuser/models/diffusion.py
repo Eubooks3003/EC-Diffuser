@@ -1,5 +1,4 @@
 from collections import namedtuple
-import random
 import numpy as np
 import torch
 from torch import nn
@@ -349,19 +348,33 @@ class GaussianDiffusion(nn.Module):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         x_noisy = apply_conditioning(x_noisy, cond, self.action_dim) # a, 0, 1
 
-        # Self-conditioning: on ~half of steps, run a throwaway no-grad forward
-        # and feed its x0 action estimate back in as the un-noised token. The
-        # dropout matters -- at sampling the first denoising step has no estimate
-        # yet, so the model must also work with the token absent. predict_epsilon
-        # is False here, so the model output IS x0; no conversion needed.
-        self_cond = None
-        if self.self_cond_action and random.random() < 0.5:
+        # Self-conditioning, SYMMETRIC with sampling.
+        #
+        # At sampling, denoising step i consumes the x0 estimate produced at step
+        # i+1 -- i.e. from a NOISIER state. Producing the training estimate at the
+        # same t would hand the model a systematically better estimate than it
+        # ever sees at rollout. With only n_diffusion_steps=5 consecutive alpha_bar
+        # values are far apart, so that gap is large and would bias the model
+        # toward over-trusting the token. So build x_{t+1} from the SAME noise
+        # vector -- putting x_{t+1} and x_t on one consistent noising path,
+        # exactly as sampling does -- and estimate there.
+        #
+        # No random dropout: the noise level itself says when the token is absent.
+        # Rows at t = T-1 have no previous step, which is precisely the first
+        # sampling step. t is drawn uniformly, so ~1/T of rows train the absent
+        # regime -- matching the 1-of-T sampling steps that use it.
+        self_cond, self_cond_mask = None, None
+        if self.self_cond_action:
+            t_prev = (t + 1).clamp(max=self.n_timesteps - 1)
+            self_cond_mask = (t + 1) < self.n_timesteps          # False at t = T-1
             with torch.no_grad():
-                _prev = self.model(x_noisy, cond, t, task_id=task_id, self_cond=None)
+                x_prev = self.q_sample(x_start=x_start, t=t_prev, noise=noise)
+                x_prev = apply_conditioning(x_prev, cond, self.action_dim)
+                _prev = self.model(x_prev, cond, t_prev, task_id=task_id, self_cond=None)
                 # Identity when predict_epsilon=False (these configs), but written
                 # correctly so an epsilon-parameterised config feeds x0 rather
                 # than epsilon into the token.
-                _prev_x0 = self.predict_start_from_noise(x_noisy, t=t, noise=_prev)
+                _prev_x0 = self.predict_start_from_noise(x_prev, t=t_prev, noise=_prev)
                 if self.clip_denoised:
                     _prev_x0 = _prev_x0.clamp(-1., 1.)   # out-of-place
                 self_cond = _prev_x0[:, :, :self.action_dim].detach()
@@ -370,11 +383,12 @@ class GaussianDiffusion(nn.Module):
             # Aux branches read the same action/proprio slices of `x_noisy` -> the
             # diffusion noise is shared across representations by construction.
             x_recon, aux_out = self.model(x_noisy, cond, t, task_id=task_id, return_aux=True,
-                                          self_cond=self_cond)
+                                          self_cond=self_cond, self_cond_mask=self_cond_mask)
             aux_preds = aux_out['action'] if isinstance(aux_out, dict) else aux_out
             aux_prop = aux_out.get('proprio', []) if isinstance(aux_out, dict) else []
         else:
-            x_recon = self.model(x_noisy, cond, t, task_id=task_id, self_cond=self_cond)  # a' 0' 1'
+            x_recon = self.model(x_noisy, cond, t, task_id=task_id, self_cond=self_cond,
+                                 self_cond_mask=self_cond_mask)  # a' 0' 1'
             aux_preds, aux_prop = [], []
 
         x_recon = apply_conditioning(x_recon, cond, self.action_dim)
