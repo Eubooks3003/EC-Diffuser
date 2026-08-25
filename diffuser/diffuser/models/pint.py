@@ -124,7 +124,8 @@ class AdaLNPINTDenoiser(nn.Module):
                  prop_pos_dim=3, prop_rot_dim=6, prop_grip_dim=1,
                  n_tasks=1, split_action_tokens=None,
                  action_token_groups=None, proprio_token_groups=None,
-                 aux_action_token_groups=None, aux_proprio_token_groups=None, **kwargs):
+                 aux_action_token_groups=None, aux_proprio_token_groups=None,
+                 self_cond_action=False, **kwargs):
         super(AdaLNPINTDenoiser, self).__init__()
 
         self.features_dim = features_dim
@@ -308,6 +309,22 @@ class AdaLNPINTDenoiser(nn.Module):
             self.aux_p_encodings = nn.ModuleList(
                 [_make_group_encodings(len(g)) for g in self.aux_proprio_token_groups])
 
+        # Self-conditioning token: ONE token encoding the model's own previous
+        # x0 estimate of the action, UN-noised. Unlike the aux branches (which
+        # re-tokenize the same *noised* action slice) this carries a clean
+        # estimate, and the noised action/proprio/particle tokens self-attend
+        # to it. Input-only: no decoder, no loss -- the action is already
+        # supervised by the primary head.
+        #
+        # `sc_absent` stands in when no estimate exists yet (the first denoising
+        # step, and the training dropout). A learned embedding rather than zeros,
+        # because zeros is a *valid* normalized action and would be ambiguous.
+        self.self_cond_action = bool(self_cond_action)
+        if self.self_cond_action:
+            self.sc_projection = _make_proj(action_dim)
+            self.sc_encoding = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+            self.sc_absent = nn.Parameter(0.02 * torch.randn(1, 1, projection_dim))
+
         # Instantiate the AdaLN Particle Transformer.
         self.particle_transformer = AdaLNParticleTransformer(
             self.projection_dim, n_head, n_layer, block_size, self.projection_dim,
@@ -363,7 +380,7 @@ class AdaLNPINTDenoiser(nn.Module):
             self.particle_encoding = nn.Parameter(0.02 * torch.randn(1, 1, 1, projection_dim))
 
     def forward(self, x, cond, time, task_id=None, return_attention=False,
-                return_aux=False):
+                return_aux=False, self_cond=None):
         """
         Input/output flat layout (both paths):
             [action(action_dim), gripper(gripper_dim), bg(bg_dim), particles(K*features_dim)]
@@ -462,6 +479,17 @@ class AdaLNPINTDenoiser(nn.Module):
                 p_rot_tok = self.p_rot_projection(p_rot) + self.p_rot_encoding.repeat(bs, T, 1)
                 p_grip_tok = self.p_grip_projection(p_grip) + self.p_grip_encoding.repeat(bs, T, 1)
                 robot_tokens.extend([p_pos_tok, p_rot_tok, p_grip_tok])
+
+        # Self-conditioning token (opt-in). Inserted after the primary groups and
+        # BEFORE the aux branches so aux token indices are unchanged when both
+        # are present. Always built when enabled, so it attends during sampling.
+        if self.self_cond_action:
+            if self_cond is None:
+                sc_tok = self.sc_absent.repeat(bs, T, 1)
+            else:
+                sc_tok = (self.sc_projection(self_cond)
+                          + self.sc_encoding.repeat(bs, T, 1))
+            robot_tokens.append(sc_tok)
 
         # Auxiliary action branches: re-tokenize the SAME action slice. Appended
         # last so the primary token indices match a run without them. Always

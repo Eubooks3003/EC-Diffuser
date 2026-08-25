@@ -298,6 +298,7 @@ model_config = utils.Config(
     action_token_groups=getattr(args, 'action_token_groups', None),
     proprio_token_groups=getattr(args, 'proprio_token_groups', None),
     aux_action_token_groups=getattr(args, 'aux_action_token_groups', None),
+    self_cond_action=getattr(args, 'self_cond_action', False),
     aux_proprio_token_groups=getattr(args, 'aux_proprio_token_groups', None),
 )
 

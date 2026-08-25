@@ -1185,6 +1185,7 @@ def main():
         action_token_groups=getattr(cfg, 'action_token_groups', None),
         proprio_token_groups=getattr(cfg, 'proprio_token_groups', None),
         aux_action_token_groups=getattr(cfg, 'aux_action_token_groups', None),
+        self_cond_action=getattr(cfg, 'self_cond_action', False),
         aux_proprio_token_groups=getattr(cfg, 'aux_proprio_token_groups', None),
     )
 

@@ -1,4 +1,5 @@
 from collections import namedtuple
+import random
 import numpy as np
 import torch
 from torch import nn
@@ -17,8 +18,14 @@ Sample = namedtuple('Sample', 'trajectories values chains')
 
 
 @torch.no_grad()
-def default_sample_fn(model, x, cond, t, task_id=None):
-    model_mean, _, model_log_variance = model.p_mean_variance(x=x, cond=cond, t=t, task_id=task_id)
+def default_sample_fn(model, x, cond, t, task_id=None, self_cond=None):
+    if getattr(model, 'self_cond_action', False):
+        model_mean, _, model_log_variance, x_recon = model.p_mean_variance(
+            x=x, cond=cond, t=t, task_id=task_id, self_cond=self_cond, return_x_recon=True)
+    else:
+        model_mean, _, model_log_variance = model.p_mean_variance(
+            x=x, cond=cond, t=t, task_id=task_id)
+        x_recon = None
     model_std = torch.exp(0.5 * model_log_variance)
 
     # no noise when t == 0
@@ -26,7 +33,10 @@ def default_sample_fn(model, x, cond, t, task_id=None):
     noise[t == 0] = 0
 
     values = torch.zeros(len(x), device=x.device)
-    return model_mean + model_std * noise, values
+    out = model_mean + model_std * noise
+    if x_recon is not None:
+        return out, values, x_recon[:, :, :model.action_dim].detach()
+    return out, values
 
 @torch.no_grad()
 def sample_fn_return_attn(model, x, cond, t, task_id=None):
@@ -115,6 +125,11 @@ class GaussianDiffusion(nn.Module):
         self.has_aux_action = (self.aux_action_branches + self.aux_proprio_branches) > 0 \
             and self.aux_action_loss_weight > 0
 
+        # Self-conditioning: the denoiser carries an extra UN-noised token holding
+        # its own previous x0 estimate of the action. Read off the model so a
+        # checkpoint/config without it behaves exactly as before.
+        self.self_cond_action = bool(getattr(model, 'self_cond_action', False))
+
         if self.obs_only:
             self.loss_fn = nn.L1Loss()
 
@@ -193,14 +208,19 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, cond, t, task_id=None):
-        x_recon = self.predict_start_from_noise(x, t=t, noise=self.model(x, cond, t, task_id=task_id))
+    def p_mean_variance(self, x, cond, t, task_id=None, self_cond=None,
+                        return_x_recon=False):
+        x_recon = self.predict_start_from_noise(
+            x, t=t, noise=self.model(x, cond, t, task_id=task_id, self_cond=self_cond))
 
         if self.clip_denoised:
             x_recon.clamp_(-1., 1.)
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
                 x_start=x_recon, x_t=x, t=t)
+        if return_x_recon:
+            # self-conditioning needs the x0 estimate carried to the next step
+            return model_mean, posterior_variance, posterior_log_variance, x_recon
         return model_mean, posterior_variance, posterior_log_variance
 
     def p_mean_variance_return_attn(self, x, cond, t, task_id=None):
@@ -227,11 +247,19 @@ class GaussianDiffusion(nn.Module):
         if return_attention:
             sample_fn = sample_fn_return_attn
 
+        # Self-conditioning: carry the x0 action estimate from one denoising step
+        # to the next. None on the first step -- the model sees its learned
+        # "absent" embedding there, which is why training drops the token ~50%.
+        self_cond = None
+
         progress = utils.Progress(self.n_timesteps) if verbose else utils.Silent()
         for i in reversed(range(0, self.n_timesteps)):
             t = make_timesteps(batch_size, i, device)
             if return_attention:
                 x, values, att_dict = sample_fn(self, x, cond, t, task_id=task_id, **sample_kwargs)
+            elif self.self_cond_action:
+                x, values, self_cond = sample_fn(self, x, cond, t, task_id=task_id,
+                                                 self_cond=self_cond, **sample_kwargs)
             else:
                 x, values = sample_fn(self, x, cond, t, task_id=task_id, **sample_kwargs)
             x = apply_conditioning(x, cond, self.action_dim)
@@ -310,14 +338,26 @@ class GaussianDiffusion(nn.Module):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         x_noisy = apply_conditioning(x_noisy, cond, self.action_dim) # a, 0, 1
 
+        # Self-conditioning: on ~half of steps, run a throwaway no-grad forward
+        # and feed its x0 action estimate back in as the un-noised token. The
+        # dropout matters -- at sampling the first denoising step has no estimate
+        # yet, so the model must also work with the token absent. predict_epsilon
+        # is False here, so the model output IS x0; no conversion needed.
+        self_cond = None
+        if self.self_cond_action and random.random() < 0.5:
+            with torch.no_grad():
+                _prev = self.model(x_noisy, cond, t, task_id=task_id)
+                self_cond = _prev[:, :, :self.action_dim].detach()
+
         if self.has_aux_action:
             # Aux branches read the same action/proprio slices of `x_noisy` -> the
             # diffusion noise is shared across representations by construction.
-            x_recon, aux_out = self.model(x_noisy, cond, t, task_id=task_id, return_aux=True)
+            x_recon, aux_out = self.model(x_noisy, cond, t, task_id=task_id, return_aux=True,
+                                          self_cond=self_cond)
             aux_preds = aux_out['action'] if isinstance(aux_out, dict) else aux_out
             aux_prop = aux_out.get('proprio', []) if isinstance(aux_out, dict) else []
         else:
-            x_recon = self.model(x_noisy, cond, t, task_id=task_id)  # a' 0' 1'
+            x_recon = self.model(x_noisy, cond, t, task_id=task_id, self_cond=self_cond)  # a' 0' 1'
             aux_preds, aux_prop = [], []
 
         x_recon = apply_conditioning(x_recon, cond, self.action_dim)
